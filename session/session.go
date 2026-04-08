@@ -62,11 +62,11 @@ func (e *Engine) StartSession(ctx context.Context, cfg model.SessionConfig, deps
 		return nil, fmt.Errorf("session: StartSession: append SessionStarted: %w", err)
 	}
 
-	rt, runtimeConfig, runtimeHash, err := newBranchRuntime(engine.SessionRuntimeContext{
+	rt, runtimeConfig, runtimeHash, err := newBranchRuntime(ctx, engine.SessionRuntimeContext{
 		SessionID:   sessionID,
 		BranchID:    rootBranchID,
 		RuntimeHash: runtimeConfigHash(deps.RuntimeConfig),
-	}, deps.VMDelegate, deps.RuntimeConfig)
+	}, deps.VMDelegate, deps.RuntimeConfig, nil)
 	if err != nil {
 		return nil, fmt.Errorf("session: StartSession: init runtime: %w", err)
 	}
@@ -184,11 +184,11 @@ func (s *session) prepareSubmitRuntime(ctx context.Context) (*branchRuntime, []b
 		return s.runtime, append([]byte(nil), s.runtimeConfig...), s.runtimeHash, nil
 	}
 	if s.head == "" {
-		rt, runtimeConfig, runtimeHash, err := newBranchRuntime(engine.SessionRuntimeContext{
+		rt, runtimeConfig, runtimeHash, err := newBranchRuntime(ctx, engine.SessionRuntimeContext{
 			SessionID:   s.id,
 			BranchID:    s.branch,
 			RuntimeHash: s.runtimeHash,
-		}, s.delegate, s.runtimeConfig)
+		}, s.delegate, s.runtimeConfig, nil)
 		if err != nil {
 			return nil, nil, "", err
 		}
@@ -202,7 +202,7 @@ func (s *session) prepareSubmitRuntime(ctx context.Context) (*branchRuntime, []b
 		SessionID:   s.id,
 		BranchID:    s.branch,
 		RuntimeHash: plan.RuntimeHash,
-	}, s.delegate)
+	}, s.delegate, nil)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("rebuild runtime for submit: %w", err)
 	}
@@ -387,7 +387,7 @@ func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) er
 		SessionID:   s.id,
 		BranchID:    newBranchID,
 		RuntimeHash: plan.RuntimeHash,
-	}, s.delegate)
+	}, s.delegate, nil)
 	if err != nil {
 		return fmt.Errorf("session: Restore: replay history: %w", err)
 	}

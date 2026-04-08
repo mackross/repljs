@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -10,7 +11,7 @@ import (
 
 func mustNewBranchRuntime(t *testing.T) *branchRuntime {
 	t.Helper()
-	rt, _, _, err := newBranchRuntime(engine.SessionRuntimeContext{}, nil, nil)
+	rt, _, _, err := newBranchRuntime(context.Background(), engine.SessionRuntimeContext{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("newBranchRuntime: %v", err)
 	}

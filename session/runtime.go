@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/dop251/goja"
@@ -17,6 +18,43 @@ import (
 )
 
 const directRunTimeout = 100 * time.Millisecond
+
+// effectAccumulator collects the EffectIDs and PromiseRefs launched during a
+// single cell evaluation. It is goroutine-safe; both the JS event-loop
+// goroutine (via add) and the caller (via drain) may touch it concurrently.
+type effectAccumulator struct {
+	mu       sync.Mutex
+	effects  []model.EffectID
+	promises []model.PromiseRef
+}
+
+func (a *effectAccumulator) add(effectID model.EffectID, promiseRef model.PromiseRef) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.effects = append(a.effects, effectID)
+	a.promises = append(a.promises, promiseRef)
+}
+
+func (a *effectAccumulator) drain() ([]model.EffectID, []model.PromiseRef) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	effects := a.effects
+	promises := a.promises
+	a.effects = nil
+	a.promises = nil
+	return effects, promises
+}
+
+// effectsWiring bundles the dependencies needed to install journaling wrappers
+// for host functions. newBranchRuntime accepts a *effectsWiring; nil disables
+// the feature entirely.
+type effectsWiring struct {
+	delegate  engine.EffectsDelegate
+	store     store.Store
+	sessionID model.SessionID
+	cellID    func() model.CellID   // returns the cell being evaluated (may be called during setup)
+	acc       *effectAccumulator
+}
 
 // branchRuntime holds a single goja VM that persists across successful submits
 // on one branch. Each new branch (including after Restore) gets its own VM so
@@ -50,15 +88,19 @@ func runtimeConfigHash(state json.RawMessage) string {
 // starts an event loop for it, and applies the optional delegate before
 // returning. It returns the configured VM plus the serialised runtime
 // descriptor that should be persisted for future recreation.
-func newBranchRuntime(ctx engine.SessionRuntimeContext, delegate engine.VMDelegate, state json.RawMessage) (*branchRuntime, json.RawMessage, string, error) {
+//
+// When wiring is non-nil, newBranchRuntime also calls
+// wiring.delegate.HostFunctions and installs one journaling JS global per
+// HostFunctionDef. Pass nil to skip effect wiring (no delegate configured).
+func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, delegate engine.VMDelegate, state json.RawMessage, wiring *effectsWiring) (*branchRuntime, json.RawMessage, string, error) {
 	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
 	loop.Start()
 
 	type initResult struct {
-		runtime       *branchRuntime
-		configured    json.RawMessage
-		runtimeHash   string
-		err           error
+		runtime     *branchRuntime
+		configured  json.RawMessage
+		runtimeHash string
+		err         error
 	}
 	initCh := make(chan initResult, 1)
 	loop.RunOnLoop(func(vm *goja.Runtime) {
@@ -85,6 +127,23 @@ func newBranchRuntime(ctx engine.SessionRuntimeContext, delegate engine.VMDelega
 		if normalizedConfiguredState != nil {
 			normalizedConfiguredState = append(json.RawMessage(nil), normalizedConfiguredState...)
 		}
+
+		// Install journaling host-function bindings if an effects delegate is wired.
+		if wiring != nil {
+			defs, hErr := wiring.delegate.HostFunctions(bgCtx, wiring.sessionID)
+			if hErr != nil {
+				initCh <- initResult{err: fmt.Errorf("effects delegate: HostFunctions: %w", hErr)}
+				return
+			}
+			for _, def := range defs {
+				def := def // capture loop variable
+				if hErr := installHostFunction(vm, wiring, def); hErr != nil {
+					initCh <- initResult{err: fmt.Errorf("install host function %q: %w", def.Name, hErr)}
+					return
+				}
+			}
+		}
+
 		initCh <- initResult{
 			runtime:     &branchRuntime{vm: vm, loop: loop},
 			configured:  normalizedConfiguredState,
@@ -101,6 +160,91 @@ func newBranchRuntime(ctx engine.SessionRuntimeContext, delegate engine.VMDelega
 		return nil, nil, "", init.err
 	}
 	return init.runtime, init.configured, init.runtimeHash, nil
+}
+
+// installHostFunction sets a JS global on vm that journals EffectStarted /
+// EffectCompleted / EffectFailed facts and calls def.Invoke in a goroutine.
+// Must be called on the runtime event loop.
+func installHostFunction(vm *goja.Runtime, wiring *effectsWiring, def engine.HostFunctionDef) error {
+	return vm.Set(def.Name, func(call goja.FunctionCall) goja.Value {
+		promise, resolve, reject := vm.NewPromise()
+
+		// Serialize the first argument to JSON.
+		var params json.RawMessage
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
+			exported := call.Arguments[0].Export()
+			b, err := json.Marshal(exported)
+			if err != nil {
+				_ = reject(vm.ToValue(fmt.Sprintf("host function %q: marshal params: %v", def.Name, err)))
+				return vm.ToValue(promise)
+			}
+			params = b
+		} else {
+			params = json.RawMessage("null")
+		}
+
+		effectID := model.EffectID(uuid.NewString())
+		promiseID := model.PromiseID(uuid.NewString())
+
+		// AppendFact(EffectStarted) synchronously on the event loop before the
+		// goroutine is launched — no goroutine may run without a journal entry.
+		cellID := wiring.cellID()
+		if err := wiring.store.AppendFact(context.Background(), model.EffectStarted{
+			Session:      wiring.sessionID,
+			Effect:       effectID,
+			Cell:         cellID,
+			FunctionName: def.Name,
+			Params:       params,
+			ReplayPolicy: def.ReplayPolicy,
+			At:           time.Now().UTC(),
+		}); err != nil {
+			_ = reject(vm.ToValue(fmt.Sprintf("host function %q: journal EffectStarted: %v", def.Name, err)))
+			return vm.ToValue(promise)
+		}
+
+		// Record the effect+promise in the accumulator so the caller can populate
+		// CellEvaluated.LinkedEffects and CellEvaluated.CreatedPromises.
+		wiring.acc.add(effectID, model.PromiseRef{ID: promiseID, State: model.PromisePending})
+
+		invoke := def.Invoke
+		sessionID := wiring.sessionID
+		st := wiring.store
+
+		go func() {
+			result, err := invoke(context.Background(), params)
+			engine.RunOnRuntimeLoop(vm, func(vm *goja.Runtime) {
+				now := time.Now().UTC()
+				if err != nil {
+					_ = st.AppendFact(context.Background(), model.EffectFailed{
+						Session:      sessionID,
+						Effect:       effectID,
+						ErrorMessage: err.Error(),
+						At:           now,
+					})
+					_ = reject(vm.ToValue(err.Error()))
+					return
+				}
+				_ = st.AppendFact(context.Background(), model.EffectCompleted{
+					Session: sessionID,
+					Effect:  effectID,
+					Result:  result,
+					At:      now,
+				})
+				// Parse the JSON result back into a JS value so callers can
+				// await the promise and receive a proper object.
+				var resultVal any
+				if len(result) > 0 {
+					if jsonErr := json.Unmarshal(result, &resultVal); jsonErr != nil {
+						// If we can't unmarshal, pass the raw string.
+						resultVal = string(result)
+					}
+				}
+				_ = resolve(vm.ToValue(resultVal))
+			})
+		}()
+
+		return vm.ToValue(promise)
+	})
 }
 
 func (r *branchRuntime) close() {
@@ -238,8 +382,10 @@ func valueToEvalResult(val goja.Value) (evalResult, error) {
 //
 // Returns an error (and a nil runtime) if any step fails to evaluate; in that
 // case the caller should abort the restore without activating the new branch.
-func replayPlanIntoRuntime(ctx context.Context, plan store.ReplayPlan, rtCtx engine.SessionRuntimeContext, delegate engine.VMDelegate) (*branchRuntime, json.RawMessage, string, error) {
-	rt, configuredState, runtimeHash, err := newBranchRuntime(rtCtx, delegate, plan.RuntimeConfig)
+//
+// wiring is forwarded to newBranchRuntime; pass nil when no effects delegate is configured.
+func replayPlanIntoRuntime(ctx context.Context, plan store.ReplayPlan, rtCtx engine.SessionRuntimeContext, delegate engine.VMDelegate, wiring *effectsWiring) (*branchRuntime, json.RawMessage, string, error) {
+	rt, configuredState, runtimeHash, err := newBranchRuntime(ctx, rtCtx, delegate, plan.RuntimeConfig, wiring)
 	if err != nil {
 		return nil, nil, "", err
 	}
