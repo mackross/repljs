@@ -758,7 +758,10 @@ ORDER BY id ASC`
 	}
 
 	var recordedResult []byte
+	completionOrder := 0
+	rowIndex := 0
 	for rows2.Next() {
+		rowIndex++
 		var payload string
 		if err := rows2.Scan(&payload); err != nil {
 			_ = rows2.Close()
@@ -771,6 +774,7 @@ ORDER BY id ASC`
 		}
 		if f.Effect == effectID {
 			recordedResult = f.Result
+			completionOrder = rowIndex
 			break
 		}
 	}
@@ -781,8 +785,9 @@ ORDER BY id ASC`
 	}
 
 	return store.ReplayDecision{
-		Effect:         effectID,
-		Policy:         policy,
-		RecordedResult: recordedResult,
+		Effect:          effectID,
+		Policy:          policy,
+		RecordedResult:  recordedResult,
+		CompletionOrder: completionOrder,
 	}, nil
 }

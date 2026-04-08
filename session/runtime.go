@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -21,14 +22,20 @@ const directRunTimeout = 100 * time.Millisecond
 
 // effectAccumulator collects the EffectIDs and PromiseRefs launched during a
 // single cell evaluation. It is goroutine-safe; both the JS event-loop
-// goroutine (via add) and the caller (via drain) may touch it concurrently.
+// goroutine (via add*) and the caller (via drain) may touch it concurrently.
 type effectAccumulator struct {
 	mu       sync.Mutex
 	effects  []model.EffectID
 	promises []model.PromiseRef
 }
 
-func (a *effectAccumulator) add(effectID model.EffectID, promiseRef model.PromiseRef) {
+func (a *effectAccumulator) addEffect(effectID model.EffectID) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.effects = append(a.effects, effectID)
+}
+
+func (a *effectAccumulator) addAsync(effectID model.EffectID, promiseRef model.PromiseRef) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.effects = append(a.effects, effectID)
@@ -45,23 +52,267 @@ func (a *effectAccumulator) drain() ([]model.EffectID, []model.PromiseRef) {
 	return effects, promises
 }
 
-// effectsWiring bundles the dependencies needed to install journaling wrappers
-// for host functions. newBranchRuntime accepts a *effectsWiring; nil disables
-// the feature entirely.
-type effectsWiring struct {
-	delegate  engine.EffectsDelegate
+type hostRuntimeWiring struct {
+	store      store.Store
+	sessionID  model.SessionID
+	replayPlan *store.ReplayPlan
+}
+
+type hostFunctionMode uint8
+
+const (
+	hostFunctionModeLive hostFunctionMode = iota
+	hostFunctionModeReplay
+)
+
+type replayInvocation struct {
+	effectID model.EffectID
+	decision store.ReplayDecision
+}
+
+type replayStepState struct {
+	mu            sync.Mutex
+	effects       []replayInvocation
+	nextStart     int
+	pendingAsync  map[int][]func(*goja.Runtime)
+	flushScheduled bool
+}
+
+func newReplayStepState(effectIDs []model.EffectID, decisions map[model.EffectID]store.ReplayDecision) (*replayStepState, error) {
+	state := &replayStepState{}
+	if len(effectIDs) == 0 {
+		return state, nil
+	}
+	state.effects = make([]replayInvocation, 0, len(effectIDs))
+	for _, effectID := range effectIDs {
+		decision, ok := decisions[effectID]
+		if !ok {
+			return nil, fmt.Errorf("missing replay decision for effect %q", effectID)
+		}
+		state.effects = append(state.effects, replayInvocation{effectID: effectID, decision: decision})
+	}
+	return state, nil
+}
+
+func (s *replayStepState) nextEffect() (replayInvocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nextStart >= len(s.effects) {
+		return replayInvocation{}, fmt.Errorf("replay effect stream exhausted")
+	}
+	inv := s.effects[s.nextStart]
+	s.nextStart++
+	return inv, nil
+}
+
+func (s *replayStepState) queueAsync(order int, settle func(*goja.Runtime)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingAsync == nil {
+		s.pendingAsync = make(map[int][]func(*goja.Runtime))
+	}
+	s.pendingAsync[order] = append(s.pendingAsync[order], settle)
+	if s.flushScheduled {
+		return false
+	}
+	s.flushScheduled = true
+	return true
+}
+
+func (s *replayStepState) takePendingAsync() []func(*goja.Runtime) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pendingAsync) == 0 {
+		s.flushScheduled = false
+		return nil
+	}
+	orders := make([]int, 0, len(s.pendingAsync))
+	for order := range s.pendingAsync {
+		orders = append(orders, order)
+	}
+	sort.Ints(orders)
+	settlers := make([]func(*goja.Runtime), 0, len(orders))
+	for _, order := range orders {
+		settlers = append(settlers, s.pendingAsync[order]...)
+	}
+	s.pendingAsync = nil
+	s.flushScheduled = false
+	return settlers
+}
+
+func (s *replayStepState) ensureConsumed() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nextStart != len(s.effects) {
+		return fmt.Errorf("replay consumed %d of %d expected effects", s.nextStart, len(s.effects))
+	}
+	return nil
+}
+
+type liveCallState struct {
+	cellID model.CellID
+	acc    *effectAccumulator
+}
+
+type hostFunctionRouter struct {
+	vm        *goja.Runtime
 	store     store.Store
 	sessionID model.SessionID
-	cellID    func() model.CellID   // returns the cell being evaluated (may be called during setup)
-	acc       *effectAccumulator
+
+	modeMu sync.RWMutex
+	mode   hostFunctionMode
+
+	liveMu sync.RWMutex
+	live   *liveCallState
+
+	replayMu   sync.Mutex
+	replayStep *replayStepState
+}
+
+func newHostFunctionRouter(vm *goja.Runtime, wiring *hostRuntimeWiring) *hostFunctionRouter {
+	router := &hostFunctionRouter{vm: vm}
+	if wiring != nil {
+		router.store = wiring.store
+		router.sessionID = wiring.sessionID
+		if wiring.replayPlan != nil {
+			router.mode = hostFunctionModeReplay
+		} else {
+			router.mode = hostFunctionModeLive
+		}
+	}
+	return router
+}
+
+func (r *hostFunctionRouter) beginCell(cellID model.CellID, acc *effectAccumulator) {
+	if r == nil {
+		return
+	}
+	r.liveMu.Lock()
+	defer r.liveMu.Unlock()
+	r.live = &liveCallState{cellID: cellID, acc: acc}
+}
+
+func (r *hostFunctionRouter) endCell() {
+	if r == nil {
+		return
+	}
+	r.liveMu.Lock()
+	defer r.liveMu.Unlock()
+	r.live = nil
+}
+
+func (r *hostFunctionRouter) beginReplayStep(effectIDs []model.EffectID, decisions map[model.EffectID]store.ReplayDecision) error {
+	if r == nil {
+		return nil
+	}
+	state, err := newReplayStepState(effectIDs, decisions)
+	if err != nil {
+		return err
+	}
+	r.replayMu.Lock()
+	defer r.replayMu.Unlock()
+	r.replayStep = state
+	return nil
+}
+
+func (r *hostFunctionRouter) finishReplayStep() error {
+	if r == nil {
+		return nil
+	}
+	r.replayMu.Lock()
+	state := r.replayStep
+	r.replayStep = nil
+	r.replayMu.Unlock()
+	if state == nil {
+		return nil
+	}
+	return state.ensureConsumed()
+}
+
+func (r *hostFunctionRouter) activateLive() {
+	if r == nil {
+		return
+	}
+	r.modeMu.Lock()
+	defer r.modeMu.Unlock()
+	r.mode = hostFunctionModeLive
+}
+
+func (r *hostFunctionRouter) currentMode() hostFunctionMode {
+	if r == nil {
+		return hostFunctionModeLive
+	}
+	r.modeMu.RLock()
+	defer r.modeMu.RUnlock()
+	return r.mode
+}
+
+func (r *hostFunctionRouter) currentLiveState() (*liveCallState, error) {
+	r.liveMu.RLock()
+	defer r.liveMu.RUnlock()
+	if r.live == nil {
+		return nil, fmt.Errorf("host function invoked with no active cell evaluation")
+	}
+	return r.live, nil
+}
+
+func (r *hostFunctionRouter) nextReplayInvocation() (replayInvocation, error) {
+	r.replayMu.Lock()
+	state := r.replayStep
+	r.replayMu.Unlock()
+	if state == nil {
+		return replayInvocation{}, fmt.Errorf("replay host function invoked outside replay step")
+	}
+	return state.nextEffect()
+}
+
+func (r *hostFunctionRouter) queueReplayAsync(order int, settle func(*goja.Runtime)) {
+	r.replayMu.Lock()
+	state := r.replayStep
+	r.replayMu.Unlock()
+	if state == nil {
+		return
+	}
+	if !state.queueAsync(order, settle) {
+		return
+	}
+	engine.RunOnRuntimeLoop(r.vm, func(vm *goja.Runtime) {
+		settlers := state.takePendingAsync()
+		for _, fn := range settlers {
+			fn(vm)
+		}
+	})
+}
+
+type hostFuncBuilder struct {
+	router *hostFunctionRouter
+}
+
+func (b hostFuncBuilder) WrapSync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		if b.router == nil || b.router.vm == nil {
+			panic(goja.Undefined())
+		}
+		return b.router.invokeSync(name, replay, invoke, call)
+	}
+}
+
+func (b hostFuncBuilder) WrapAsync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		if b.router == nil || b.router.vm == nil {
+			return goja.Undefined()
+		}
+		return b.router.invokeAsync(name, replay, invoke, call)
+	}
 }
 
 // branchRuntime holds a single goja VM that persists across successful submits
 // on one branch. Each new branch (including after Restore) gets its own VM so
 // bindings from sibling branches are never visible to one another.
 type branchRuntime struct {
-	vm   *goja.Runtime
-	loop *eventloop.EventLoop
+	vm     *goja.Runtime
+	loop   *eventloop.EventLoop
+	router *hostFunctionRouter
 }
 
 func normalizeRuntimeConfig(state json.RawMessage) (json.RawMessage, error) {
@@ -88,11 +339,7 @@ func runtimeConfigHash(state json.RawMessage) string {
 // starts an event loop for it, and applies the optional delegate before
 // returning. It returns the configured VM plus the serialised runtime
 // descriptor that should be persisted for future recreation.
-//
-// When wiring is non-nil, newBranchRuntime also calls
-// wiring.delegate.HostFunctions and installs one journaling JS global per
-// HostFunctionDef. Pass nil to skip effect wiring (no delegate configured).
-func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, delegate engine.VMDelegate, state json.RawMessage, wiring *effectsWiring) (*branchRuntime, json.RawMessage, string, error) {
+func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate, state json.RawMessage, replayPlan *store.ReplayPlan) (*branchRuntime, json.RawMessage, string, error) {
 	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
 	loop.Start()
 
@@ -105,6 +352,7 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, d
 	initCh := make(chan initResult, 1)
 	loop.RunOnLoop(func(vm *goja.Runtime) {
 		engine.BindRuntimeLoop(vm, loop.RunOnLoop)
+		router := newHostFunctionRouter(vm, &hostRuntimeWiring{store: st, sessionID: ctx.SessionID, replayPlan: replayPlan})
 
 		normalizedState, err := normalizeRuntimeConfig(state)
 		if err != nil {
@@ -113,7 +361,7 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, d
 		}
 		configuredState := normalizedState
 		if delegate != nil {
-			configuredState, err = delegate.ConfigureRuntime(ctx, vm, normalizedState)
+			configuredState, err = delegate.ConfigureRuntime(ctx, vm, hostFuncBuilder{router: router}, normalizedState)
 			if err != nil {
 				initCh <- initResult{err: fmt.Errorf("configure runtime: %w", err)}
 				return
@@ -128,24 +376,9 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, d
 			normalizedConfiguredState = append(json.RawMessage(nil), normalizedConfiguredState...)
 		}
 
-		// Install journaling host-function bindings if an effects delegate is wired.
-		if wiring != nil {
-			defs, hErr := wiring.delegate.HostFunctions(bgCtx, wiring.sessionID)
-			if hErr != nil {
-				initCh <- initResult{err: fmt.Errorf("effects delegate: HostFunctions: %w", hErr)}
-				return
-			}
-			for _, def := range defs {
-				def := def // capture loop variable
-				if hErr := installHostFunction(vm, wiring, def); hErr != nil {
-					initCh <- initResult{err: fmt.Errorf("install host function %q: %w", def.Name, hErr)}
-					return
-				}
-			}
-		}
-
+		_ = bgCtx
 		initCh <- initResult{
-			runtime:     &branchRuntime{vm: vm, loop: loop},
+			runtime:     &branchRuntime{vm: vm, loop: loop, router: router},
 			configured:  normalizedConfiguredState,
 			runtimeHash: runtimeConfigHash(normalizedConfiguredState),
 		}
@@ -162,89 +395,39 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, d
 	return init.runtime, init.configured, init.runtimeHash, nil
 }
 
-// installHostFunction sets a JS global on vm that journals EffectStarted /
-// EffectCompleted / EffectFailed facts and calls def.Invoke in a goroutine.
-// Must be called on the runtime event loop.
-func installHostFunction(vm *goja.Runtime, wiring *effectsWiring, def engine.HostFunctionDef) error {
-	return vm.Set(def.Name, func(call goja.FunctionCall) goja.Value {
-		promise, resolve, reject := vm.NewPromise()
+func (r *branchRuntime) beginCell(cellID model.CellID, acc *effectAccumulator) {
+	if r == nil || r.router == nil {
+		return
+	}
+	r.router.beginCell(cellID, acc)
+}
 
-		// Serialize the first argument to JSON.
-		var params json.RawMessage
-		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
-			exported := call.Arguments[0].Export()
-			b, err := json.Marshal(exported)
-			if err != nil {
-				_ = reject(vm.ToValue(fmt.Sprintf("host function %q: marshal params: %v", def.Name, err)))
-				return vm.ToValue(promise)
-			}
-			params = b
-		} else {
-			params = json.RawMessage("null")
-		}
+func (r *branchRuntime) endCell() {
+	if r == nil || r.router == nil {
+		return
+	}
+	r.router.endCell()
+}
 
-		effectID := model.EffectID(uuid.NewString())
-		promiseID := model.PromiseID(uuid.NewString())
+func (r *branchRuntime) beginReplayStep(effectIDs []model.EffectID, decisions map[model.EffectID]store.ReplayDecision) error {
+	if r == nil || r.router == nil {
+		return nil
+	}
+	return r.router.beginReplayStep(effectIDs, decisions)
+}
 
-		// AppendFact(EffectStarted) synchronously on the event loop before the
-		// goroutine is launched — no goroutine may run without a journal entry.
-		cellID := wiring.cellID()
-		if err := wiring.store.AppendFact(context.Background(), model.EffectStarted{
-			Session:      wiring.sessionID,
-			Effect:       effectID,
-			Cell:         cellID,
-			FunctionName: def.Name,
-			Params:       params,
-			ReplayPolicy: def.ReplayPolicy,
-			At:           time.Now().UTC(),
-		}); err != nil {
-			_ = reject(vm.ToValue(fmt.Sprintf("host function %q: journal EffectStarted: %v", def.Name, err)))
-			return vm.ToValue(promise)
-		}
+func (r *branchRuntime) finishReplayStep() error {
+	if r == nil || r.router == nil {
+		return nil
+	}
+	return r.router.finishReplayStep()
+}
 
-		// Record the effect+promise in the accumulator so the caller can populate
-		// CellEvaluated.LinkedEffects and CellEvaluated.CreatedPromises.
-		wiring.acc.add(effectID, model.PromiseRef{ID: promiseID, State: model.PromisePending})
-
-		invoke := def.Invoke
-		sessionID := wiring.sessionID
-		st := wiring.store
-
-		go func() {
-			result, err := invoke(context.Background(), params)
-			engine.RunOnRuntimeLoop(vm, func(vm *goja.Runtime) {
-				now := time.Now().UTC()
-				if err != nil {
-					_ = st.AppendFact(context.Background(), model.EffectFailed{
-						Session:      sessionID,
-						Effect:       effectID,
-						ErrorMessage: err.Error(),
-						At:           now,
-					})
-					_ = reject(vm.ToValue(err.Error()))
-					return
-				}
-				_ = st.AppendFact(context.Background(), model.EffectCompleted{
-					Session: sessionID,
-					Effect:  effectID,
-					Result:  result,
-					At:      now,
-				})
-				// Parse the JSON result back into a JS value so callers can
-				// await the promise and receive a proper object.
-				var resultVal any
-				if len(result) > 0 {
-					if jsonErr := json.Unmarshal(result, &resultVal); jsonErr != nil {
-						// If we can't unmarshal, pass the raw string.
-						resultVal = string(result)
-					}
-				}
-				_ = resolve(vm.ToValue(resultVal))
-			})
-		}()
-
-		return vm.ToValue(promise)
-	})
+func (r *branchRuntime) activateLiveBindings() {
+	if r == nil || r.router == nil {
+		return
+	}
+	r.router.activateLive()
 }
 
 func (r *branchRuntime) close() {
@@ -255,6 +438,162 @@ func (r *branchRuntime) close() {
 		engine.UnbindRuntimeLoop(r.vm)
 	}
 	r.loop.Stop()
+}
+
+func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
+	vm := r.vm
+	params, err := marshalFirstArgument(call)
+	if err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
+	if r.currentMode() == hostFunctionModeReplay {
+		inv, replayErr := r.nextReplayInvocation()
+		if replayErr != nil {
+			panic(vm.ToValue(fmt.Sprintf("host function %q replay: %v", name, replayErr)))
+		}
+		if len(inv.decision.RecordedResult) == 0 {
+			panic(vm.ToValue(fmt.Sprintf("host function %q replay: missing recorded result for effect %q", name, inv.effectID)))
+		}
+		return jsonResultToValue(vm, inv.decision.RecordedResult)
+	}
+
+	live, err := r.currentLiveState()
+	if err != nil {
+		panic(vm.ToValue(fmt.Sprintf("host function %q: %v", name, err)))
+	}
+	effectID := model.EffectID(uuid.NewString())
+	if err := r.store.AppendFact(context.Background(), model.EffectStarted{
+		Session:      r.sessionID,
+		Effect:       effectID,
+		Cell:         live.cellID,
+		FunctionName: name,
+		Params:       params,
+		ReplayPolicy: replay,
+		At:           time.Now().UTC(),
+	}); err != nil {
+		panic(vm.ToValue(fmt.Sprintf("host function %q: journal EffectStarted: %v", name, err)))
+	}
+	live.acc.addEffect(effectID)
+
+	result, err := invoke(context.Background(), params)
+	if err != nil {
+		_ = r.store.AppendFact(context.Background(), model.EffectFailed{
+			Session:      r.sessionID,
+			Effect:       effectID,
+			ErrorMessage: err.Error(),
+			At:           time.Now().UTC(),
+		})
+		panic(vm.ToValue(err.Error()))
+	}
+	if err := r.store.AppendFact(context.Background(), model.EffectCompleted{
+		Session: r.sessionID,
+		Effect:  effectID,
+		Result:  result,
+		At:      time.Now().UTC(),
+	}); err != nil {
+		panic(vm.ToValue(fmt.Sprintf("host function %q: journal EffectCompleted: %v", name, err)))
+	}
+	return jsonResultToValue(vm, result)
+}
+
+func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
+	vm := r.vm
+	promise, resolve, reject := vm.NewPromise()
+
+	params, err := marshalFirstArgument(call)
+	if err != nil {
+		_ = reject(vm.ToValue(err.Error()))
+		return vm.ToValue(promise)
+	}
+
+	if r.currentMode() == hostFunctionModeReplay {
+		inv, replayErr := r.nextReplayInvocation()
+		if replayErr != nil {
+			_ = reject(vm.ToValue(fmt.Sprintf("host function %q replay: %v", name, replayErr)))
+			return vm.ToValue(promise)
+		}
+		if len(inv.decision.RecordedResult) == 0 {
+			_ = reject(vm.ToValue(fmt.Sprintf("host function %q replay: missing recorded result for effect %q", name, inv.effectID)))
+			return vm.ToValue(promise)
+		}
+		order := inv.decision.CompletionOrder
+		if order <= 0 {
+			order = int(time.Now().UnixNano())
+		}
+		r.queueReplayAsync(order, func(vm *goja.Runtime) {
+			_ = resolve(jsonResultToValue(vm, inv.decision.RecordedResult))
+		})
+		return vm.ToValue(promise)
+	}
+
+	live, stateErr := r.currentLiveState()
+	if stateErr != nil {
+		_ = reject(vm.ToValue(fmt.Sprintf("host function %q: %v", name, stateErr)))
+		return vm.ToValue(promise)
+	}
+	effectID := model.EffectID(uuid.NewString())
+	promiseID := model.PromiseID(uuid.NewString())
+	if err := r.store.AppendFact(context.Background(), model.EffectStarted{
+		Session:      r.sessionID,
+		Effect:       effectID,
+		Cell:         live.cellID,
+		FunctionName: name,
+		Params:       params,
+		ReplayPolicy: replay,
+		At:           time.Now().UTC(),
+	}); err != nil {
+		_ = reject(vm.ToValue(fmt.Sprintf("host function %q: journal EffectStarted: %v", name, err)))
+		return vm.ToValue(promise)
+	}
+	live.acc.addAsync(effectID, model.PromiseRef{ID: promiseID, State: model.PromisePending})
+
+	go func() {
+		result, invokeErr := invoke(context.Background(), params)
+		engine.RunOnRuntimeLoop(vm, func(vm *goja.Runtime) {
+			now := time.Now().UTC()
+			if invokeErr != nil {
+				_ = r.store.AppendFact(context.Background(), model.EffectFailed{
+					Session:      r.sessionID,
+					Effect:       effectID,
+					ErrorMessage: invokeErr.Error(),
+					At:           now,
+				})
+				_ = reject(vm.ToValue(invokeErr.Error()))
+				return
+			}
+			_ = r.store.AppendFact(context.Background(), model.EffectCompleted{
+				Session: r.sessionID,
+				Effect:  effectID,
+				Result:  result,
+				At:      now,
+			})
+			_ = resolve(jsonResultToValue(vm, result))
+		})
+	}()
+
+	return vm.ToValue(promise)
+}
+
+func marshalFirstArgument(call goja.FunctionCall) (json.RawMessage, error) {
+	if len(call.Arguments) == 0 || goja.IsUndefined(call.Arguments[0]) || goja.IsNull(call.Arguments[0]) {
+		return json.RawMessage("null"), nil
+	}
+	b, err := json.Marshal(call.Arguments[0].Export())
+	if err != nil {
+		return nil, fmt.Errorf("marshal params: %w", err)
+	}
+	return b, nil
+}
+
+func jsonResultToValue(vm *goja.Runtime, raw json.RawMessage) goja.Value {
+	if len(raw) == 0 {
+		return vm.ToValue(nil)
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return vm.ToValue(string(raw))
+	}
+	return vm.ToValue(decoded)
 }
 
 // evalResult carries the output of a single evaluation.
@@ -379,22 +718,27 @@ func valueToEvalResult(val goja.Value) (evalResult, error) {
 // plan into it, in order, using the same evaluation path as Submit. This
 // ensures a restored branch starts with exactly the bindings visible at the
 // restore target, and no bindings created after the fork point.
-//
-// Returns an error (and a nil runtime) if any step fails to evaluate; in that
-// case the caller should abort the restore without activating the new branch.
-//
-// wiring is forwarded to newBranchRuntime; pass nil when no effects delegate is configured.
-func replayPlanIntoRuntime(ctx context.Context, plan store.ReplayPlan, rtCtx engine.SessionRuntimeContext, delegate engine.VMDelegate, wiring *effectsWiring) (*branchRuntime, json.RawMessage, string, error) {
-	rt, configuredState, runtimeHash, err := newBranchRuntime(ctx, rtCtx, delegate, plan.RuntimeConfig, wiring)
+func replayPlanIntoRuntime(ctx context.Context, plan store.ReplayPlan, rtCtx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate) (*branchRuntime, json.RawMessage, string, error) {
+	rt, configuredState, runtimeHash, err := newBranchRuntime(ctx, rtCtx, st, delegate, plan.RuntimeConfig, &plan)
 	if err != nil {
 		return nil, nil, "", err
 	}
 	for _, step := range plan.Steps {
+		if err := rt.beginReplayStep(step.Effects, plan.Decisions); err != nil {
+			rt.close()
+			return nil, nil, "", fmt.Errorf("prepare replay step %q: %w", step.Cell, err)
+		}
 		if _, err := rt.runContext(ctx, step.Source); err != nil {
+			_ = rt.finishReplayStep()
 			rt.close()
 			return nil, nil, "", fmt.Errorf("replay cell %q: %w", step.Cell, err)
 		}
+		if err := rt.finishReplayStep(); err != nil {
+			rt.close()
+			return nil, nil, "", fmt.Errorf("replay cell %q effects: %w", step.Cell, err)
+		}
 	}
+	rt.activateLiveBindings()
 	return rt, configuredState, runtimeHash, nil
 }
 

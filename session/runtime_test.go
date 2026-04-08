@@ -11,7 +11,7 @@ import (
 
 func mustNewBranchRuntime(t *testing.T) *branchRuntime {
 	t.Helper()
-	rt, _, _, err := newBranchRuntime(context.Background(), engine.SessionRuntimeContext{}, nil, nil, nil)
+	rt, _, _, err := newBranchRuntime(context.Background(), engine.SessionRuntimeContext{}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("newBranchRuntime: %v", err)
 	}

@@ -66,7 +66,7 @@ func (e *Engine) StartSession(ctx context.Context, cfg model.SessionConfig, deps
 		SessionID:   sessionID,
 		BranchID:    rootBranchID,
 		RuntimeHash: runtimeConfigHash(deps.RuntimeConfig),
-	}, deps.VMDelegate, deps.RuntimeConfig, nil)
+	}, deps.Store, deps.VMDelegate, deps.RuntimeConfig, nil)
 	if err != nil {
 		return nil, fmt.Errorf("session: StartSession: init runtime: %w", err)
 	}
@@ -188,7 +188,7 @@ func (s *session) prepareSubmitRuntime(ctx context.Context) (*branchRuntime, []b
 			SessionID:   s.id,
 			BranchID:    s.branch,
 			RuntimeHash: s.runtimeHash,
-		}, s.delegate, s.runtimeConfig, nil)
+		}, s.store, s.delegate, s.runtimeConfig, nil)
 		if err != nil {
 			return nil, nil, "", err
 		}
@@ -202,7 +202,7 @@ func (s *session) prepareSubmitRuntime(ctx context.Context) (*branchRuntime, []b
 		SessionID:   s.id,
 		BranchID:    s.branch,
 		RuntimeHash: plan.RuntimeHash,
-	}, s.delegate, nil)
+	}, s.store, s.delegate)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("rebuild runtime for submit: %w", err)
 	}
@@ -233,6 +233,11 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: prepare runtime: %w", err)
 	}
 	freshRuntime := evalRuntime != s.runtime
+	cellID := model.CellID(uuid.NewString())
+	acc := &effectAccumulator{}
+	evalRuntime.beginCell(cellID, acc)
+	defer evalRuntime.endCell()
+
 	evalCtx, cancel := withCellSettleTimeout(ctx)
 	defer cancel()
 	eval, err := evalRuntime.runContext(evalCtx, src)
@@ -243,7 +248,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: eval: %w", err)
 	}
 
-	cellID := model.CellID(uuid.NewString())
+	effects, promises := acc.drain()
 	now := time.Now().UTC()
 	previousHead := s.head
 
@@ -267,6 +272,8 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		Session:         s.id,
 		Branch:          s.branch,
 		Cell:            cellID,
+		CreatedPromises: promises,
+		LinkedEffects:   effects,
 		CompletionValue: eval.completionValue,
 		At:              now,
 	}); err != nil {
@@ -328,6 +335,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	return engine.SubmitResult{
 		Cell:            cellID,
 		CompletionValue: eval.completionValue,
+		CreatedPromises: promises,
 	}, nil
 }
 
@@ -387,7 +395,7 @@ func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) er
 		SessionID:   s.id,
 		BranchID:    newBranchID,
 		RuntimeHash: plan.RuntimeHash,
-	}, s.delegate, nil)
+	}, s.store, s.delegate)
 	if err != nil {
 		return fmt.Errorf("session: Restore: replay history: %w", err)
 	}

@@ -85,38 +85,52 @@ type asyncHostDelegate struct {
 type asyncHostSessionState struct {
 	callCount int
 	round     int
-	pending   map[string]func(*goja.Runtime)
+	pending   map[string]*asyncPendingCall
+}
+
+type asyncPendingCall struct {
+	proceed  chan struct{}
+	returned chan struct{}
 }
 
 type blockingHostDelegate struct {
 	enter   chan string
 	release chan struct{}
+
+	mu    sync.Mutex
+	calls map[model.SessionID]int
 }
 
-func (d *blockingHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, state json.RawMessage) (json.RawMessage, error) {
-	if err := rt.Set("hostAsync", func(call goja.FunctionCall) goja.Value {
-		promise, resolve, reject := rt.NewPromise()
-		if len(call.Arguments) < 1 || goja.IsUndefined(call.Arguments[0]) || goja.IsNull(call.Arguments[0]) {
-			_ = reject(rt.ToValue("hostAsync: value required"))
-			return rt.ToValue(promise)
+func (d *blockingHostDelegate) recordCall(sessionID model.SessionID) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.calls == nil {
+		d.calls = make(map[model.SessionID]int)
+	}
+	d.calls[sessionID]++
+}
+
+func (d *blockingHostDelegate) CallCount(sessionID model.SessionID) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls[sessionID]
+}
+
+func (d *blockingHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
+		var value string
+		if err := json.Unmarshal(params, &value); err != nil {
+			return nil, fmt.Errorf("hostAsync: value required")
 		}
-		value := call.Arguments[0].String()
-		go func() {
-			if d.enter != nil {
-				d.enter <- value
-			}
-			if d.release != nil {
-				<-d.release
-			}
-			ok := engine.RunOnRuntimeLoop(rt, func(vm *goja.Runtime) {
-				_ = resolve(vm.ToValue(value))
-			})
-			if !ok {
-				_ = reject(rt.ToValue("runtime loop unavailable"))
-			}
-		}()
-		return rt.ToValue(promise)
-	}); err != nil {
+		d.recordCall(ctx.SessionID)
+		if d.enter != nil {
+			d.enter <- value
+		}
+		if d.release != nil {
+			<-d.release
+		}
+		return json.Marshal(value)
+	})); err != nil {
 		return nil, err
 	}
 	if err := rt.Set("hostWrap", func(call goja.FunctionCall) goja.Value {
@@ -126,12 +140,7 @@ func (d *blockingHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, 
 			return rt.ToValue(promise)
 		}
 		value := call.Arguments[0].String()
-		ok := engine.RunOnRuntimeLoop(rt, func(vm *goja.Runtime) {
-			_ = resolve(vm.ToValue(map[string]any{"value": value}))
-		})
-		if !ok {
-			_ = reject(rt.ToValue("runtime loop unavailable"))
-		}
+		_ = resolve(rt.ToValue(map[string]any{"value": value}))
 		return rt.ToValue(promise)
 	}); err != nil {
 		return nil, err
@@ -165,66 +174,65 @@ func (d *asyncHostDelegate) CallCount(sessionID model.SessionID) int {
 	return d.state[sessionID].callCount
 }
 
-func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, state json.RawMessage) (json.RawMessage, error) {
-	if err := rt.Set("hostAsync", func(call goja.FunctionCall) goja.Value {
-		promise, resolve, reject := rt.NewPromise()
-		if len(call.Arguments) < 1 || goja.IsUndefined(call.Arguments[0]) || goja.IsNull(call.Arguments[0]) {
-			_ = reject(rt.ToValue("hostAsync: value required"))
-			return rt.ToValue(promise)
+func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
+		var value string
+		if err := json.Unmarshal(params, &value); err != nil {
+			return nil, fmt.Errorf("hostAsync: value required")
 		}
-		value := call.Arguments[0].String()
-		go func() {
-			cur := atomic.AddInt32(&d.current, 1)
-			for {
-				max := atomic.LoadInt32(&d.max)
-				if cur <= max || atomic.CompareAndSwapInt32(&d.max, max, cur) {
-					break
-				}
-			}
-			defer atomic.AddInt32(&d.current, -1)
-			if d.enter != nil {
-				d.enter <- value
-			}
-			if d.release != nil {
-				<-d.release
-			}
 
-			st := d.sessionState(ctx.SessionID)
-			d.mu.Lock()
-			st.callCount++
-			if st.pending == nil {
-				st.round++
-				st.pending = make(map[string]func(*goja.Runtime))
+		cur := atomic.AddInt32(&d.current, 1)
+		for {
+			max := atomic.LoadInt32(&d.max)
+			if cur <= max || atomic.CompareAndSwapInt32(&d.max, max, cur) {
+				break
 			}
-			round := st.round
-			st.pending[value] = func(vm *goja.Runtime) {
-				_ = resolve(vm.ToValue(value))
-			}
-			if len(st.pending) < 2 {
-				d.mu.Unlock()
-				return
-			}
+		}
+		defer atomic.AddInt32(&d.current, -1)
+
+		if d.enter != nil {
+			d.enter <- value
+		}
+		if d.release != nil {
+			<-d.release
+		}
+
+		st := d.sessionState(ctx.SessionID)
+		pc := &asyncPendingCall{proceed: make(chan struct{}), returned: make(chan struct{})}
+
+		d.mu.Lock()
+		st.callCount++
+		if st.pending == nil {
+			st.round++
+			st.pending = make(map[string]*asyncPendingCall)
+		}
+		round := st.round
+		st.pending[value] = pc
+		if len(st.pending) == 2 {
 			pending := st.pending
 			st.pending = nil
-			d.mu.Unlock()
-
-			order := []string{"right", "left"}
-			if round%2 == 0 {
-				order = []string{"left", "right"}
-			}
-			ok := engine.RunOnRuntimeLoop(rt, func(vm *goja.Runtime) {
-				for _, label := range order {
-					if resolver, exists := pending[label]; exists {
-						resolver(vm)
-					}
+			go func() {
+				order := []string{"right", "left"}
+				if round%2 == 0 {
+					order = []string{"left", "right"}
 				}
-			})
-			if !ok {
-				_ = reject(rt.ToValue("runtime loop unavailable"))
-			}
-		}()
-		return rt.ToValue(promise)
-	}); err != nil {
+				first := pending[order[0]]
+				second := pending[order[1]]
+				if first != nil {
+					close(first.proceed)
+					<-first.returned
+				}
+				if second != nil {
+					close(second.proceed)
+				}
+			}()
+		}
+		d.mu.Unlock()
+
+		<-pc.proceed
+		close(pc.returned)
+		return json.Marshal(value)
+	})); err != nil {
 		return nil, err
 	}
 	if err := rt.Set("hostWrap", func(call goja.FunctionCall) goja.Value {
@@ -234,12 +242,7 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 			return rt.ToValue(promise)
 		}
 		value := call.Arguments[0].String()
-		ok := engine.RunOnRuntimeLoop(rt, func(vm *goja.Runtime) {
-			_ = resolve(vm.ToValue(map[string]any{"value": value}))
-		})
-		if !ok {
-			_ = reject(rt.ToValue("runtime loop unavailable"))
-		}
+		_ = resolve(rt.ToValue(map[string]any{"value": value}))
 		return rt.ToValue(promise)
 	}); err != nil {
 		return nil, err
@@ -248,6 +251,40 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 		return append(json.RawMessage(nil), state...), nil
 	}
 	return json.RawMessage(`{"kind":"async-host-test","version":1}`), nil
+}
+
+type syncRandomDelegate struct {
+	mu    sync.Mutex
+	calls map[model.SessionID]int
+}
+
+func (d *syncRandomDelegate) next(sessionID model.SessionID) float64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.calls == nil {
+		d.calls = make(map[model.SessionID]int)
+	}
+	d.calls[sessionID]++
+	return float64(d.calls[sessionID]) / 10
+}
+
+func (d *syncRandomDelegate) CallCount(sessionID model.SessionID) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls[sessionID]
+}
+
+func (d *syncRandomDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	mathObj := rt.Get("Math").ToObject(rt)
+	if err := mathObj.Set("random", host.WrapSync("Math.random", model.ReplayReadonly, func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		return json.Marshal(d.next(ctx.SessionID))
+	})); err != nil {
+		return nil, err
+	}
+	if len(state) != 0 {
+		return append(json.RawMessage(nil), state...), nil
+	}
+	return json.RawMessage(`{"kind":"sync-random-test","version":1}`), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1712,7 +1749,7 @@ func TestSession_Submit_CancelledWhileWaitingOnHostPromise(t *testing.T) {
 	}
 }
 
-func TestSession_ReplayPerSubmit_TimesOutWhileReplayingPriorAsyncCell(t *testing.T) {
+func TestSession_ReplayPerSubmit_ReusesRecordedAsyncCellWhileRebuildingRuntime(t *testing.T) {
 	e := session.New()
 	fix := newFixture(t)
 	delegate := &blockingHostDelegate{
@@ -1733,25 +1770,32 @@ func TestSession_ReplayPerSubmit_TimesOutWhileReplayingPriorAsyncCell(t *testing
 	if err != nil {
 		t.Fatalf("Submit seed cell: %v", err)
 	}
+	if delegate.CallCount(sessID) != 1 {
+		t.Fatalf("expected one live host invocation after seed submit, got %d", delegate.CallCount(sessID))
+	}
 
 	delegate.release = make(chan struct{})
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	_, err = sess.Submit(ctx, `saved + "!"`)
-	close(delegate.release)
-	if err == nil {
-		t.Fatal("expected timeout while replaying prior async cell")
+	res, err := sess.Submit(context.Background(), `saved + "!"`)
+	if err != nil {
+		t.Fatalf("Submit using replayed async state: %v", err)
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected context deadline exceeded, got: %v", err)
+	close(delegate.release)
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value after replayed async state")
+	}
+	if res.CompletionValue.Preview != "seed!" {
+		t.Fatalf("expected preview %q, got %q", "seed!", res.CompletionValue.Preview)
+	}
+	if delegate.CallCount(sessID) != 1 {
+		t.Fatalf("expected replay to reuse recorded host result without a second invocation, got %d calls", delegate.CallCount(sessID))
 	}
 
-	plan, err := fix.st.LoadReplayPlan(context.Background(), sessID, r1.Cell)
+	plan, err := fix.st.LoadReplayPlan(context.Background(), sessID, res.Cell)
 	if err != nil {
-		t.Fatalf("LoadReplayPlan after replay timeout: %v", err)
+		t.Fatalf("LoadReplayPlan after replayed submit: %v", err)
 	}
-	if len(plan.Steps) != 1 || plan.Steps[0].Cell != r1.Cell {
-		t.Fatalf("expected only seed cell committed after replay timeout, got %v", plan.Steps)
+	if len(plan.Steps) != 2 || plan.Steps[0].Cell != r1.Cell || plan.Steps[1].Cell != res.Cell {
+		t.Fatalf("expected seed and derived cells committed, got %v", plan.Steps)
 	}
 }
 
@@ -1905,5 +1949,43 @@ func TestSession_ReplayPerSubmit_ReusesRecordedHostResults_AfterEffectLayer(t *t
 	}
 	if len(problems) > 0 {
 		t.Fatalf("expected replay_per_submit to reuse recorded host results after the effect layer is implemented; %s", strings.Join(problems, "; "))
+	}
+}
+
+func TestSession_ReplayPerSubmit_ReusesRecordedSyncHostResults_AfterEffectLayer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	delegate := &syncRandomDelegate{}
+	h, err := sessiontest.StartComparableSessions(ctx, defaultConfig(), delegate, nil)
+	if err != nil {
+		t.Fatalf("StartComparableSessions: %v", err)
+	}
+	defer h.Close()
+
+	first, err := h.SubmitBoth(ctx, `(() => { globalThis.sample = [Math.random(), Math.random()]; return sample.join(":"); })()`)
+	if err != nil {
+		t.Fatalf("SubmitBoth first cell: %v", err)
+	}
+	if err := sessiontest.CompareSubmitPair(first); err != nil {
+		t.Fatalf("first cell mismatch: %v", err)
+	}
+
+	second, err := h.SubmitBoth(ctx, `sample.join(":")`)
+	if err != nil {
+		t.Fatalf("SubmitBoth second cell: %v", err)
+	}
+
+	var problems []string
+	if err := sessiontest.CompareSubmitPair(second); err != nil {
+		problems = append(problems, fmt.Sprintf("state mismatch: %v", err))
+	}
+	persistentCalls := delegate.CallCount(h.Persistent.ID())
+	replayCalls := delegate.CallCount(h.Replay.ID())
+	if persistentCalls != replayCalls {
+		problems = append(problems, fmt.Sprintf("sync host invocation count mismatch: persistent=%d replay=%d", persistentCalls, replayCalls))
+	}
+	if len(problems) > 0 {
+		t.Fatalf("expected replay_per_submit to reuse recorded sync host results after the effect layer is implemented; %s", strings.Join(problems, "; "))
 	}
 }

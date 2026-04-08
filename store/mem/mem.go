@@ -535,7 +535,8 @@ func (s *Store) loadReplayDecision(session model.SessionID, effectID model.Effec
 	}
 
 	var recordedResult []byte
-	for _, e := range s.facts {
+	completionOrder := 0
+	for i, e := range s.facts {
 		if e.session != session || e.factType != model.FactTypeEffectCompleted {
 			continue
 		}
@@ -544,12 +545,14 @@ func (s *Store) loadReplayDecision(session model.SessionID, effectID model.Effec
 			continue
 		}
 		recordedResult = f.Result
+		completionOrder = i + 1
 		break
 	}
 
 	return store.ReplayDecision{
-		Effect:         effectID,
-		Policy:         policy,
-		RecordedResult: recordedResult,
+		Effect:          effectID,
+		Policy:          policy,
+		RecordedResult:  recordedResult,
+		CompletionOrder: completionOrder,
 	}, nil
 }

@@ -45,6 +45,11 @@ type ReplayDecision struct {
 	// value means the effect did not complete before the prior process ended.
 	RecordedResult []byte
 
+	// CompletionOrder is the append-order index of the terminal success row for
+	// this effect. Replay uses it to preserve settlement order for concurrent
+	// async effects within a replayed cell.
+	CompletionOrder int
+
 	// Rerun, when true, instructs the effects layer to re-invoke the host
 	// function rather than reusing a recorded result.
 	Rerun bool

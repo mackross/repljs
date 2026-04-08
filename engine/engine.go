@@ -103,37 +103,33 @@ type SessionRuntimeContext struct {
 	RuntimeHash string
 }
 
+// HostFuncInvoke is the Go implementation behind one journaled host call.
+// params is the JSON-serialised first argument passed from JS. The returned
+// bytes must be valid JSON.
+type HostFuncInvoke func(ctx context.Context, params json.RawMessage) (json.RawMessage, error)
+
+// HostFuncBuilder wraps Go implementations with the runtime's effect-journaling
+// and replay machinery. The delegate chooses where the returned callables are
+// installed in the goja object graph.
+type HostFuncBuilder interface {
+	// WrapSync returns a callable goja binding that executes synchronously from
+	// JS while still passing through effect journaling and replay control.
+	WrapSync(name string, replay model.ReplayPolicy, invoke HostFuncInvoke) func(goja.FunctionCall) goja.Value
+
+	// WrapAsync returns a callable goja binding that resolves via a JS Promise
+	// while still passing through effect journaling and replay control.
+	WrapAsync(name string, replay model.ReplayPolicy, invoke HostFuncInvoke) func(goja.FunctionCall) goja.Value
+}
+
 type VMDelegate interface {
-	// ConfigureRuntime installs any host bindings onto a fresh VM. The input
-	// state is the last serialised runtime descriptor persisted for this
-	// session. The returned state is what should be persisted for future VM
-	// recreation.
-	ConfigureRuntime(ctx SessionRuntimeContext, rt *goja.Runtime, state json.RawMessage) (json.RawMessage, error)
-}
-
-// HostFunctionDef describes a single callable host function together with its
-// live implementation. Name must match the identifier used by the JS global
-// installed in the runtime.
-type HostFunctionDef struct {
-	// Name is the JS global name for this function (e.g. "myTool").
-	Name string
-
-	// ReplayPolicy controls how the effects layer handles this call during
-	// session restore.
-	ReplayPolicy model.ReplayPolicy
-
-	// Invoke is the Go implementation. params is the JSON-serialised first
-	// argument passed from JS. The returned bytes must be valid JSON.
-	Invoke func(ctx context.Context, params json.RawMessage) (json.RawMessage, error)
-}
-
-// EffectsDelegate is the optional host-side provider of callable functions.
-// It is kept separate from VMDelegate so that pure runtime configuration
-// (globals, polyfills) does not need to know about effect journaling.
-type EffectsDelegate interface {
-	// HostFunctions returns the set of host functions to install for a session.
-	// Called once per fresh VM creation.
-	HostFunctions(ctx context.Context, sessionID model.SessionID) ([]HostFunctionDef, error)
+	// ConfigureRuntime installs any host bindings onto a fresh VM. rt exposes
+	// the raw goja surface for arbitrary setup; host wraps Go callbacks so the
+	// delegate can place replay-aware bindings anywhere it wants in the JS
+	// object graph (top-level globals, nested objects like Math.random, etc.).
+	// The input state is the last serialised runtime descriptor persisted for
+	// this session. The returned state is what should be persisted for future
+	// VM recreation.
+	ConfigureRuntime(ctx SessionRuntimeContext, rt *goja.Runtime, host HostFuncBuilder, state json.RawMessage) (json.RawMessage, error)
 }
 
 type SessionDeps struct {
@@ -142,9 +138,6 @@ type SessionDeps struct {
 	// VMDelegate configures each freshly created runtime before any replay/eval.
 	// Optional; nil keeps legacy behavior.
 	VMDelegate VMDelegate
-	// EffectsDelegate provides callable host functions whose invocations are
-	// journaled as durable effect facts. Optional; nil disables effect hosting.
-	EffectsDelegate EffectsDelegate
 	// RuntimeConfig is optional serialisable delegate state passed to the
 	// delegate when the first VM is created for the session.
 	RuntimeConfig json.RawMessage
