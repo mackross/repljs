@@ -157,13 +157,13 @@ type session struct {
 	mu            sync.Mutex
 	id            model.SessionID
 	store         store.Store
-	branch        model.BranchID                       // active branch
-	head          model.CellID                         // most recently committed cell on the active branch
-	runtimeHash   string                               // stable identity derived from runtimeConfig
-	runtimeConfig []byte                               // serialised runtime descriptor for fresh VM creation
-	delegate      engine.VMDelegate                    // optional VM configuration hook
-	runtimeMode   engine.RuntimeMode                   // persistent vs replay-per-submit
-	runtime       *branchRuntime                       // branch-local goja VM; replaced on each Restore
+	branch        model.BranchID                     // active branch
+	head          model.CellID                       // most recently committed cell on the active branch
+	runtimeHash   string                             // stable identity derived from runtimeConfig
+	runtimeConfig []byte                             // serialised runtime descriptor for fresh VM creation
+	delegate      engine.VMDelegate                  // optional VM configuration hook
+	runtimeMode   engine.RuntimeMode                 // persistent vs replay-per-submit
+	runtime       *branchRuntime                     // branch-local goja VM; replaced on each Restore
 	values        map[model.ValueID]engine.ValueView // inspectable value handles for the current branch
 }
 
@@ -234,12 +234,12 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	}
 	freshRuntime := evalRuntime != s.runtime
 	cellID := model.CellID(uuid.NewString())
-	acc := &effectAccumulator{}
-	evalRuntime.beginCell(cellID, acc)
-	defer evalRuntime.endCell()
-
 	evalCtx, cancel := withCellSettleTimeout(ctx)
 	defer cancel()
+	acc := &effectAccumulator{}
+	evalRuntime.beginCell(evalCtx, cellID, acc)
+	defer evalRuntime.endCell()
+
 	eval, err := evalRuntime.runContext(evalCtx, src)
 	if err != nil {
 		if freshRuntime {

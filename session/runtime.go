@@ -71,10 +71,10 @@ type replayInvocation struct {
 }
 
 type replayStepState struct {
-	mu            sync.Mutex
-	effects       []replayInvocation
-	nextStart     int
-	pendingAsync  map[int][]func(*goja.Runtime)
+	mu             sync.Mutex
+	effects        []replayInvocation
+	nextStart      int
+	pendingAsync   map[int][]func(*goja.Runtime)
 	flushScheduled bool
 }
 
@@ -150,6 +150,7 @@ func (s *replayStepState) ensureConsumed() error {
 }
 
 type liveCallState struct {
+	ctx    context.Context
 	cellID model.CellID
 	acc    *effectAccumulator
 }
@@ -183,13 +184,16 @@ func newHostFunctionRouter(vm *goja.Runtime, wiring *hostRuntimeWiring) *hostFun
 	return router
 }
 
-func (r *hostFunctionRouter) beginCell(cellID model.CellID, acc *effectAccumulator) {
+func (r *hostFunctionRouter) beginCell(ctx context.Context, cellID model.CellID, acc *effectAccumulator) {
 	if r == nil {
 		return
 	}
 	r.liveMu.Lock()
 	defer r.liveMu.Unlock()
-	r.live = &liveCallState{cellID: cellID, acc: acc}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.live = &liveCallState{ctx: ctx, cellID: cellID, acc: acc}
 }
 
 func (r *hostFunctionRouter) endCell() {
@@ -395,11 +399,11 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 	return init.runtime, init.configured, init.runtimeHash, nil
 }
 
-func (r *branchRuntime) beginCell(cellID model.CellID, acc *effectAccumulator) {
+func (r *branchRuntime) beginCell(ctx context.Context, cellID model.CellID, acc *effectAccumulator) {
 	if r == nil || r.router == nil {
 		return
 	}
-	r.router.beginCell(cellID, acc)
+	r.router.beginCell(ctx, cellID, acc)
 }
 
 func (r *branchRuntime) endCell() {
@@ -475,7 +479,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 	}
 	live.acc.addEffect(effectID)
 
-	result, err := invoke(context.Background(), params)
+	result, err := invoke(live.ctx, params)
 	if err != nil {
 		_ = r.store.AppendFact(context.Background(), model.EffectFailed{
 			Session:      r.sessionID,
@@ -547,8 +551,8 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 	}
 	live.acc.addAsync(effectID, model.PromiseRef{ID: promiseID, State: model.PromisePending})
 
-	go func() {
-		result, invokeErr := invoke(context.Background(), params)
+	go func(callCtx context.Context) {
+		result, invokeErr := invoke(callCtx, params)
 		engine.RunOnRuntimeLoop(vm, func(vm *goja.Runtime) {
 			now := time.Now().UTC()
 			if invokeErr != nil {
@@ -569,7 +573,7 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 			})
 			_ = resolve(jsonResultToValue(vm, result))
 		})
-	}()
+	}(live.ctx)
 
 	return vm.ToValue(promise)
 }

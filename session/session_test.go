@@ -42,6 +42,66 @@ func newFixture(t *testing.T) *fixture {
 	return &fixture{st: st, deps: engine.SessionDeps{Store: st}}
 }
 
+type recordingStore struct {
+	wrapped *memstore.Store
+
+	mu    sync.Mutex
+	facts []model.Fact
+}
+
+func newRecordingStore() *recordingStore {
+	return &recordingStore{wrapped: memstore.New()}
+}
+
+func (s *recordingStore) AppendFact(ctx context.Context, fact model.Fact) error {
+	if err := s.wrapped.AppendFact(ctx, fact); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.facts = append(s.facts, fact)
+	return nil
+}
+
+func (s *recordingStore) PutRuntimeConfig(ctx context.Context, hash string, config json.RawMessage) error {
+	return s.wrapped.PutRuntimeConfig(ctx, hash, config)
+}
+
+func (s *recordingStore) LoadRuntimeConfig(ctx context.Context, hash string) (json.RawMessage, error) {
+	return s.wrapped.LoadRuntimeConfig(ctx, hash)
+}
+
+func (s *recordingStore) LoadHead(ctx context.Context, sess model.SessionID, branch model.BranchID) (store.HeadRecord, error) {
+	return s.wrapped.LoadHead(ctx, sess, branch)
+}
+
+func (s *recordingStore) LoadStaticEnv(ctx context.Context, sess model.SessionID, branch model.BranchID, head model.CellID) (store.StaticEnvSnapshot, error) {
+	return s.wrapped.LoadStaticEnv(ctx, sess, branch, head)
+}
+
+func (s *recordingStore) LoadReplayPlan(ctx context.Context, sess model.SessionID, targetCell model.CellID) (store.ReplayPlan, error) {
+	return s.wrapped.LoadReplayPlan(ctx, sess, targetCell)
+}
+
+func (s *recordingStore) Facts() []model.Fact {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	facts := make([]model.Fact, len(s.facts))
+	copy(facts, s.facts)
+	return facts
+}
+
+type recordingFixture struct {
+	st   *recordingStore
+	deps engine.SessionDeps
+}
+
+func newRecordingFixture(t *testing.T) *recordingFixture {
+	t.Helper()
+	st := newRecordingStore()
+	return &recordingFixture{st: st, deps: engine.SessionDeps{Store: st}}
+}
+
 // defaultManifest returns a minimal manifest suitable for tests.
 func defaultManifest() model.Manifest {
 	return model.Manifest{ID: "manifest-v1"}
@@ -78,8 +138,8 @@ type asyncHostDelegate struct {
 	current int32
 	max     int32
 
-	mu     sync.Mutex
-	state  map[model.SessionID]*asyncHostSessionState
+	mu    sync.Mutex
+	state map[model.SessionID]*asyncHostSessionState
 }
 
 type asyncHostSessionState struct {
@@ -287,6 +347,144 @@ func (d *syncRandomDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, 
 	return json.RawMessage(`{"kind":"sync-random-test","version":1}`), nil
 }
 
+type effectHostDelegate struct {
+	mu      sync.Mutex
+	calls   map[string]int
+	invokes map[string]engine.HostFuncInvoke
+}
+
+func newEffectHostDelegate() *effectHostDelegate {
+	return &effectHostDelegate{invokes: make(map[string]engine.HostFuncInvoke)}
+}
+
+func (d *effectHostDelegate) SetAsync(name string, invoke engine.HostFuncInvoke) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.invokes == nil {
+		d.invokes = make(map[string]engine.HostFuncInvoke)
+	}
+	d.invokes[name] = invoke
+}
+
+func (d *effectHostDelegate) CallCount(name string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls[name]
+}
+
+func (d *effectHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	d.mu.Lock()
+	invokes := make(map[string]engine.HostFuncInvoke, len(d.invokes))
+	for name, invoke := range d.invokes {
+		invokes[name] = invoke
+	}
+	d.mu.Unlock()
+
+	for name, invoke := range invokes {
+		name := name
+		invoke := invoke
+		if err := rt.Set(name, host.WrapAsync(name, model.ReplayReadonly, func(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+			d.mu.Lock()
+			if d.calls == nil {
+				d.calls = make(map[string]int)
+			}
+			d.calls[name]++
+			d.mu.Unlock()
+			return invoke(ctx, params)
+		})); err != nil {
+			return nil, err
+		}
+	}
+	if len(state) != 0 {
+		return append(json.RawMessage(nil), state...), nil
+	}
+	return json.RawMessage(`{"kind":"effect-host-test","version":1}`), nil
+}
+
+func decodeJSONStringParam(params json.RawMessage) (string, error) {
+	if len(params) == 0 {
+		return "", nil
+	}
+	var value string
+	if err := json.Unmarshal(params, &value); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+func factsCellEvaluated(facts []model.Fact, cell model.CellID) (model.CellEvaluated, bool) {
+	for i := len(facts) - 1; i >= 0; i-- {
+		fact, ok := facts[i].(model.CellEvaluated)
+		if ok && fact.Cell == cell {
+			return fact, true
+		}
+	}
+	return model.CellEvaluated{}, false
+}
+
+func factsEffectStartedForCell(facts []model.Fact, cell model.CellID) []model.EffectStarted {
+	started := make([]model.EffectStarted, 0)
+	for _, fact := range facts {
+		startedFact, ok := fact.(model.EffectStarted)
+		if ok && startedFact.Cell == cell {
+			started = append(started, startedFact)
+		}
+	}
+	return started
+}
+
+func factsEffectCompletedByID(facts []model.Fact, effectID model.EffectID) (model.EffectCompleted, bool) {
+	for i := len(facts) - 1; i >= 0; i-- {
+		fact, ok := facts[i].(model.EffectCompleted)
+		if ok && fact.Effect == effectID {
+			return fact, true
+		}
+	}
+	return model.EffectCompleted{}, false
+}
+
+func factsEffectFailedByID(facts []model.Fact, effectID model.EffectID) (model.EffectFailed, bool) {
+	for i := len(facts) - 1; i >= 0; i-- {
+		fact, ok := facts[i].(model.EffectFailed)
+		if ok && fact.Effect == effectID {
+			return fact, true
+		}
+	}
+	return model.EffectFailed{}, false
+}
+
+func countCellCommittedFacts(facts []model.Fact) int {
+	count := 0
+	for _, fact := range facts {
+		if _, ok := fact.(model.CellCommitted); ok {
+			count++
+		}
+	}
+	return count
+}
+
+func countHeadMovedFacts(facts []model.Fact) int {
+	count := 0
+	for _, fact := range facts {
+		if _, ok := fact.(model.HeadMoved); ok {
+			count++
+		}
+	}
+	return count
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, description string, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
+}
+
 // ---------------------------------------------------------------------------
 // TestSessionEngine_StartSession
 // ---------------------------------------------------------------------------
@@ -470,8 +668,8 @@ func TestSession_Restore_ToCurrentHead(t *testing.T) {
 // TestSession_BranchedLifecycle is the primary acceptance test. It matches the
 // roadmap demo exactly:
 //
-//   start a session → submit 3 cells → restore to cell 1 →
-//   submit 2 cells on new branch → both branches visible with correct heads.
+//	start a session → submit 3 cells → restore to cell 1 →
+//	submit 2 cells on new branch → both branches visible with correct heads.
 //
 // It asserts LoadHead and LoadStaticEnv results, not just successful method
 // returns.
@@ -1621,6 +1819,384 @@ func TestSession_Submit_InvalidCellDoesNotAdvanceHead(t *testing.T) {
 	if r3.CompletionValue.Preview != "2" {
 		t.Errorf("expected preview %q, got %q", "2", r3.CompletionValue.Preview)
 	}
+}
+
+func TestSession_Submit_WithoutHostBindings_LeavesEffectFieldsEmpty(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newRecordingFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, "1 + 1")
+	if err != nil {
+		t.Fatalf("Submit without host bindings: %v", err)
+	}
+	if len(res.CreatedPromises) != 0 {
+		t.Fatalf("expected no created promises without host bindings, got %d", len(res.CreatedPromises))
+	}
+
+	evalFact, ok := factsCellEvaluated(fix.st.Facts(), res.Cell)
+	if !ok {
+		t.Fatalf("CellEvaluated not recorded for cell %q", res.Cell)
+	}
+	if len(evalFact.LinkedEffects) != 0 {
+		t.Fatalf("expected no linked effects without host bindings, got %v", evalFact.LinkedEffects)
+	}
+	if len(evalFact.CreatedPromises) != 0 {
+		t.Fatalf("expected no created promises in CellEvaluated without host bindings, got %v", evalFact.CreatedPromises)
+	}
+}
+
+func TestSession_Submit_SingleEffectRecordsLinkedEffects(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := newEffectHostDelegate()
+	delegate.SetAsync("hostOne", func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
+		value, err := decodeJSONStringParam(params)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal("echo:" + value)
+	})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `(async () => await hostOne("alpha"))()`)
+	if err != nil {
+		t.Fatalf("Submit single effect: %v", err)
+	}
+	if len(res.CreatedPromises) != 1 {
+		t.Fatalf("expected one created promise in submit result, got %d", len(res.CreatedPromises))
+	}
+
+	plan, err := fix.st.LoadReplayPlan(ctx, sess.ID(), res.Cell)
+	if err != nil {
+		t.Fatalf("LoadReplayPlan: %v", err)
+	}
+	if len(plan.Steps) != 1 {
+		t.Fatalf("expected one replay step, got %d", len(plan.Steps))
+	}
+	if len(plan.Steps[0].Effects) != 1 {
+		t.Fatalf("expected one linked effect in replay plan, got %v", plan.Steps[0].Effects)
+	}
+	linkedEffect := plan.Steps[0].Effects[0]
+
+	facts := fix.st.Facts()
+	evalFact, ok := factsCellEvaluated(facts, res.Cell)
+	if !ok {
+		t.Fatalf("CellEvaluated not recorded for cell %q", res.Cell)
+	}
+	if len(evalFact.LinkedEffects) != 1 || evalFact.LinkedEffects[0] != linkedEffect {
+		t.Fatalf("CellEvaluated linked effects = %v, want [%s]", evalFact.LinkedEffects, linkedEffect)
+	}
+	if len(evalFact.CreatedPromises) != 1 {
+		t.Fatalf("expected one created promise in CellEvaluated, got %v", evalFact.CreatedPromises)
+	}
+	if evalFact.CreatedPromises[0].ID != res.CreatedPromises[0].ID {
+		t.Fatalf("created promise mismatch: CellEvaluated=%q SubmitResult=%q", evalFact.CreatedPromises[0].ID, res.CreatedPromises[0].ID)
+	}
+
+	started := factsEffectStartedForCell(facts, res.Cell)
+	if len(started) != 1 {
+		t.Fatalf("expected one EffectStarted for cell %q, got %d", res.Cell, len(started))
+	}
+	if started[0].Effect != linkedEffect {
+		t.Fatalf("EffectStarted effect = %q, want %q", started[0].Effect, linkedEffect)
+	}
+	if started[0].FunctionName != "hostOne" {
+		t.Fatalf("EffectStarted function = %q, want hostOne", started[0].FunctionName)
+	}
+	if _, ok := factsEffectCompletedByID(facts, linkedEffect); !ok {
+		t.Fatalf("EffectCompleted not recorded for effect %q", linkedEffect)
+	}
+	if delegate.CallCount("hostOne") != 1 {
+		t.Fatalf("expected one hostOne invocation, got %d", delegate.CallCount("hostOne"))
+	}
+}
+
+func TestSession_Submit_ConcurrentEffectsRecordBothCompletions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := newEffectHostDelegate()
+	enter := make(chan string, 2)
+	release := make(chan struct{})
+	var current int32
+	var max int32
+
+	mkInvoke := func(name string) engine.HostFuncInvoke {
+		return func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+			cur := atomic.AddInt32(&current, 1)
+			for {
+				observed := atomic.LoadInt32(&max)
+				if cur <= observed || atomic.CompareAndSwapInt32(&max, observed, cur) {
+					break
+				}
+			}
+			defer atomic.AddInt32(&current, -1)
+			enter <- name
+			<-release
+			return json.Marshal(name)
+		}
+	}
+	delegate.SetAsync("left", mkInvoke("left"))
+	delegate.SetAsync("right", mkInvoke("right"))
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	type submitOutcome struct {
+		res engine.SubmitResult
+		err error
+	}
+	outcomeCh := make(chan submitOutcome, 1)
+	go func() {
+		res, err := sess.Submit(ctx, `(async () => Promise.all([left(null), right(null)]))()`)
+		outcomeCh <- submitOutcome{res: res, err: err}
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case name := <-enter:
+			seen[name] = true
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for concurrent effects to start: seen=%v", seen)
+		}
+	}
+	if atomic.LoadInt32(&max) < 2 {
+		t.Fatalf("expected concurrent invocations, max in-flight = %d", atomic.LoadInt32(&max))
+	}
+	select {
+	case outcome := <-outcomeCh:
+		t.Fatalf("Submit returned before both effects were released: %+v", outcome)
+	default:
+	}
+	close(release)
+
+	var outcome submitOutcome
+	select {
+	case outcome = <-outcomeCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for concurrent submit result")
+	}
+	if outcome.err != nil {
+		t.Fatalf("Submit concurrent effects: %v", outcome.err)
+	}
+	if len(outcome.res.CreatedPromises) != 2 {
+		t.Fatalf("expected two created promises in submit result, got %d", len(outcome.res.CreatedPromises))
+	}
+
+	plan, err := fix.st.LoadReplayPlan(ctx, sess.ID(), outcome.res.Cell)
+	if err != nil {
+		t.Fatalf("LoadReplayPlan: %v", err)
+	}
+	if len(plan.Steps) != 1 {
+		t.Fatalf("expected one replay step, got %d", len(plan.Steps))
+	}
+	if len(plan.Steps[0].Effects) != 2 {
+		t.Fatalf("expected two linked effects in replay plan, got %v", plan.Steps[0].Effects)
+	}
+
+	facts := fix.st.Facts()
+	evalFact, ok := factsCellEvaluated(facts, outcome.res.Cell)
+	if !ok {
+		t.Fatalf("CellEvaluated not recorded for cell %q", outcome.res.Cell)
+	}
+	if len(evalFact.LinkedEffects) != 2 {
+		t.Fatalf("expected two linked effects in CellEvaluated, got %v", evalFact.LinkedEffects)
+	}
+	if len(evalFact.CreatedPromises) != 2 {
+		t.Fatalf("expected two created promises in CellEvaluated, got %v", evalFact.CreatedPromises)
+	}
+	started := factsEffectStartedForCell(facts, outcome.res.Cell)
+	if len(started) != 2 {
+		t.Fatalf("expected two EffectStarted facts for cell %q, got %d", outcome.res.Cell, len(started))
+	}
+	for _, effectID := range evalFact.LinkedEffects {
+		if _, ok := factsEffectCompletedByID(facts, effectID); !ok {
+			t.Fatalf("EffectCompleted not recorded for effect %q", effectID)
+		}
+	}
+	if delegate.CallCount("left") != 1 || delegate.CallCount("right") != 1 {
+		t.Fatalf("expected one call per host function, got left=%d right=%d", delegate.CallCount("left"), delegate.CallCount("right"))
+	}
+}
+
+func TestSession_Submit_EffectFailureDoesNotCommitCell(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := newEffectHostDelegate()
+	delegate.SetAsync("boom", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		return nil, errors.New("boom")
+	})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	stable, err := sess.Submit(ctx, `const stable = 1;`)
+	if err != nil {
+		t.Fatalf("Submit stable cell: %v", err)
+	}
+	beforeFacts := fix.st.Facts()
+	beforeCommitted := countCellCommittedFacts(beforeFacts)
+	beforeHeads := countHeadMovedFacts(beforeFacts)
+
+	_, err = sess.Submit(ctx, `(async () => await boom(null))()`)
+	if err == nil {
+		t.Fatal("expected Submit to fail when host invocation fails")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected boom error, got: %v", err)
+	}
+
+	plan, err := fix.st.LoadReplayPlan(ctx, sess.ID(), stable.Cell)
+	if err != nil {
+		t.Fatalf("LoadReplayPlan after failed submit: %v", err)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].Cell != stable.Cell {
+		t.Fatalf("expected only the stable cell to remain committed, got %v", plan.Steps)
+	}
+
+	facts := fix.st.Facts()
+	if countCellCommittedFacts(facts) != beforeCommitted {
+		t.Fatalf("CellCommitted count changed after failed submit: before=%d after=%d", beforeCommitted, countCellCommittedFacts(facts))
+	}
+	if countHeadMovedFacts(facts) != beforeHeads {
+		t.Fatalf("HeadMoved count changed after failed submit: before=%d after=%d", beforeHeads, countHeadMovedFacts(facts))
+	}
+	var started model.EffectStarted
+	startedCount := 0
+	for _, fact := range facts {
+		if startedFact, ok := fact.(model.EffectStarted); ok {
+			started = startedFact
+			startedCount++
+		}
+	}
+	if startedCount != 1 {
+		t.Fatalf("expected one EffectStarted for failed submit, got %d", startedCount)
+	}
+	failed, ok := factsEffectFailedByID(facts, started.Effect)
+	if !ok {
+		t.Fatalf("EffectFailed not recorded for effect %q", started.Effect)
+	}
+	if failed.ErrorMessage != "boom" {
+		t.Fatalf("EffectFailed message = %q, want boom", failed.ErrorMessage)
+	}
+	if delegate.CallCount("boom") != 1 {
+		t.Fatalf("expected one boom invocation, got %d", delegate.CallCount("boom"))
+	}
+}
+
+func TestSession_Submit_ContextCancelMidEffectDoesNotCommitCell(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := newEffectHostDelegate()
+	started := make(chan struct{}, 1)
+	returned := make(chan error, 1)
+	delegate.SetAsync("slow", func(callCtx context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-callCtx.Done()
+		err := callCtx.Err()
+		returned <- err
+		return nil, err
+	})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(context.Background(), defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := sess.Submit(ctx, `(async () => await slow(null))()`)
+		errCh <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for slow effect to start")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected submit cancellation error")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled, got: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("submit did not return after context cancellation")
+	}
+
+	select {
+	case invokeErr := <-returned:
+		if !errors.Is(invokeErr, context.Canceled) {
+			t.Fatalf("expected host invoke to observe context cancellation, got: %v", invokeErr)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("host invoke did not return after context cancellation")
+	}
+
+	facts := fix.st.Facts()
+	if countCellCommittedFacts(facts) != 0 {
+		t.Fatalf("expected no committed cells after canceled submit, got %d", countCellCommittedFacts(facts))
+	}
+	if countHeadMovedFacts(facts) != 0 {
+		t.Fatalf("expected no head movements after canceled submit, got %d", countHeadMovedFacts(facts))
+	}
+	var effectID model.EffectID
+	startedCount := 0
+	for _, fact := range facts {
+		if startedFact, ok := fact.(model.EffectStarted); ok {
+			effectID = startedFact.Effect
+			startedCount++
+		}
+	}
+	if startedCount != 1 {
+		t.Fatalf("expected one EffectStarted for canceled submit, got %d", startedCount)
+	}
+	waitForCondition(t, time.Second, "EffectFailed after cancellation", func() bool {
+		_, ok := factsEffectFailedByID(fix.st.Facts(), effectID)
+		return ok
+	})
 }
 
 func TestSession_Submit_SingleAwaitChainedHostPromise(t *testing.T) {
