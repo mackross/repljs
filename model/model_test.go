@@ -43,7 +43,6 @@ func TestReplayPolicyConstants(t *testing.T) {
 	}{
 		{ReplayReadonly, "readonly"},
 		{ReplayIdempotent, "idempotent"},
-		{ReplayAtMostOnce, "at_most_once"},
 		{ReplayNonReplayable, "non_replayable"},
 	}
 	for _, c := range cases {

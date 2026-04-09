@@ -14,10 +14,6 @@ const (
 	// supply an idempotency key.
 	ReplayIdempotent ReplayPolicy = "idempotent"
 
-	// ReplayAtMostOnce marks calls that must not be rerun automatically after
-	// uncertainty. Replay may only reuse a previously recorded completed result.
-	ReplayAtMostOnce ReplayPolicy = "at_most_once"
-
 	// ReplayNonReplayable marks calls that cannot be safely replayed.
 	// Restoring across such an effect may fail or enter a user-visible degraded
 	// mode.
