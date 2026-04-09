@@ -3646,6 +3646,195 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// TestSession_Restore_ReadonlyEffects_ReusesRecordedResult,
+// TestSession_Restore_NonReplayableEffect_ReturnsError, and
+// TestSession_Restore_PreEffectCell_WorksNormally — restore replay contract
+// ---------------------------------------------------------------------------
+
+// policyTestDelegate registers a single sync host function "hostFn" with a
+// configurable replay policy and tracks how many times the live invoke fires.
+type policyTestDelegate struct {
+	policy model.ReplayPolicy
+	result json.RawMessage
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (d *policyTestDelegate) CallCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls
+}
+
+func (d *policyTestDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	if err := rt.Set("hostFn", host.WrapSync("hostFn", d.policy, func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		d.mu.Lock()
+		d.calls++
+		d.mu.Unlock()
+		return d.result, nil
+	})); err != nil {
+		return nil, err
+	}
+	return json.RawMessage(`{"kind":"policy-test","version":1}`), nil
+}
+
+func countBranchCreatedFacts(facts []model.Fact) int {
+	n := 0
+	for _, f := range facts {
+		if _, ok := f.(model.BranchCreated); ok {
+			n++
+		}
+	}
+	return n
+}
+
+// TestSession_Restore_ReadonlyEffects_ReusesRecordedResult verifies that during
+// a Restore replay, a readonly effect is satisfied from the durable recorded
+// result and the live host delegate is never re-invoked.
+func TestSession_Restore_ReadonlyEffects_ReusesRecordedResult(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	delegate := &policyTestDelegate{
+		policy: model.ReplayReadonly,
+		result: json.RawMessage(`"recorded-value"`),
+	}
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	// Live submission: hostFn is invoked once and the result is journaled.
+	r1, err := sess.Submit(ctx, `hostFn()`)
+	if err != nil {
+		t.Fatalf("Submit effectful cell: %v", err)
+	}
+	if delegate.CallCount() != 1 {
+		t.Fatalf("expected 1 live host invocation after seed submit, got %d", delegate.CallCount())
+	}
+
+	// Submit a second cell so there is a follow-on to "restore past".
+	_, err = sess.Submit(ctx, `const x = 1`)
+	if err != nil {
+		t.Fatalf("Submit follow-up cell: %v", err)
+	}
+
+	// Restore to r1: replay plan includes r1 and its readonly effect.
+	if err := sess.Restore(ctx, r1.Cell); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	// The host delegate must not have been invoked again during replay.
+	if delegate.CallCount() != 1 {
+		t.Fatalf("expected readonly effect reused without re-invocation during restore, got %d calls", delegate.CallCount())
+	}
+
+	// The forked runtime should be fully operational.
+	res, err := sess.Submit(ctx, `"fork-ok"`)
+	if err != nil {
+		t.Fatalf("Submit on fork: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "fork-ok" {
+		t.Fatalf("expected fork-ok completion value, got %+v", res.CompletionValue)
+	}
+}
+
+// TestSession_Restore_NonReplayableEffect_ReturnsError verifies that attempting
+// to Restore to a cell that contains a non-replayable effect returns a
+// descriptive error and leaves branch history unchanged.
+func TestSession_Restore_NonReplayableEffect_ReturnsError(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := &policyTestDelegate{
+		policy: model.ReplayNonReplayable,
+		result: json.RawMessage(`"side-effect-result"`),
+	}
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	// Live submission: hostFn is invoked once (non-replayable).
+	r1, err := sess.Submit(ctx, `hostFn()`)
+	if err != nil {
+		t.Fatalf("Submit non-replayable effectful cell: %v", err)
+	}
+
+	// Record BranchCreated count before the attempted restore.
+	branchCountBefore := countBranchCreatedFacts(fix.st.Facts())
+
+	// Attempt to Restore to r1: replay plan includes the non-replayable effect.
+	restoreErr := sess.Restore(ctx, r1.Cell)
+	if restoreErr == nil {
+		t.Fatal("Restore across non-replayable effect: expected error, got nil")
+	}
+	if !strings.Contains(restoreErr.Error(), "non-replayable") {
+		t.Fatalf("Restore error must mention %q, got: %v", "non-replayable", restoreErr)
+	}
+
+	// Branch history must be unchanged: no BranchCreated fact was appended.
+	branchCountAfter := countBranchCreatedFacts(fix.st.Facts())
+	if branchCountAfter != branchCountBefore {
+		t.Fatalf("expected branch count unchanged after failed restore, before=%d after=%d", branchCountBefore, branchCountAfter)
+	}
+}
+
+// TestSession_Restore_PreEffectCell_WorksNormally verifies that restoring to a
+// cell that precedes any effectful cell succeeds even when later cells contain
+// non-replayable effects that would otherwise block restore.
+func TestSession_Restore_PreEffectCell_WorksNormally(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	delegate := &policyTestDelegate{
+		policy: model.ReplayNonReplayable,
+		result: json.RawMessage(`"side-effect-result"`),
+	}
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	// Submit a plain cell with no host-function calls.
+	r1, err := sess.Submit(ctx, `const x = 42`)
+	if err != nil {
+		t.Fatalf("Submit pre-effect cell: %v", err)
+	}
+
+	// Submit a cell that invokes the non-replayable host function.
+	_, err = sess.Submit(ctx, `hostFn()`)
+	if err != nil {
+		t.Fatalf("Submit non-replayable effectful cell: %v", err)
+	}
+
+	// Restore to r1 (before the non-replayable effect): the replay plan for r1
+	// does not include the effectful step, so restore must succeed.
+	if err := sess.Restore(ctx, r1.Cell); err != nil {
+		t.Fatalf("Restore to pre-effect cell: %v", err)
+	}
+
+	// The forked runtime should contain x and be fully usable.
+	res, err := sess.Submit(ctx, `x + 1`)
+	if err != nil {
+		t.Fatalf("Submit on fork: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "43" {
+		t.Fatalf("expected completion value %q, got %+v", "43", res.CompletionValue)
+	}
+}
+
 func TestSession_TopLevelAwaitRestoreForkParity(t *testing.T) {
 	ctx := context.Background()
 	h, err := sessiontest.StartComparableSessions(ctx, defaultConfig(), nil, nil)

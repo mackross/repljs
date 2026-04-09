@@ -461,6 +461,9 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 		if replayErr != nil {
 			panic(vm.ToValue(fmt.Sprintf("host function %q replay: %v", name, replayErr)))
 		}
+		if inv.decision.Policy == model.ReplayNonReplayable {
+			panic(vm.ToValue(fmt.Sprintf("non-replayable effect: function %q effectID %q cannot be replayed", name, inv.effectID)))
+		}
 		if len(inv.decision.RecordedResult) == 0 {
 			panic(vm.ToValue(fmt.Sprintf("host function %q replay: missing recorded result for effect %q", name, inv.effectID)))
 		}
@@ -520,6 +523,10 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 		inv, replayErr := r.nextReplayInvocation()
 		if replayErr != nil {
 			_ = reject(vm.ToValue(fmt.Sprintf("host function %q replay: %v", name, replayErr)))
+			return vm.ToValue(promise)
+		}
+		if inv.decision.Policy == model.ReplayNonReplayable {
+			_ = reject(vm.ToValue(fmt.Sprintf("non-replayable effect: function %q effectID %q cannot be replayed", name, inv.effectID)))
 			return vm.ToValue(promise)
 		}
 		if len(inv.decision.RecordedResult) == 0 {
