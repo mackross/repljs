@@ -21,6 +21,7 @@ const (
 	FactTypeCellChecked      = "CellChecked"
 	FactTypeCellEvaluated    = "CellEvaluated"
 	FactTypeCellCommitted    = "CellCommitted"
+	FactTypeCellFailed       = "CellFailed"
 	FactTypeEffectStarted    = "EffectStarted"
 	FactTypeEffectCompleted  = "EffectCompleted"
 	FactTypeEffectFailed     = "EffectFailed"
@@ -119,6 +120,25 @@ type CellCommitted struct {
 }
 
 func (CellCommitted) FactType() string { return FactTypeCellCommitted }
+
+// CellFailed is appended when a submit attempt fails and therefore does not
+// become part of committed session history. The source and parent head are
+// captured so callers can inspect and later replay the failed attempt in an
+// isolated debug flow.
+type CellFailed struct {
+	Session       SessionID  `json:"session"`
+	Branch        BranchID   `json:"branch"`
+	Failure       FailureID  `json:"failure"`
+	Parent        CellID     `json:"parent,omitempty"`
+	Source        string     `json:"source"`
+	RuntimeHash   string     `json:"runtime_hash,omitempty"`
+	Phase         string     `json:"phase,omitempty"`
+	ErrorMessage  string     `json:"error_message"`
+	LinkedEffects []EffectID `json:"linked_effects,omitempty"`
+	At            time.Time  `json:"at"`
+}
+
+func (CellFailed) FactType() string { return FactTypeCellFailed }
 
 // --- Effect facts ---
 

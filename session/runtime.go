@@ -314,9 +314,10 @@ func (b hostFuncBuilder) WrapAsync(name string, replay model.ReplayPolicy, invok
 // on one branch. Each new branch (including after Restore) gets its own VM so
 // bindings from sibling branches are never visible to one another.
 type branchRuntime struct {
-	vm     *goja.Runtime
-	loop   *eventloop.EventLoop
-	router *hostFunctionRouter
+	vm            *goja.Runtime
+	loop          *eventloop.EventLoop
+	router        *hostFunctionRouter
+	topLevelAwait *topLevelAwaitState
 }
 
 func normalizeRuntimeConfig(state json.RawMessage) (json.RawMessage, error) {
@@ -346,6 +347,7 @@ func runtimeConfigHash(state json.RawMessage) string {
 func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate, state json.RawMessage, replayPlan *store.ReplayPlan) (*branchRuntime, json.RawMessage, string, error) {
 	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
 	loop.Start()
+	topLevelAwait := newTopLevelAwaitState()
 
 	type initResult struct {
 		runtime     *branchRuntime
@@ -357,6 +359,10 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 	loop.RunOnLoop(func(vm *goja.Runtime) {
 		engine.BindRuntimeLoop(vm, loop.RunOnLoop)
 		router := newHostFunctionRouter(vm, &hostRuntimeWiring{store: st, sessionID: ctx.SessionID, replayPlan: replayPlan})
+		if err := topLevelAwait.install(vm); err != nil {
+			initCh <- initResult{err: fmt.Errorf("install top-level await hook: %w", err)}
+			return
+		}
 
 		normalizedState, err := normalizeRuntimeConfig(state)
 		if err != nil {
@@ -382,7 +388,7 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 
 		_ = bgCtx
 		initCh <- initResult{
-			runtime:     &branchRuntime{vm: vm, loop: loop, router: router},
+			runtime:     &branchRuntime{vm: vm, loop: loop, router: router, topLevelAwait: topLevelAwait},
 			configured:  normalizedConfiguredState,
 			runtimeHash: runtimeConfigHash(normalizedConfiguredState),
 		}
@@ -624,6 +630,11 @@ func (r *branchRuntime) run(src string) (evalResult, error) {
 // runContext evaluates src on the runtime's event loop and blocks until the
 // result settles or ctx is done.
 func (r *branchRuntime) runContext(ctx context.Context, src string) (evalResult, error) {
+	plan, err := buildTopLevelAwaitPlan(src, r.topLevelAwait)
+	if err != nil {
+		return evalResult{}, fmt.Errorf("goja: %w", err)
+	}
+
 	resultCh := make(chan outcome, 1)
 	deliver := func(out outcome) {
 		select {
@@ -632,8 +643,21 @@ func (r *branchRuntime) runContext(ctx context.Context, src string) (evalResult,
 		}
 	}
 
+	if plan.Transformed {
+		r.topLevelAwait.beginCommit(plan.Declarations)
+		defer r.topLevelAwait.endCommit()
+	}
+
 	r.loop.RunOnLoop(func(vm *goja.Runtime) {
-		raw, err := vm.RunString(src)
+		var (
+			raw goja.Value
+			err error
+		)
+		if plan.Transformed {
+			raw, err = vm.RunProgram(plan.Program)
+		} else {
+			raw, err = vm.RunString(src)
+		}
 		if err != nil {
 			deliver(outcome{err: fmt.Errorf("goja: %w", err)})
 			return
@@ -643,6 +667,9 @@ func (r *branchRuntime) runContext(ctx context.Context, src string) (evalResult,
 
 	select {
 	case out := <-resultCh:
+		if out.err == nil {
+			r.topLevelAwait.commitDeclarations(plan.Declarations, plan.Transformed)
+		}
 		return out.res, out.err
 	case <-ctx.Done():
 		return evalResult{}, fmt.Errorf("promise still pending after evaluation: %w", ctx.Err())

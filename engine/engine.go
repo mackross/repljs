@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/solidarity-ai/repl/model"
@@ -83,6 +84,21 @@ type ValueView struct {
 	// Structured carries a JSON-serialisable representation of the value when
 	// available. Nil for values that can only be previewed as a string.
 	Structured []byte
+}
+
+// FailureView describes one durable failed submit attempt. Unlike SubmitResult,
+// a FailureView does not imply that the cell became part of committed session
+// history; it is a debug/inspection artifact only.
+type FailureView struct {
+	Failure       model.FailureID
+	Branch        model.BranchID
+	Parent        model.CellID
+	Source        string
+	RuntimeHash   string
+	Phase         string
+	ErrorMessage  string
+	LinkedEffects []model.EffectID
+	At            time.Time
 }
 
 // SessionDeps bundles the external collaborators needed to start or restore a
@@ -187,6 +203,10 @@ type Session interface {
 	// The handle must have been obtained from a prior SubmitResult or
 	// PromiseRef settlement.
 	Inspect(ctx context.Context, handle model.ValueID) (ValueView, error)
+
+	// Failures returns the durable failed submit attempts for this session in
+	// append order. The last element is therefore the most recent failure.
+	Failures(ctx context.Context) ([]FailureView, error)
 
 	// Restore positions this session at targetCell by replaying history up to
 	// that point. If the session has already committed cells beyond

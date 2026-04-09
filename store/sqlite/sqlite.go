@@ -299,6 +299,41 @@ func (s *Store) LoadReplayPlan(ctx context.Context, session model.SessionID, tar
 	}, nil
 }
 
+// LoadFailures returns durable failed submit attempts for the given session in
+// append order.
+func (s *Store) LoadFailures(ctx context.Context, session model.SessionID) ([]model.CellFailed, error) {
+	const q = `
+SELECT payload FROM facts
+WHERE session = ? AND fact_type = ?
+ORDER BY id ASC`
+
+	rows, err := s.db.QueryContext(ctx, q, string(session), model.FactTypeCellFailed)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: LoadFailures query: %w", err)
+	}
+
+	var failures []model.CellFailed
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("sqlite: LoadFailures scan: %w", err)
+		}
+		var f model.CellFailed
+		if err := json.Unmarshal([]byte(payload), &f); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("sqlite: LoadFailures decode: %w", err)
+		}
+		failures = append(failures, f)
+	}
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	if rowsErr != nil {
+		return nil, fmt.Errorf("sqlite: LoadFailures rows: %w", rowsErr)
+	}
+	return failures, nil
+}
+
 // --- internal helpers ---
 
 // extractIndexColumns extracts the session, branch, and cell fields from any
@@ -318,6 +353,8 @@ func extractIndexColumns(fact model.Fact) (session model.SessionID, branch model
 		return f.Session, f.Branch, f.Cell
 	case model.CellCommitted:
 		return f.Session, f.Branch, f.Cell
+	case model.CellFailed:
+		return f.Session, f.Branch, ""
 	case model.EffectStarted:
 		return f.Session, "", f.Cell
 	case model.EffectCompleted:

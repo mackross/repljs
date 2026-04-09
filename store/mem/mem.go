@@ -187,6 +187,26 @@ func (s *Store) LoadReplayPlan(ctx context.Context, session model.SessionID, tar
 	}, nil
 }
 
+// LoadFailures returns durable failed submit attempts for the given session in
+// append order.
+func (s *Store) LoadFailures(_ context.Context, session model.SessionID) ([]model.CellFailed, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	failures := make([]model.CellFailed, 0)
+	for _, e := range s.facts {
+		if e.session != session || e.factType != model.FactTypeCellFailed {
+			continue
+		}
+		f, ok := e.fact.(model.CellFailed)
+		if !ok {
+			continue
+		}
+		failures = append(failures, f)
+	}
+	return failures, nil
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers (called with s.mu read-lock already held)
 // ---------------------------------------------------------------------------
@@ -207,6 +227,8 @@ func extractIndexColumns(fact model.Fact) (session model.SessionID, branch model
 		return f.Session, f.Branch, f.Cell
 	case model.CellCommitted:
 		return f.Session, f.Branch, f.Cell
+	case model.CellFailed:
+		return f.Session, f.Branch, ""
 	case model.EffectStarted:
 		return f.Session, "", f.Cell
 	case model.EffectCompleted:

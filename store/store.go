@@ -147,4 +147,8 @@ type Store interface {
 	// the given target cell. All cells on the branch ancestry up to and
 	// including targetCell are included in the plan.
 	LoadReplayPlan(ctx context.Context, session model.SessionID, targetCell model.CellID) (ReplayPlan, error)
+
+	// LoadFailures returns the durable failed submit attempts for the given
+	// session in append order.
+	LoadFailures(ctx context.Context, session model.SessionID) ([]model.CellFailed, error)
 }

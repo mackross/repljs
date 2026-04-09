@@ -24,6 +24,7 @@ func TestIDTypes(t *testing.T) {
 		{"PromiseID", func() bool { return PromiseID("p1") == "p1" }},
 		{"ValueID", func() bool { return ValueID("v1") == "v1" }},
 		{"CheckpointID", func() bool { return CheckpointID("k1") == "k1" }},
+		{"FailureID", func() bool { return FailureID("f1") == "f1" }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,6 +83,7 @@ func TestFactInterface(t *testing.T) {
 		{CellChecked{}, FactTypeCellChecked},
 		{CellEvaluated{}, FactTypeCellEvaluated},
 		{CellCommitted{}, FactTypeCellCommitted},
+		{CellFailed{}, FactTypeCellFailed},
 		{EffectStarted{}, FactTypeEffectStarted},
 		{EffectCompleted{}, FactTypeEffectCompleted},
 		{EffectFailed{}, FactTypeEffectFailed},

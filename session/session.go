@@ -164,6 +164,7 @@ type session struct {
 	delegate      engine.VMDelegate                  // optional VM configuration hook
 	runtimeMode   engine.RuntimeMode                 // persistent vs replay-per-submit
 	runtime       *branchRuntime                     // branch-local goja VM; replaced on each Restore
+	runtimeDirty  bool                               // live runtime diverged from durable head after a failed submit; rebuild before reuse
 	values        map[model.ValueID]engine.ValueView // inspectable value handles for the current branch
 }
 
@@ -181,6 +182,11 @@ func withCellSettleTimeout(ctx context.Context) (context.Context, context.Cancel
 
 func (s *session) prepareSubmitRuntime(ctx context.Context) (*branchRuntime, []byte, string, error) {
 	if s.runtimeMode != engine.RuntimeModeReplayPerSubmit {
+		if s.runtimeDirty {
+			if err := s.rebuildRuntimeFromCommitted(ctx); err != nil {
+				return nil, nil, "", fmt.Errorf("recover dirty runtime: %w", err)
+			}
+		}
 		return s.runtime, append([]byte(nil), s.runtimeConfig...), s.runtimeHash, nil
 	}
 	if s.head == "" {
@@ -209,6 +215,67 @@ func (s *session) prepareSubmitRuntime(ctx context.Context) (*branchRuntime, []b
 	return rt, runtimeConfig, runtimeHash, nil
 }
 
+func (s *session) rebuildRuntimeFromCommitted(ctx context.Context) error {
+	var (
+		rt            *branchRuntime
+		runtimeConfig []byte
+		runtimeHash   string
+		err           error
+	)
+
+	if s.head == "" {
+		rt, runtimeConfig, runtimeHash, err = newBranchRuntime(ctx, engine.SessionRuntimeContext{
+			SessionID:   s.id,
+			BranchID:    s.branch,
+			RuntimeHash: s.runtimeHash,
+		}, s.store, s.delegate, s.runtimeConfig, nil)
+		if err != nil {
+			return fmt.Errorf("init runtime from current config: %w", err)
+		}
+	} else {
+		plan, err := s.store.LoadReplayPlan(ctx, s.id, s.head)
+		if err != nil {
+			return fmt.Errorf("load replay plan for runtime rebuild: %w", err)
+		}
+		rt, runtimeConfig, runtimeHash, err = replayPlanIntoRuntime(ctx, plan, engine.SessionRuntimeContext{
+			SessionID:   s.id,
+			BranchID:    s.branch,
+			RuntimeHash: plan.RuntimeHash,
+		}, s.store, s.delegate)
+		if err != nil {
+			return fmt.Errorf("replay committed runtime state: %w", err)
+		}
+	}
+
+	oldRuntime := s.runtime
+	s.runtime = rt
+	s.runtimeConfig = append([]byte(nil), runtimeConfig...)
+	s.runtimeHash = runtimeHash
+	s.runtimeDirty = false
+	if oldRuntime != nil {
+		oldRuntime.close()
+	}
+	return nil
+}
+
+func (s *session) recordFailure(failureID model.FailureID, source string, parent model.CellID, runtimeHash, phase string, effects []model.EffectID, evalErr error) error {
+	if evalErr == nil {
+		return nil
+	}
+	return s.store.AppendFact(context.Background(), model.CellFailed{
+		Session:       s.id,
+		Branch:        s.branch,
+		Failure:       failureID,
+		Parent:        parent,
+		Source:        source,
+		RuntimeHash:   runtimeHash,
+		Phase:         phase,
+		ErrorMessage:  evalErr.Error(),
+		LinkedEffects: append([]model.EffectID(nil), effects...),
+		At:            time.Now().UTC(),
+	})
+}
+
 // Submit evaluates src in the branch-local goja runtime, then commits the
 // resulting cell to durable history. Evaluation happens before any fact is
 // appended so that a parse or runtime failure leaves both the VM state and
@@ -233,6 +300,8 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: prepare runtime: %w", err)
 	}
 	freshRuntime := evalRuntime != s.runtime
+	failureID := model.FailureID(uuid.NewString())
+	previousHead := s.head
 	cellID := model.CellID(uuid.NewString())
 	evalCtx, cancel := withCellSettleTimeout(ctx)
 	defer cancel()
@@ -242,15 +311,20 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 
 	eval, err := evalRuntime.runContext(evalCtx, src)
 	if err != nil {
+		effects, _ := acc.drain()
 		if freshRuntime {
 			evalRuntime.close()
+		} else {
+			s.runtimeDirty = true
+		}
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "eval", effects, err); recordErr != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: eval: %w; record failure: %v", err, recordErr)
 		}
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: eval: %w", err)
 	}
 
 	effects, promises := acc.drain()
 	now := time.Now().UTC()
-	previousHead := s.head
 
 	if err := s.store.AppendFact(ctx, model.CellChecked{
 		Session:     s.id,
@@ -264,6 +338,11 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	}); err != nil {
 		if freshRuntime {
 			evalRuntime.close()
+		} else {
+			s.runtimeDirty = true
+		}
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_checked", effects, err); recordErr != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellChecked: %w; record failure: %v", err, recordErr)
 		}
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellChecked: %w", err)
 	}
@@ -279,6 +358,11 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	}); err != nil {
 		if freshRuntime {
 			evalRuntime.close()
+		} else {
+			s.runtimeDirty = true
+		}
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_evaluated", effects, err); recordErr != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellEvaluated: %w; record failure: %v", err, recordErr)
 		}
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellEvaluated: %w", err)
 	}
@@ -291,6 +375,11 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	}); err != nil {
 		if freshRuntime {
 			evalRuntime.close()
+		} else {
+			s.runtimeDirty = true
+		}
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_committed", effects, err); recordErr != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellCommitted: %w; record failure: %v", err, recordErr)
 		}
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellCommitted: %w", err)
 	}
@@ -304,12 +393,18 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	}); err != nil {
 		if freshRuntime {
 			evalRuntime.close()
+		} else {
+			s.runtimeDirty = true
+		}
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_head_moved", effects, err); recordErr != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append HeadMoved: %w; record failure: %v", err, recordErr)
 		}
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append HeadMoved: %w", err)
 	}
 
 	// Only advance in-memory head after all durable facts succeed.
 	s.head = cellID
+	s.runtimeDirty = false
 	if freshRuntime {
 		oldRuntime := s.runtime
 		s.runtime = evalRuntime
@@ -351,6 +446,33 @@ func (s *session) Inspect(_ context.Context, handle model.ValueID) (engine.Value
 		return engine.ValueView{}, fmt.Errorf("session: Inspect: unknown handle %q", handle)
 	}
 	return view, nil
+}
+
+// Failures returns durable failed submit attempts for this session in append
+// order. The last entry is therefore the most recent failure.
+func (s *session) Failures(ctx context.Context) ([]engine.FailureView, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	records, err := s.store.LoadFailures(ctx, s.id)
+	if err != nil {
+		return nil, fmt.Errorf("session: Failures: %w", err)
+	}
+	out := make([]engine.FailureView, 0, len(records))
+	for _, record := range records {
+		out = append(out, engine.FailureView{
+			Failure:       record.Failure,
+			Branch:        record.Branch,
+			Parent:        record.Parent,
+			Source:        record.Source,
+			RuntimeHash:   record.RuntimeHash,
+			Phase:         record.Phase,
+			ErrorMessage:  record.ErrorMessage,
+			LinkedEffects: append([]model.EffectID(nil), record.LinkedEffects...),
+			At:            record.At,
+		})
+	}
+	return out, nil
 }
 
 // Restore positions this session at targetCell by forking a new branch. It
@@ -434,6 +556,7 @@ func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) er
 	s.runtimeHash = runtimeHash
 	s.runtimeConfig = append([]byte(nil), runtimeConfig...)
 	s.runtime = rt
+	s.runtimeDirty = false
 	s.values = make(map[model.ValueID]engine.ValueView)
 	if oldRuntime != nil {
 		oldRuntime.close()

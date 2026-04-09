@@ -23,3 +23,6 @@ type ValueID string
 
 // CheckpointID identifies a persisted runtime snapshot.
 type CheckpointID string
+
+// FailureID identifies one durable failed submit attempt.
+type FailureID string

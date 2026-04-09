@@ -83,6 +83,10 @@ func (s *recordingStore) LoadReplayPlan(ctx context.Context, sess model.SessionI
 	return s.wrapped.LoadReplayPlan(ctx, sess, targetCell)
 }
 
+func (s *recordingStore) LoadFailures(ctx context.Context, sess model.SessionID) ([]model.CellFailed, error) {
+	return s.wrapped.LoadFailures(ctx, sess)
+}
+
 func (s *recordingStore) Facts() []model.Fact {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,20 +141,35 @@ type asyncHostDelegate struct {
 	release chan struct{}
 	current int32
 	max     int32
+	serial  int64
 
 	mu    sync.Mutex
 	state map[model.SessionID]*asyncHostSessionState
 }
 
+// asyncHostDelegate intentionally controls JS-visible promise settlement order,
+// not just Go host callback return order. The red replay-order test asserts on
+// `.then(...)` side effects (`events.push(v)`), so the delegate wraps the
+// journaled host promise with an outer promise and only marks a call as
+// settled after that inner promise resolves/rejects on the runtime loop.
+//
+// This matters for replay tests: if replay stops preserving recorded
+// settlement order and starts re-invoking hosts or settling in start-order,
+// the alternating round order below will surface a mismatch in the observed JS
+// event order rather than being masked by an earlier Go-level return signal.
+
 type asyncHostSessionState struct {
 	callCount int
 	round     int
 	pending   map[string]*asyncPendingCall
+	handles   map[string]*asyncPendingCall
 }
 
 type asyncPendingCall struct {
-	proceed  chan struct{}
-	returned chan struct{}
+	id      string
+	value   string
+	proceed chan struct{}
+	settled chan struct{}
 }
 
 type blockingHostDelegate struct {
@@ -211,6 +230,58 @@ func (d *blockingHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext
 	return json.RawMessage(`{"kind":"blocking-host-test","version":1}`), nil
 }
 
+func (d *asyncHostDelegate) registerHandle(sessionID model.SessionID, value string) *asyncPendingCall {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.state == nil {
+		d.state = make(map[model.SessionID]*asyncHostSessionState)
+	}
+	st, ok := d.state[sessionID]
+	if !ok {
+		st = &asyncHostSessionState{}
+		d.state[sessionID] = st
+	}
+	if st.handles == nil {
+		st.handles = make(map[string]*asyncPendingCall)
+	}
+	id := fmt.Sprintf("%s:%d", sessionID, atomic.AddInt64(&d.serial, 1))
+	pc := &asyncPendingCall{
+		id:      id,
+		value:   value,
+		proceed: make(chan struct{}),
+		settled: make(chan struct{}),
+	}
+	st.handles[id] = pc
+	return pc
+}
+
+func (d *asyncHostDelegate) lookupHandle(sessionID model.SessionID, id string) *asyncPendingCall {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.state == nil {
+		return nil
+	}
+	st := d.state[sessionID]
+	if st == nil || st.handles == nil {
+		return nil
+	}
+	return st.handles[id]
+}
+
+func (d *asyncHostDelegate) settleHandle(sessionID model.SessionID, id string) {
+	d.mu.Lock()
+	st := d.state[sessionID]
+	var pc *asyncPendingCall
+	if st != nil && st.handles != nil {
+		pc = st.handles[id]
+		delete(st.handles, id)
+	}
+	d.mu.Unlock()
+	if pc != nil {
+		close(pc.settled)
+	}
+}
+
 func (d *asyncHostDelegate) sessionState(sessionID model.SessionID) *asyncHostSessionState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -235,9 +306,12 @@ func (d *asyncHostDelegate) CallCount(sessionID model.SessionID) int {
 }
 
 func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
-	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
-		var value string
-		if err := json.Unmarshal(params, &value); err != nil {
+	baseHostAsync := host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
+		var payload struct {
+			ID    string `json:"id"`
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(params, &payload); err != nil || payload.ID == "" || payload.Value == "" {
 			return nil, fmt.Errorf("hostAsync: value required")
 		}
 
@@ -251,14 +325,17 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 		defer atomic.AddInt32(&d.current, -1)
 
 		if d.enter != nil {
-			d.enter <- value
+			d.enter <- payload.Value
 		}
 		if d.release != nil {
 			<-d.release
 		}
 
 		st := d.sessionState(ctx.SessionID)
-		pc := &asyncPendingCall{proceed: make(chan struct{}), returned: make(chan struct{})}
+		pc := d.lookupHandle(ctx.SessionID, payload.ID)
+		if pc == nil {
+			return nil, fmt.Errorf("hostAsync: missing handle %q", payload.ID)
+		}
 
 		d.mu.Lock()
 		st.callCount++
@@ -267,7 +344,7 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 			st.pending = make(map[string]*asyncPendingCall)
 		}
 		round := st.round
-		st.pending[value] = pc
+		st.pending[payload.ID] = pc
 		if len(st.pending) == 2 {
 			pending := st.pending
 			st.pending = nil
@@ -276,11 +353,18 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 				if round%2 == 0 {
 					order = []string{"left", "right"}
 				}
-				first := pending[order[0]]
-				second := pending[order[1]]
+				var first, second *asyncPendingCall
+				for _, candidate := range pending {
+					if candidate.value == order[0] {
+						first = candidate
+					}
+					if candidate.value == order[1] {
+						second = candidate
+					}
+				}
 				if first != nil {
 					close(first.proceed)
-					<-first.returned
+					<-first.settled
 				}
 				if second != nil {
 					close(second.proceed)
@@ -290,9 +374,43 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 		d.mu.Unlock()
 
 		<-pc.proceed
-		close(pc.returned)
-		return json.Marshal(value)
-	})); err != nil {
+		return json.Marshal(payload.Value)
+	})
+
+	if err := rt.Set("hostAsync", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 || goja.IsUndefined(call.Arguments[0]) || goja.IsNull(call.Arguments[0]) {
+			promise, _, reject := rt.NewPromise()
+			_ = reject(rt.ToValue("hostAsync: value required"))
+			return rt.ToValue(promise)
+		}
+		value := call.Arguments[0].String()
+		handle := d.registerHandle(ctx.SessionID, value)
+		base := baseHostAsync(goja.FunctionCall{This: call.This, Arguments: []goja.Value{rt.ToValue(map[string]any{"id": handle.id, "value": value})}})
+		baseObj := base.ToObject(rt)
+		then, ok := goja.AssertFunction(baseObj.Get("then"))
+		if !ok {
+			d.settleHandle(ctx.SessionID, handle.id)
+			panic(rt.ToValue("hostAsync: wrapped async host did not return a promise"))
+		}
+		promise, resolve, reject := rt.NewPromise()
+		_, err := then(baseObj,
+			rt.ToValue(func(cb goja.FunctionCall) goja.Value {
+				d.settleHandle(ctx.SessionID, handle.id)
+				_ = resolve(cb.Argument(0))
+				return goja.Undefined()
+			}),
+			rt.ToValue(func(cb goja.FunctionCall) goja.Value {
+				d.settleHandle(ctx.SessionID, handle.id)
+				_ = reject(cb.Argument(0))
+				return goja.Undefined()
+			}),
+		)
+		if err != nil {
+			d.settleHandle(ctx.SessionID, handle.id)
+			panic(rt.ToValue(err.Error()))
+		}
+		return rt.ToValue(promise)
+	}); err != nil {
 		return nil, err
 	}
 	if err := rt.Set("hostWrap", func(call goja.FunctionCall) goja.Value {
@@ -1314,6 +1432,10 @@ func (f *failingStore) LoadReplayPlan(ctx context.Context, sess model.SessionID,
 	return f.wrapped.LoadReplayPlan(ctx, sess, targetCell)
 }
 
+func (f *failingStore) LoadFailures(ctx context.Context, sess model.SessionID) ([]model.CellFailed, error) {
+	return f.wrapped.LoadFailures(ctx, sess)
+}
+
 // TestSession_Submit_AppendErrorDoesNotAdvanceHead verifies that a store
 // failure during Submit does not silently advance the in-memory head.
 // (Negative test: error path from Failure Modes section.)
@@ -1849,6 +1971,119 @@ func TestSession_Submit_WithoutHostBindings_LeavesEffectFieldsEmpty(t *testing.T
 	}
 	if len(evalFact.CreatedPromises) != 0 {
 		t.Fatalf("expected no created promises in CellEvaluated without host bindings, got %v", evalFact.CreatedPromises)
+	}
+}
+
+func TestSession_Submit_FailuresReturnsDurableHistoryInOrder(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	r1, err := sess.Submit(ctx, `const stable = 1`)
+	if err != nil {
+		t.Fatalf("Submit stable cell: %v", err)
+	}
+
+	_, err = sess.Submit(ctx, `const =`)
+	if err == nil {
+		t.Fatal("expected syntax error")
+	}
+
+	r2, err := sess.Submit(ctx, `stable + 1`)
+	if err != nil {
+		t.Fatalf("Submit after first failure: %v", err)
+	}
+
+	_, err = sess.Submit(ctx, `throw new Error("boom")`)
+	if err == nil {
+		t.Fatal("expected runtime throw")
+	}
+
+	failures, err := sess.Failures(ctx)
+	if err != nil {
+		t.Fatalf("Failures: %v", err)
+	}
+	if len(failures) != 2 {
+		t.Fatalf("expected 2 failures, got %d", len(failures))
+	}
+	if failures[0].Source != `const =` {
+		t.Fatalf("first failure source = %q, want syntax source", failures[0].Source)
+	}
+	if failures[0].Parent != r1.Cell {
+		t.Fatalf("first failure parent = %q, want %q", failures[0].Parent, r1.Cell)
+	}
+	if !strings.Contains(failures[0].ErrorMessage, "SyntaxError") {
+		t.Fatalf("first failure message = %q, want SyntaxError", failures[0].ErrorMessage)
+	}
+	if failures[1].Source != `throw new Error("boom")` {
+		t.Fatalf("second failure source = %q, want throw source", failures[1].Source)
+	}
+	if failures[1].Parent != r2.Cell {
+		t.Fatalf("second failure parent = %q, want %q", failures[1].Parent, r2.Cell)
+	}
+	if !strings.Contains(failures[1].ErrorMessage, "boom") {
+		t.Fatalf("second failure message = %q, want boom", failures[1].ErrorMessage)
+	}
+
+	if err := sess.Restore(ctx, r1.Cell); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	failuresAfterRestore, err := sess.Failures(ctx)
+	if err != nil {
+		t.Fatalf("Failures after restore: %v", err)
+	}
+	if len(failuresAfterRestore) != 2 {
+		t.Fatalf("expected failures to persist after restore, got %d", len(failuresAfterRestore))
+	}
+}
+
+func TestSession_Submit_FailuresIncludeLinkedEffects(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := newEffectHostDelegate()
+	delegate.SetAsync("boom", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		return nil, errors.New("boom")
+	})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	_, err = sess.Submit(ctx, `(async () => await boom(null))()`)
+	if err == nil {
+		t.Fatal("expected host failure")
+	}
+
+	failures, err := sess.Failures(ctx)
+	if err != nil {
+		t.Fatalf("Failures: %v", err)
+	}
+	if len(failures) != 1 {
+		t.Fatalf("expected 1 failure, got %d", len(failures))
+	}
+	if len(failures[0].LinkedEffects) != 1 {
+		t.Fatalf("expected 1 linked effect, got %v", failures[0].LinkedEffects)
+	}
+
+	facts := fix.st.Facts()
+	failedEffect, ok := factsEffectFailedByID(facts, failures[0].LinkedEffects[0])
+	if !ok {
+		t.Fatalf("EffectFailed not recorded for linked effect %q", failures[0].LinkedEffects[0])
+	}
+	if failedEffect.ErrorMessage != "boom" {
+		t.Fatalf("EffectFailed message = %q, want boom", failedEffect.ErrorMessage)
 	}
 }
 
@@ -2563,5 +2798,881 @@ func TestSession_ReplayPerSubmit_ReusesRecordedSyncHostResults_AfterEffectLayer(
 	}
 	if len(problems) > 0 {
 		t.Fatalf("expected replay_per_submit to reuse recorded sync host results after the effect layer is implemented; %s", strings.Join(problems, "; "))
+	}
+}
+
+func TestSession_Submit_TopLevelAwaitAssignmentPersists(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `txt = await Promise.resolve("hello")`); err != nil {
+		t.Fatalf("Submit top-level await assignment: %v", err)
+	}
+
+	res, err := sess.Submit(ctx, `txt.length`)
+	if err != nil {
+		t.Fatalf("Submit txt.length: %v", err)
+	}
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value for txt.length")
+	}
+	if res.CompletionValue.Preview != "5" {
+		t.Fatalf("txt.length preview: want %q, got %q", "5", res.CompletionValue.Preview)
+	}
+}
+
+func TestSession_Submit_TopLevelAwaitSharedMutableBinding(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `let x = await Promise.resolve(1); function inc(){ x += 1; return x }`); err != nil {
+		t.Fatalf("Submit promoted top-level await cell: %v", err)
+	}
+
+	inc1, err := sess.Submit(ctx, `inc()`)
+	if err != nil {
+		t.Fatalf("Submit inc() #1: %v", err)
+	}
+	if inc1.CompletionValue == nil || inc1.CompletionValue.Preview != "2" {
+		t.Fatalf("inc() #1 preview: want %q, got %+v", "2", inc1.CompletionValue)
+	}
+
+	x1, err := sess.Submit(ctx, `x`)
+	if err != nil {
+		t.Fatalf("Submit x after inc() #1: %v", err)
+	}
+	if x1.CompletionValue == nil || x1.CompletionValue.Preview != "2" {
+		t.Fatalf("x after inc() #1 preview: want %q, got %+v", "2", x1.CompletionValue)
+	}
+
+	if _, err := sess.Submit(ctx, `x = 100`); err != nil {
+		t.Fatalf("Submit x = 100: %v", err)
+	}
+
+	inc2, err := sess.Submit(ctx, `inc()`)
+	if err != nil {
+		t.Fatalf("Submit inc() #2: %v", err)
+	}
+	if inc2.CompletionValue == nil || inc2.CompletionValue.Preview != "101" {
+		t.Fatalf("inc() #2 preview: want %q, got %+v", "101", inc2.CompletionValue)
+	}
+
+	x2, err := sess.Submit(ctx, `x`)
+	if err != nil {
+		t.Fatalf("Submit x after inc() #2: %v", err)
+	}
+	if x2.CompletionValue == nil || x2.CompletionValue.Preview != "101" {
+		t.Fatalf("x after inc() #2 preview: want %q, got %+v", "101", x2.CompletionValue)
+	}
+
+	if _, err := sess.Submit(ctx, `const y = await Promise.resolve(x + 1)`); err != nil {
+		t.Fatalf("Submit second top-level await declaration: %v", err)
+	}
+
+	y, err := sess.Submit(ctx, `y`)
+	if err != nil {
+		t.Fatalf("Submit y: %v", err)
+	}
+	if y.CompletionValue == nil || y.CompletionValue.Preview != "102" {
+		t.Fatalf("y preview: want %q, got %+v", "102", y.CompletionValue)
+	}
+}
+
+func TestSession_Submit_TopLevelAwaitRedeclarationBlocked(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `const txt = await Promise.resolve("hello")`); err != nil {
+		t.Fatalf("Submit first top-level await declaration: %v", err)
+	}
+
+	_, err = sess.Submit(ctx, `const txt = 99`)
+	if err == nil {
+		t.Fatal("expected redeclaration error, got nil")
+	}
+	if !strings.Contains(err.Error(), `top-level declaration "txt"`) {
+		t.Fatalf("expected redeclaration error to mention txt, got: %v", err)
+	}
+}
+
+func TestSession_ReplayPerSubmit_TopLevelAwaitPromotionReplays(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.RuntimeMode = engine.RuntimeModeReplayPerSubmit
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `let x = await Promise.resolve(1); function inc(){ x += 1; return x }`); err != nil {
+		t.Fatalf("Submit top-level await declaration in replay_per_submit: %v", err)
+	}
+
+	inc, err := sess.Submit(ctx, `inc()`)
+	if err != nil {
+		t.Fatalf("Submit inc() in replay_per_submit: %v", err)
+	}
+	if inc.CompletionValue == nil || inc.CompletionValue.Preview != "2" {
+		t.Fatalf("inc() replay_per_submit preview: want %q, got %+v", "2", inc.CompletionValue)
+	}
+
+	x, err := sess.Submit(ctx, `x`)
+	if err != nil {
+		t.Fatalf("Submit x in replay_per_submit: %v", err)
+	}
+	if x.CompletionValue == nil || x.CompletionValue.Preview != "2" {
+		t.Fatalf("x replay_per_submit preview: want %q, got %+v", "2", x.CompletionValue)
+	}
+}
+
+type topLevelAwaitAction func(t *testing.T, ctx context.Context, h *sessiontest.Harness)
+
+type topLevelAwaitScenario struct {
+	name         string
+	steps        []topLevelAwaitAction
+	knownGap     bool
+	gapRationale string
+}
+
+func submitComparablePairWithSharedContext(t *testing.T, ctx context.Context, h *sessiontest.Harness, src string) sessiontest.SubmitPair {
+	t.Helper()
+	pair, err := h.SubmitBoth(ctx, src)
+	if err != nil {
+		t.Fatalf("SubmitBoth(%q): %v", src, err)
+	}
+	if cmpErr := sessiontest.CompareSubmitPair(pair); cmpErr != nil {
+		t.Fatalf("SubmitBoth(%q) parity mismatch: %v", src, cmpErr)
+	}
+	return pair
+}
+
+func submitComparablePairWithSeparateContexts(t *testing.T, h *sessiontest.Harness, persistentCtx, replayCtx context.Context, src string) sessiontest.SubmitPair {
+	t.Helper()
+	var pair sessiontest.SubmitPair
+
+	pair.PersistentResult, pair.PersistentErr = h.Persistent.Submit(persistentCtx, src)
+	if pair.PersistentErr == nil && pair.PersistentResult.CompletionValue != nil {
+		view, err := h.Persistent.Inspect(persistentCtx, pair.PersistentResult.CompletionValue.ID)
+		if err != nil {
+			t.Fatalf("Inspect persistent completion for %q: %v", src, err)
+		}
+		pair.PersistentView = &view
+	}
+
+	pair.ReplayResult, pair.ReplayErr = h.Replay.Submit(replayCtx, src)
+	if pair.ReplayErr == nil && pair.ReplayResult.CompletionValue != nil {
+		view, err := h.Replay.Inspect(replayCtx, pair.ReplayResult.CompletionValue.ID)
+		if err != nil {
+			t.Fatalf("Inspect replay completion for %q: %v", src, err)
+		}
+		pair.ReplayView = &view
+	}
+
+	if cmpErr := sessiontest.CompareSubmitPair(pair); cmpErr != nil {
+		t.Fatalf("Submit pair for %q parity mismatch: %v", src, cmpErr)
+	}
+	return pair
+}
+
+func submitTopLevelAwaitPair(t *testing.T, ctx context.Context, h *sessiontest.Harness, src string) sessiontest.SubmitPair {
+	t.Helper()
+	return submitComparablePairWithSharedContext(t, ctx, h, src)
+}
+
+func expectTopLevelAwaitPreview(src, want string) topLevelAwaitAction {
+	return func(t *testing.T, ctx context.Context, h *sessiontest.Harness) {
+		t.Helper()
+		pair := submitTopLevelAwaitPair(t, ctx, h, src)
+		if pair.PersistentErr != nil {
+			t.Fatalf("expected success for %q, got error: %v", src, pair.PersistentErr)
+		}
+		if pair.PersistentView == nil {
+			t.Fatalf("expected completion view for %q, got nil", src)
+		}
+		if pair.PersistentView.Preview != want {
+			t.Fatalf("preview for %q: want %q, got %q", src, want, pair.PersistentView.Preview)
+		}
+	}
+}
+
+func expectTopLevelAwaitNoCompletion(src string) topLevelAwaitAction {
+	return func(t *testing.T, ctx context.Context, h *sessiontest.Harness) {
+		t.Helper()
+		pair := submitTopLevelAwaitPair(t, ctx, h, src)
+		if pair.PersistentErr != nil {
+			t.Fatalf("expected success for %q, got error: %v", src, pair.PersistentErr)
+		}
+		if pair.PersistentResult.CompletionValue != nil || pair.PersistentView != nil {
+			t.Fatalf("expected no completion for %q, got result=%+v view=%+v", src, pair.PersistentResult.CompletionValue, pair.PersistentView)
+		}
+	}
+}
+
+func expectTopLevelAwaitErrorContains(src, want string) topLevelAwaitAction {
+	return func(t *testing.T, ctx context.Context, h *sessiontest.Harness) {
+		t.Helper()
+		pair := submitTopLevelAwaitPair(t, ctx, h, src)
+		if pair.PersistentErr == nil {
+			t.Fatalf("expected error for %q, got nil", src)
+		}
+		if !strings.Contains(fmt.Sprint(pair.PersistentErr), want) {
+			t.Fatalf("error for %q: want substring %q, got %v", src, want, pair.PersistentErr)
+		}
+	}
+}
+
+func requireComparablePreview(t *testing.T, pair sessiontest.SubmitPair, src, want string) {
+	t.Helper()
+	if pair.PersistentErr != nil {
+		t.Fatalf("expected success for %q, got error: %v", src, pair.PersistentErr)
+	}
+	if pair.PersistentView == nil {
+		t.Fatalf("expected completion view for %q, got nil", src)
+	}
+	if pair.PersistentView.Preview != want {
+		t.Fatalf("preview for %q: want %q, got %q", src, want, pair.PersistentView.Preview)
+	}
+}
+
+func TestSession_FailedSubmit_DoesNotLeakRuntimeStateAcrossModes(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("sync throw after mutation", func(t *testing.T) {
+		h, err := sessiontest.StartComparableSessions(ctx, defaultConfig(), nil, nil)
+		if err != nil {
+			t.Fatalf("StartComparableSessions: %v", err)
+		}
+		defer h.Close()
+
+		failSrc := `globalThis.syncLeak = 1; throw new Error("boom")`
+		pair := submitComparablePairWithSharedContext(t, ctx, h, failSrc)
+		if pair.PersistentErr == nil {
+			t.Fatalf("expected error for %q, got nil", failSrc)
+		}
+		if !strings.Contains(fmt.Sprint(pair.PersistentErr), "boom") {
+			t.Fatalf("error for %q: want boom, got %v", failSrc, pair.PersistentErr)
+		}
+
+		checkSrc := `typeof syncLeak`
+		requireComparablePreview(t, submitComparablePairWithSharedContext(t, ctx, h, checkSrc), checkSrc, "undefined")
+	})
+
+	t.Run("top level await rejection after mutation", func(t *testing.T) {
+		h, err := sessiontest.StartComparableSessions(ctx, defaultConfig(), nil, nil)
+		if err != nil {
+			t.Fatalf("StartComparableSessions: %v", err)
+		}
+		defer h.Close()
+
+		failSrc := `globalThis.asyncLeak = false; try { await Promise.resolve(1); throw new Error("boom") } finally { globalThis.asyncLeak = true }`
+		pair := submitComparablePairWithSharedContext(t, ctx, h, failSrc)
+		if pair.PersistentErr == nil {
+			t.Fatalf("expected error for %q, got nil", failSrc)
+		}
+		if !strings.Contains(fmt.Sprint(pair.PersistentErr), "boom") {
+			t.Fatalf("error for %q: want boom, got %v", failSrc, pair.PersistentErr)
+		}
+
+		checkSrc := `typeof asyncLeak`
+		requireComparablePreview(t, submitComparablePairWithSharedContext(t, ctx, h, checkSrc), checkSrc, "undefined")
+	})
+
+	t.Run("pending await timeout after mutation", func(t *testing.T) {
+		h, err := sessiontest.StartComparableSessions(ctx, defaultConfig(), nil, nil)
+		if err != nil {
+			t.Fatalf("StartComparableSessions: %v", err)
+		}
+		defer h.Close()
+
+		failSrc := `globalThis.pendingLeak = 1; await new Promise(() => {})`
+		persistentCtx, cancelPersistent := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancelPersistent()
+		replayCtx, cancelReplay := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancelReplay()
+
+		pair := submitComparablePairWithSeparateContexts(t, h, persistentCtx, replayCtx, failSrc)
+		if pair.PersistentErr == nil {
+			t.Fatalf("expected error for %q, got nil", failSrc)
+		}
+		if !errors.Is(pair.PersistentErr, context.DeadlineExceeded) {
+			t.Fatalf("expected deadline exceeded for persistent submit, got %v", pair.PersistentErr)
+		}
+		if !errors.Is(pair.ReplayErr, context.DeadlineExceeded) {
+			t.Fatalf("expected deadline exceeded for replay submit, got %v", pair.ReplayErr)
+		}
+
+		checkSrc := `typeof pendingLeak`
+		requireComparablePreview(t, submitComparablePairWithSharedContext(t, ctx, h, checkSrc), checkSrc, "undefined")
+	})
+
+	t.Run("host failure after mutation", func(t *testing.T) {
+		delegate := newEffectHostDelegate()
+		delegate.SetAsync("boom", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+			return nil, errors.New("boom")
+		})
+
+		h, err := sessiontest.StartComparableSessions(ctx, defaultConfig(), delegate, nil)
+		if err != nil {
+			t.Fatalf("StartComparableSessions: %v", err)
+		}
+		defer h.Close()
+
+		failSrc := `globalThis.effectLeak = 1; await boom(null)`
+		pair := submitComparablePairWithSharedContext(t, ctx, h, failSrc)
+		if pair.PersistentErr == nil {
+			t.Fatalf("expected error for %q, got nil", failSrc)
+		}
+		if !strings.Contains(fmt.Sprint(pair.PersistentErr), "boom") {
+			t.Fatalf("error for %q: want boom, got %v", failSrc, pair.PersistentErr)
+		}
+
+		checkSrc := `typeof effectLeak`
+		requireComparablePreview(t, submitComparablePairWithSharedContext(t, ctx, h, checkSrc), checkSrc, "undefined")
+	})
+}
+
+func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
+	ctx := context.Background()
+	scenarios := []topLevelAwaitScenario{
+		{
+			name: "bare await expression settles and leaves session usable",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`await Promise.resolve(1)`, "1"),
+				expectTopLevelAwaitPreview(`1 + 1`, "2"),
+			},
+		},
+		{
+			name: "awaited assignment persists across cells",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`txt = await Promise.resolve("hello")`, "hello"),
+				expectTopLevelAwaitPreview(`txt.length`, "5"),
+			},
+		},
+		{
+			name: "awaited const declaration persists",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const txt = await Promise.resolve("hello")`),
+				expectTopLevelAwaitPreview(`txt.length`, "5"),
+			},
+		},
+		{
+			name: "awaited declaration keeps trailing expression completion",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`const a = await Promise.resolve(1); a + 1`, "2"),
+				expectTopLevelAwaitPreview(`a`, "1"),
+			},
+		},
+		{
+			name: "awaited let and function share mutable binding",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`let x = await Promise.resolve(1); function inc(){ x += 1; return x }`),
+				expectTopLevelAwaitPreview(`inc()`, "2"),
+				expectTopLevelAwaitPreview(`x`, "2"),
+				expectTopLevelAwaitPreview(`x = 100`, "100"),
+				expectTopLevelAwaitPreview(`inc()`, "101"),
+				expectTopLevelAwaitPreview(`x`, "101"),
+			},
+		},
+		{
+			name: "awaited var declaration persists",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`var total = await Promise.resolve(2)`),
+				expectTopLevelAwaitPreview(`total + 1`, "3"),
+			},
+		},
+		{
+			name: "promoted var declaration stays visible via globalThis",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`var shared = await Promise.resolve(1)`),
+				expectTopLevelAwaitPreview(`shared = 2`, "2"),
+				expectTopLevelAwaitPreview(`String(globalThis.shared) + ":" + String(shared)`, "2:2"),
+			},
+		},
+		{
+			name: "promoted function declaration stays visible via globalThis",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`function shared(){ return 1 }; await Promise.resolve(0)`, "0"),
+				expectTopLevelAwaitPreview(`String(shared()) + ":" + String(globalThis.shared())`, "1:1"),
+			},
+		},
+		{
+			name: "promoted function declaration can be replaced via globalThis assignment",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`function shared(){ return 1 }; await Promise.resolve(0)`, "0"),
+				expectTopLevelAwaitPreview(`globalThis.shared = function(){ return 2 }; shared()`, "2"),
+				expectTopLevelAwaitPreview(`String(shared()) + ":" + String(globalThis.shared())`, "2:2"),
+			},
+		},
+		{
+			name: "delete on promoted var stays blocked like a global binding",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`var doomed = await Promise.resolve(1)`),
+				expectTopLevelAwaitPreview(`String(delete doomed)`, "false"),
+				expectTopLevelAwaitPreview(`String(globalThis.doomed) + ":" + String(doomed)`, "1:1"),
+			},
+		},
+		{
+			name: "delete on promoted function stays blocked like a global binding",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`function doomed(){ return 1 }; await Promise.resolve(0)`, "0"),
+				expectTopLevelAwaitPreview(`String(delete doomed)`, "false"),
+				expectTopLevelAwaitPreview(`typeof doomed + ":" + typeof globalThis.doomed`, "function:function"),
+			},
+		},
+		{
+			name: "awaited assignment updates existing binding",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`let current = 1`),
+				expectTopLevelAwaitPreview(`current = await Promise.resolve(2)`, "2"),
+				expectTopLevelAwaitPreview(`current`, "2"),
+			},
+		},
+		{
+			name: "multiple awaits in one cell preserve bindings",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`const a = await Promise.resolve(1); const b = await Promise.resolve(2); a + b`, "3"),
+				expectTopLevelAwaitPreview(`a + b`, "3"),
+			},
+		},
+		{
+			name: "object destructuring declarations are promoted",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const {a, b: c} = await Promise.resolve({a: 10, b: 20})`),
+				expectTopLevelAwaitPreview(`a + c`, "30"),
+			},
+		},
+		{
+			name: "array destructuring with rest is promoted",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const [head, ...tail] = await Promise.resolve([1, 2, 3])`),
+				expectTopLevelAwaitPreview(`head + tail.length`, "3"),
+			},
+		},
+		{
+			name: "if branch with await keeps state",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`let label = "start"; if (true) { label = await Promise.resolve("done") }; label`, "done"),
+				expectTopLevelAwaitPreview(`label`, "done"),
+			},
+		},
+		{
+			name: "loop with await preserves accumulated state",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`let sum = 0; for (const n of [1, 2, 3]) { sum += await Promise.resolve(n) }; sum`, "6"),
+				expectTopLevelAwaitPreview(`sum`, "6"),
+			},
+		},
+		{
+			name: "for of source with await preserves accumulated state",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`let sum = 0; for (const n of await Promise.resolve([1, 2, 3])) { sum += n }; sum`, "6"),
+				expectTopLevelAwaitPreview(`sum`, "6"),
+			},
+		},
+		{
+			name: "for in source with await preserves discovered keys",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`let keys = []; for (const k in await Promise.resolve({a: 1, b: 2})) { keys.push(k) }; keys.join(":")`, "a:b"),
+				expectTopLevelAwaitPreview(`keys.join(":")`, "a:b"),
+			},
+		},
+		{
+			name: "labelled break with await preserves control flow",
+			knownGap: true,
+			gapRationale: "goja currently rejects the wrapped labelled-loop form once await appears in the labelled body",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`let out = 0; outer: for (const n of [1, 2, 3]) { for (const m of [1, 2, 3]) { out += await Promise.resolve(m); break outer; } }; out`, "1"),
+				expectTopLevelAwaitPreview(`out`, "1"),
+			},
+		},
+		{
+			name: "labelled continue with await preserves control flow",
+			knownGap: true,
+			gapRationale: "goja currently rejects the wrapped labelled-loop form once await appears in the labelled body",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview("let hits = []; outer: for (const n of [1, 2, 3]) { for (const m of [1, 2, 3]) { if (await Promise.resolve(m === 2)) continue outer; hits.push(`${n}:${m}`) } }; hits.join(',')", "1:1,2:1,3:1"),
+				expectTopLevelAwaitPreview(`hits.join(",")`, "1:1,2:1,3:1"),
+			},
+		},
+		{
+			name: "block scoped awaited bindings do not leak",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`{ let hidden = await Promise.resolve(1); }`),
+				expectTopLevelAwaitPreview(`typeof hidden`, "undefined"),
+			},
+		},
+		{
+			name: "short circuit skips rejected awaited branch",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const ok = false && await Promise.reject("boom")`),
+				expectTopLevelAwaitPreview(`String(ok)`, "false"),
+			},
+		},
+		{
+			name: "ternary with awaited branch persists choice",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const choice = true ? await Promise.resolve("a") : await Promise.resolve("b")`),
+				expectTopLevelAwaitPreview(`choice`, "a"),
+			},
+		},
+		{
+			name: "class declaration closes over awaited top level binding",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const seed = await Promise.resolve(41); class Box { value(){ return seed + 1 } }`),
+				expectTopLevelAwaitPreview(`new Box().value()`, "42"),
+			},
+		},
+		{
+			name: "rejection after await does not commit declarations",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const stable = 1`),
+				expectTopLevelAwaitErrorContains(`const broken = await Promise.reject("boom")`, "boom"),
+				expectTopLevelAwaitPreview(`stable`, "1"),
+				expectTopLevelAwaitPreview(`typeof broken`, "undefined"),
+			},
+		},
+		{
+			name: "redeclaration after awaited declaration is blocked",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const txt = await Promise.resolve("hello")`),
+				expectTopLevelAwaitErrorContains(`const txt = 99`, `top-level declaration "txt"`),
+				expectTopLevelAwaitPreview(`txt`, "hello"),
+			},
+		},
+		{
+			name: "nested async function plus later top level await stays usable",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`async function later(){ return await Promise.resolve(7) }`),
+				expectTopLevelAwaitPreview(`await later()`, "7"),
+			},
+		},
+		{
+			name: "await in call arguments persists result",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`Math.max(await Promise.resolve(2), await Promise.resolve(5))`, "5"),
+			},
+		},
+		{
+			name: "await in template literal interpolation persists result",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview("`value:${await Promise.resolve(42)}`", "value:42"),
+			},
+		},
+		{
+			name: "await in computed property access persists result",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`const obj = { answer: 42 }; obj[await Promise.resolve("answer")]`, "42"),
+			},
+		},
+		{
+			name: "await in object literal property persists result",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`const obj = { x: await Promise.resolve(1), y: 2 }; obj.x + obj.y`, "3"),
+			},
+		},
+		{
+			name: "await in array literal element persists result",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`const arr = [await Promise.resolve(1), 2]; arr.join(":")`, "1:2"),
+			},
+		},
+		{
+			name: "switch discriminant with await preserves selected case value",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`switch (await Promise.resolve(2)) { case 1: "one"; break; case 2: "two"; break; default: "other" }`, "two"),
+			},
+		},
+		{
+			name: "switch fallthrough after awaited case expression preserves final value",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`switch (1) { case 1: await Promise.resolve(1); case 2: 2; break; default: 3 }`, "2"),
+			},
+		},
+		{
+			name: "await in logical nullish expression persists result",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const chosen = null ?? await Promise.resolve("fallback")`),
+				expectTopLevelAwaitPreview(`chosen`, "fallback"),
+			},
+		},
+		{
+			name: "nested object destructuring with defaults is promoted",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const { nested: { value = 9 } } = await Promise.resolve({ nested: {} })`),
+				expectTopLevelAwaitPreview(`value`, "9"),
+			},
+		},
+		{
+			name: "array destructuring default with await is promoted",
+			knownGap: true,
+			gapRationale: "goja currently rejects await inside destructuring default initializers even inside the async wrapper",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const [x = await Promise.resolve(5)] = []`),
+				expectTopLevelAwaitPreview(`x`, "5"),
+			},
+		},
+		{
+			name: "object destructuring default with await is promoted",
+			knownGap: true,
+			gapRationale: "goja currently rejects await inside destructuring default initializers even inside the async wrapper",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const {x = await Promise.resolve(5)} = {}`),
+				expectTopLevelAwaitPreview(`x`, "5"),
+			},
+		},
+		{
+			name: "array destructuring with elision is promoted",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const [first, , third] = await Promise.resolve([1, 2, 3])`),
+				expectTopLevelAwaitPreview(`first + third`, "4"),
+			},
+		},
+		{
+			name: "await inside while condition preserves state",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`let i = 0; while (i < await Promise.resolve(3)) { i += 1 }; i`, "3"),
+				expectTopLevelAwaitPreview(`i`, "3"),
+			},
+		},
+		{
+			name: "await inside do while condition preserves state",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`let i = 0; do { i += 1 } while (i < await Promise.resolve(3)); i`, "3"),
+				expectTopLevelAwaitPreview(`i`, "3"),
+			},
+		},
+		{
+			name: "await inside for initializer and update preserves state",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`let acc = 0; for (let i = await Promise.resolve(0); i < 3; i = await Promise.resolve(i + 1)) { acc += i }; acc`, "3"),
+				expectTopLevelAwaitPreview(`acc`, "3"),
+			},
+		},
+		{
+			name: "awaited rejection inside short circuit chosen branch errors without commit",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const stable = 1`),
+				expectTopLevelAwaitErrorContains(`true && await Promise.reject("boom")`, "boom"),
+				expectTopLevelAwaitPreview(`stable`, "1"),
+			},
+		},
+		{
+			name: "awaited rejection inside ternary chosen branch errors without commit",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const stable = 1`),
+				expectTopLevelAwaitErrorContains(`true ? await Promise.reject("boom") : 1`, "boom"),
+				expectTopLevelAwaitPreview(`stable`, "1"),
+			},
+		},
+		{
+			name: "awaited class static field can read top level binding later",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const seed = await Promise.resolve(5); class C { static value = seed + 1 }`),
+				expectTopLevelAwaitPreview(`C.value`, "6"),
+			},
+		},
+		{
+			name: "awaited function declaration coexists with later use in another async cell",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`function plus(n){ return n + 1 }`),
+				expectTopLevelAwaitPreview(`const later = await Promise.resolve(plus(41)); later`, "42"),
+				expectTopLevelAwaitPreview(`later`, "42"),
+			},
+		},
+		{
+			name: "if completion from awaited branch should behave like native top level await",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`if (true) { await Promise.resolve(1); 2 }`, "2"),
+			},
+		},
+		{
+			name: "if else completion should preserve chosen branch value",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`if (false) { await Promise.resolve(1); 2 } else { await Promise.resolve(1); 3 }`, "3"),
+			},
+		},
+		{
+			name: "block completion should preserve final expression value",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`{ await Promise.resolve(1); 2 }`, "2"),
+			},
+		},
+		{
+			name: "switch completion should preserve selected case value",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`switch (1) { case 1: await Promise.resolve(1); 2; break; default: 3 }`, "2"),
+			},
+		},
+		{
+			name: "try catch completion should preserve catch result",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`try { await Promise.reject("boom") } catch (err) { 3 }`, "3"),
+			},
+		},
+		{
+			name: "catch binding after awaited rejection is available",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`try { await Promise.reject("boom") } catch (err) { err + "!" }`, "boom!"),
+			},
+		},
+		{
+			name: "try finally completion should preserve try result",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`try { await Promise.resolve(1); 2 } finally {}`, "2"),
+			},
+		},
+		{
+			name: "top level strict mode is rejected in transformed cells",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitErrorContains(`"use strict"; await Promise.resolve(1)`, `top-level "use strict" directive`),
+			},
+		},
+		{
+			name: "eval anywhere in transformed cells is rejected",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitErrorContains(`await Promise.resolve(0); function later(){ return eval("1") }`, `eval is not supported`),
+			},
+		},
+		{
+			name: "top level this is rejected in transformed cells",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitErrorContains(`await Promise.resolve(0); this`, "top-level `this` is not supported"),
+			},
+		},
+		{
+			name: "failed cell side effects should not diverge between persistent and replay modes",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitErrorContains(`globalThis.cleaned = false; try { await Promise.resolve(1); throw new Error("boom") } finally { globalThis.cleaned = true }`, "boom"),
+				expectTopLevelAwaitPreview(`typeof cleaned`, "undefined"),
+			},
+		},
+		{
+			name: "for await of reports a rewrite hint",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitErrorContains(`let sum = 0; for await (const n of [1, 2, 3]) { sum += n }; sum`, "for example: `for (const item of items) { const value = await item; /* body using value */ }`") ,
+			},
+		},
+		{
+			name: "raw var redeclaration after transformed var declaration reports already defined",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`var shared = await Promise.resolve(1)`),
+				expectTopLevelAwaitErrorContains(`var shared = 2`, `already defined in this session`),
+				expectTopLevelAwaitPreview(`shared`, "1"),
+			},
+		},
+		{
+			name: "function then var redeclaration should match JS global semantics",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`function shared(){ return 1 }`),
+				expectTopLevelAwaitNoCompletion(`var shared = await Promise.resolve(2)`),
+				expectTopLevelAwaitPreview(`typeof shared`, "number"),
+			},
+		},
+		{
+			name: "var then function redeclaration should match JS global semantics",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`var shared = 1`),
+				expectTopLevelAwaitPreview(`function shared(){ return 2 }; await Promise.resolve(0)`, "0"),
+				expectTopLevelAwaitPreview(`typeof shared + ":" + String(shared())`, "function:2"),
+			},
+		},
+		{
+			name: "raw function redeclaration after transformed function declaration reports already defined",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitPreview(`function shared(){ return 1 }; await Promise.resolve(0)`, "0"),
+				expectTopLevelAwaitErrorContains(`function shared(){ return 2 }`, `already defined in this session`),
+				expectTopLevelAwaitPreview(`typeof shared + ":" + String(shared())`, "function:1"),
+			},
+		},
+		{
+			name: "lexical then var redeclaration should stay blocked",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`let shared = 1`),
+				expectTopLevelAwaitErrorContains(`var shared = await Promise.resolve(2)`, `top-level declaration "shared"`),
+				expectTopLevelAwaitPreview(`shared`, "1"),
+			},
+		},
+		{
+			name: "lexical then function redeclaration should stay blocked",
+			steps: []topLevelAwaitAction{
+				expectTopLevelAwaitNoCompletion(`const shared = 1`),
+				expectTopLevelAwaitErrorContains(`function shared(){ return 2 }; await Promise.resolve(0)`, `top-level declaration "shared"`),
+				expectTopLevelAwaitPreview(`shared`, "1"),
+			},
+		},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			if scenario.knownGap {
+				t.Skipf("known gap: %s", scenario.gapRationale)
+			}
+			h, err := sessiontest.StartComparableSessions(ctx, defaultConfig(), nil, nil)
+			if err != nil {
+				t.Fatalf("StartComparableSessions: %v", err)
+			}
+			defer h.Close()
+
+			for i, step := range scenario.steps {
+				t.Run(fmt.Sprintf("step_%02d", i+1), func(t *testing.T) {
+					step(t, ctx, h)
+				})
+			}
+		})
+	}
+}
+
+func TestSession_TopLevelAwaitRestoreForkParity(t *testing.T) {
+	ctx := context.Background()
+	h, err := sessiontest.StartComparableSessions(ctx, defaultConfig(), nil, nil)
+	if err != nil {
+		t.Fatalf("StartComparableSessions: %v", err)
+	}
+	defer h.Close()
+
+	first := submitTopLevelAwaitPair(t, ctx, h, `const x = await Promise.resolve(1)`)
+	if first.PersistentErr != nil {
+		t.Fatalf("first top-level await submit: %v", first.PersistentErr)
+	}
+	_ = submitTopLevelAwaitPair(t, ctx, h, `const y = 2`)
+
+	if err := h.Persistent.Restore(ctx, first.PersistentResult.Cell); err != nil {
+		t.Fatalf("Persistent.Restore: %v", err)
+	}
+	if err := h.Replay.Restore(ctx, first.ReplayResult.Cell); err != nil {
+		t.Fatalf("Replay.Restore: %v", err)
+	}
+
+	xPair := submitTopLevelAwaitPair(t, ctx, h, `x`)
+	if xPair.PersistentView == nil || xPair.PersistentView.Preview != "1" {
+		t.Fatalf("x after restore: want %q, got %+v", "1", xPair.PersistentView)
+	}
+	yPair := submitTopLevelAwaitPair(t, ctx, h, `typeof y`)
+	if yPair.PersistentView == nil || yPair.PersistentView.Preview != "undefined" {
+		t.Fatalf("typeof y after restore: want %q, got %+v", "undefined", yPair.PersistentView)
 	}
 }
