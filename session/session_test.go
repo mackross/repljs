@@ -122,6 +122,26 @@ func defaultConfig() model.SessionConfig {
 	return model.SessionConfig{Manifest: defaultManifest()}
 }
 
+type failingStartupDelegate struct {
+	sessionID model.SessionID
+}
+
+func (d *failingStartupDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, _ *goja.Runtime, _ engine.HostFuncBuilder, _ json.RawMessage) (json.RawMessage, error) {
+	d.sessionID = ctx.SessionID
+	return nil, errors.New("configure runtime failed")
+}
+
+type runtimeHashDelegate struct {
+	returnedState json.RawMessage
+}
+
+func (d *runtimeHashDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, _ engine.HostFuncBuilder, _ json.RawMessage) (json.RawMessage, error) {
+	if err := rt.Set("__runtimeHash", ctx.RuntimeHash); err != nil {
+		return nil, err
+	}
+	return d.returnedState, nil
+}
+
 // mustLoadHead calls LoadHead and fails the test on any error.
 func mustLoadHead(t *testing.T, st *memstore.Store, sessID model.SessionID, branch model.BranchID) store.HeadRecord {
 	t.Helper()
@@ -1910,6 +1930,52 @@ func (f *failingStore) LoadSessionState(ctx context.Context, sess model.SessionI
 	return f.wrapped.LoadSessionState(ctx, sess)
 }
 
+type selectiveFailingStore struct {
+	wrapped *memstore.Store
+	fail    func(model.Fact) error
+}
+
+func newSelectiveFailingStore(fail func(model.Fact) error) *selectiveFailingStore {
+	return &selectiveFailingStore{wrapped: memstore.New(), fail: fail}
+}
+
+func (s *selectiveFailingStore) AppendFact(ctx context.Context, fact model.Fact) error {
+	if s.fail != nil {
+		if err := s.fail(fact); err != nil {
+			return err
+		}
+	}
+	return s.wrapped.AppendFact(ctx, fact)
+}
+
+func (s *selectiveFailingStore) PutRuntimeConfig(ctx context.Context, hash string, config json.RawMessage) error {
+	return s.wrapped.PutRuntimeConfig(ctx, hash, config)
+}
+
+func (s *selectiveFailingStore) LoadRuntimeConfig(ctx context.Context, hash string) (json.RawMessage, error) {
+	return s.wrapped.LoadRuntimeConfig(ctx, hash)
+}
+
+func (s *selectiveFailingStore) LoadHead(ctx context.Context, sess model.SessionID, branch model.BranchID) (store.HeadRecord, error) {
+	return s.wrapped.LoadHead(ctx, sess, branch)
+}
+
+func (s *selectiveFailingStore) LoadStaticEnv(ctx context.Context, sess model.SessionID, branch model.BranchID, head model.CellID) (store.StaticEnvSnapshot, error) {
+	return s.wrapped.LoadStaticEnv(ctx, sess, branch, head)
+}
+
+func (s *selectiveFailingStore) LoadReplayPlan(ctx context.Context, sess model.SessionID, targetCell model.CellID) (store.ReplayPlan, error) {
+	return s.wrapped.LoadReplayPlan(ctx, sess, targetCell)
+}
+
+func (s *selectiveFailingStore) LoadFailures(ctx context.Context, sess model.SessionID) ([]model.CellFailed, error) {
+	return s.wrapped.LoadFailures(ctx, sess)
+}
+
+func (s *selectiveFailingStore) LoadSessionState(ctx context.Context, sess model.SessionID) (store.SessionState, error) {
+	return s.wrapped.LoadSessionState(ctx, sess)
+}
+
 // TestSession_Submit_AppendErrorDoesNotAdvanceHead verifies that a store
 // failure during Submit does not silently advance the in-memory head.
 // (Negative test: error path from Failure Modes section.)
@@ -1934,6 +2000,132 @@ func TestSession_Submit_AppendErrorDoesNotAdvanceHead(t *testing.T) {
 	}
 	if !errors.Is(err, errForcedFailure) {
 		t.Errorf("expected errForcedFailure in chain, got: %v", err)
+	}
+}
+
+func TestSession_StartSession_ConfigureFailureDoesNotPersistSession(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	st := newRecordingStore()
+	delegate := &failingStartupDelegate{}
+
+	_, err := e.StartSession(ctx, defaultConfig(), engine.SessionDeps{
+		Store:      st,
+		VMDelegate: delegate,
+	})
+	if err == nil {
+		t.Fatal("expected StartSession to fail")
+	}
+	if !strings.Contains(err.Error(), "configure runtime failed") {
+		t.Fatalf("expected configure-runtime failure, got %v", err)
+	}
+	if delegate.sessionID == "" {
+		t.Fatal("expected delegate to observe generated session ID")
+	}
+	if facts := st.Facts(); len(facts) != 0 {
+		t.Fatalf("expected no persisted facts on failed startup, got %v", facts)
+	}
+	if _, err := st.LoadSessionState(ctx, delegate.sessionID); err == nil {
+		t.Fatal("expected failed startup session to be absent from durable state")
+	}
+}
+
+func TestSession_StartSession_RuntimeHashMatchesReopen(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	delegate := &runtimeHashDelegate{returnedState: json.RawMessage(`{"kind":"hash-test","version":1}`)}
+	fix.deps.VMDelegate = delegate
+	fix.deps.RuntimeConfig = json.RawMessage(`{"seed":1}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	initial, err := sess.Submit(ctx, "__runtimeHash")
+	if err != nil {
+		t.Fatalf("Submit __runtimeHash: %v", err)
+	}
+	if initial.CompletionValue == nil || initial.CompletionValue.Preview == "" {
+		t.Fatalf("expected initial runtime hash preview, got %+v", initial.CompletionValue)
+	}
+
+	reopened, err := e.OpenSession(ctx, sess.ID(), fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	afterReopen, err := reopened.Submit(ctx, "__runtimeHash")
+	if err != nil {
+		t.Fatalf("Submit __runtimeHash after reopen: %v", err)
+	}
+	if afterReopen.CompletionValue == nil {
+		t.Fatalf("expected reopened runtime hash completion, got %+v", afterReopen.CompletionValue)
+	}
+	if got, want := afterReopen.CompletionValue.Preview, initial.CompletionValue.Preview; got != want {
+		t.Fatalf("runtime hash changed across reopen: got %q want %q", got, want)
+	}
+}
+
+func TestSession_Submit_AsyncEffectCompletedJournalFailureFailsSubmit(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	st := newSelectiveFailingStore(func(fact model.Fact) error {
+		if _, ok := fact.(model.EffectCompleted); ok {
+			return fmt.Errorf("store: %w", errForcedFailure)
+		}
+		return nil
+	})
+	delegate := newEffectHostDelegate()
+	delegate.SetAsync("ok", func(_ context.Context, _ []byte) ([]byte, error) {
+		return mustEncodeBridgeValue("done"), nil
+	})
+
+	sess, err := e.StartSession(ctx, defaultConfig(), engine.SessionDeps{
+		Store:      st,
+		VMDelegate: delegate,
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	_, err = sess.Submit(ctx, `await ok("value")`)
+	if err == nil {
+		t.Fatal("expected submit to fail when EffectCompleted append fails")
+	}
+	if !strings.Contains(err.Error(), "journal EffectCompleted") {
+		t.Fatalf("expected journal EffectCompleted failure, got %v", err)
+	}
+
+	var submitErr *engine.SubmitFailure
+	if !errors.As(err, &submitErr) {
+		t.Fatalf("expected SubmitFailure, got %T (%v)", err, err)
+	}
+	if len(submitErr.LinkedEffects) != 1 {
+		t.Fatalf("expected one linked effect, got %v", submitErr.LinkedEffects)
+	}
+	effect := submitErr.LinkedEffects[0]
+	if effect.Status != engine.EffectStatusFailed {
+		t.Fatalf("expected linked effect to be failed, got %q", effect.Status)
+	}
+	if !strings.Contains(effect.ErrorMessage, "journal EffectCompleted") {
+		t.Fatalf("expected linked effect error to mention journal failure, got %q", effect.ErrorMessage)
+	}
+
+	state, err := st.LoadSessionState(ctx, sess.ID())
+	if err != nil {
+		t.Fatalf("LoadSessionState: %v", err)
+	}
+	head, err := st.LoadHead(ctx, state.Session, state.Branch)
+	if err != nil {
+		t.Fatalf("LoadHead: %v", err)
+	}
+	if head.Head != "" {
+		t.Fatalf("expected failed submit to leave head empty, got %q", head.Head)
 	}
 }
 

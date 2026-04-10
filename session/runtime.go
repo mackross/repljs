@@ -22,6 +22,7 @@ import (
 )
 
 const directRunTimeout = 100 * time.Millisecond
+const maxRuntimeHashResolutionPasses = 8
 
 // effectAccumulator collects the EffectIDs launched during a
 // single cell evaluation. It is goroutine-safe; both the JS event-loop
@@ -606,6 +607,11 @@ type branchRuntime struct {
 	valueByIndex  map[int]goja.Value
 }
 
+type runtimeBootstrap struct {
+	router        *hostFunctionRouter
+	topLevelAwait *topLevelAwaitState
+}
+
 func normalizeRuntimeConfig(state json.RawMessage) (json.RawMessage, error) {
 	if len(state) == 0 {
 		return nil, nil
@@ -626,14 +632,138 @@ func runtimeConfigHash(state json.RawMessage) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func bootstrapRuntimeVM(vm *goja.Runtime, loop *eventloop.EventLoop, st store.Store, ctx engine.SessionRuntimeContext, replayPlan *store.ReplayPlan) (*runtimeBootstrap, error) {
+	engine.BindRuntimeLoop(vm, loop.RunOnLoop)
+	router := newHostFunctionRouter(vm, &hostRuntimeWiring{store: st, sessionID: ctx.SessionID, replayPlan: replayPlan})
+	vm.SetPromiseRejectionTracker(router.trackPromiseRejection)
+	if err := installReplayAwareGojaNondeterminism(vm, hostFuncBuilder{router: router}); err != nil {
+		return nil, fmt.Errorf("install replay-aware goja nondeterminism: %w", err)
+	}
+	if err := disableUnsupportedTimerGlobals(vm); err != nil {
+		return nil, fmt.Errorf("disable timer globals: %w", err)
+	}
+	if err := installConsoleAndInspect(vm, router); err != nil {
+		return nil, fmt.Errorf("install console/inspect: %w", err)
+	}
+	topLevelAwait := newTopLevelAwaitState()
+	if err := topLevelAwait.install(vm); err != nil {
+		return nil, fmt.Errorf("install top-level await hook: %w", err)
+	}
+	return &runtimeBootstrap{
+		router:        router,
+		topLevelAwait: topLevelAwait,
+	}, nil
+}
+
+func installRuntimeValueLookups(vm *goja.Runtime, valueByIndex map[int]goja.Value) error {
+	if err := vm.Set("$last", goja.Undefined()); err != nil {
+		return fmt.Errorf("install $last: %w", err)
+	}
+	if err := vm.Set("$val", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panicJSError(vm, "TypeError", "$val(index): missing index")
+		}
+		index := int(call.Argument(0).ToInteger())
+		if index <= 0 {
+			panicJSError(vm, "RangeError", "$val(%d): index must be positive", index)
+		}
+		value, ok := valueByIndex[index]
+		if !ok {
+			panicJSError(vm, "Error", "$val(%d): no such visible cell value on this branch", index)
+		}
+		return value
+	}); err != nil {
+		return fmt.Errorf("install $val: %w", err)
+	}
+	return nil
+}
+
+func previewConfiguredRuntimeState(bgCtx context.Context, ctx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate, state json.RawMessage, replayPlan *store.ReplayPlan) (json.RawMessage, error) {
+	if delegate == nil {
+		return state, nil
+	}
+
+	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
+	loop.Start()
+
+	type previewResult struct {
+		configured json.RawMessage
+		err        error
+	}
+	resultCh := make(chan previewResult, 1)
+	loop.RunOnLoop(func(vm *goja.Runtime) {
+		bootstrap, err := bootstrapRuntimeVM(vm, loop, st, ctx, replayPlan)
+		if err != nil {
+			resultCh <- previewResult{err: err}
+			return
+		}
+		configuredState, err := delegate.ConfigureRuntime(ctx, vm, hostFuncBuilder{router: bootstrap.router}, state)
+		if err != nil {
+			resultCh <- previewResult{err: fmt.Errorf("configure runtime: %w", err)}
+			return
+		}
+		resultCh <- previewResult{configured: configuredState}
+	})
+
+	result := <-resultCh
+	_ = bgCtx
+	loop.RunOnLoop(func(vm *goja.Runtime) {
+		engine.UnbindRuntimeLoop(vm)
+	})
+	loop.Stop()
+	return result.configured, result.err
+}
+
+func resolveRuntimeDescriptor(bgCtx context.Context, ctx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate, state json.RawMessage, replayPlan *store.ReplayPlan) (json.RawMessage, string, error) {
+	normalizedState, err := normalizeRuntimeConfig(state)
+	if err != nil {
+		return nil, "", err
+	}
+	if delegate == nil {
+		if normalizedState != nil {
+			normalizedState = append(json.RawMessage(nil), normalizedState...)
+		}
+		return normalizedState, runtimeConfigHash(normalizedState), nil
+	}
+
+	hash := runtimeConfigHash(normalizedState)
+	for pass := 0; pass < maxRuntimeHashResolutionPasses; pass++ {
+		configuredState, err := previewConfiguredRuntimeState(bgCtx, engine.SessionRuntimeContext{
+			SessionID:   ctx.SessionID,
+			BranchID:    ctx.BranchID,
+			RuntimeHash: hash,
+		}, st, delegate, normalizedState, replayPlan)
+		if err != nil {
+			return nil, "", err
+		}
+		normalizedConfiguredState, err := normalizeRuntimeConfig(configuredState)
+		if err != nil {
+			return nil, "", err
+		}
+		nextHash := runtimeConfigHash(normalizedConfiguredState)
+		if nextHash == hash {
+			if normalizedConfiguredState != nil {
+				normalizedConfiguredState = append(json.RawMessage(nil), normalizedConfiguredState...)
+			}
+			return normalizedConfiguredState, nextHash, nil
+		}
+		hash = nextHash
+	}
+	return nil, "", fmt.Errorf("resolve runtime descriptor: runtime hash did not stabilize after %d passes", maxRuntimeHashResolutionPasses)
+}
+
 // newBranchRuntime allocates a fresh goja VM with no pre-loaded bindings,
 // starts an event loop for it, and applies the optional delegate before
 // returning. It returns the configured VM plus the serialised runtime
 // descriptor that should be persisted for future recreation.
 func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate, state json.RawMessage, replayPlan *store.ReplayPlan) (*branchRuntime, json.RawMessage, string, error) {
+	_, resolvedHash, err := resolveRuntimeDescriptor(bgCtx, ctx, st, delegate, state, replayPlan)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
 	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
 	loop.Start()
-	topLevelAwait := newTopLevelAwaitState()
 
 	type initResult struct {
 		runtime     *branchRuntime
@@ -643,45 +773,18 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 	}
 	initCh := make(chan initResult, 1)
 	loop.RunOnLoop(func(vm *goja.Runtime) {
-		engine.BindRuntimeLoop(vm, loop.RunOnLoop)
-		router := newHostFunctionRouter(vm, &hostRuntimeWiring{store: st, sessionID: ctx.SessionID, replayPlan: replayPlan})
-		vm.SetPromiseRejectionTracker(router.trackPromiseRejection)
-		if err := installReplayAwareGojaNondeterminism(vm, hostFuncBuilder{router: router}); err != nil {
-			initCh <- initResult{err: fmt.Errorf("install replay-aware goja nondeterminism: %w", err)}
+		bootstrap, err := bootstrapRuntimeVM(vm, loop, st, engine.SessionRuntimeContext{
+			SessionID:   ctx.SessionID,
+			BranchID:    ctx.BranchID,
+			RuntimeHash: resolvedHash,
+		}, replayPlan)
+		if err != nil {
+			initCh <- initResult{err: err}
 			return
 		}
-		if err := disableUnsupportedTimerGlobals(vm); err != nil {
-			initCh <- initResult{err: fmt.Errorf("disable timer globals: %w", err)}
-			return
-		}
-		rt := &branchRuntime{vm: vm, loop: loop, router: router, topLevelAwait: topLevelAwait, valueByIndex: make(map[int]goja.Value)}
-		if err := vm.Set("$last", goja.Undefined()); err != nil {
-			initCh <- initResult{err: fmt.Errorf("install $last: %w", err)}
-			return
-		}
-		if err := vm.Set("$val", func(call goja.FunctionCall) goja.Value {
-			if len(call.Arguments) == 0 {
-				panicJSError(vm, "TypeError", "$val(index): missing index")
-			}
-			index := int(call.Argument(0).ToInteger())
-			if index <= 0 {
-				panicJSError(vm, "RangeError", "$val(%d): index must be positive", index)
-			}
-			value, ok := rt.valueByIndex[index]
-			if !ok {
-				panicJSError(vm, "Error", "$val(%d): no such visible cell value on this branch", index)
-			}
-			return value
-		}); err != nil {
-			initCh <- initResult{err: fmt.Errorf("install $val: %w", err)}
-			return
-		}
-		if err := installConsoleAndInspect(vm, router); err != nil {
-			initCh <- initResult{err: fmt.Errorf("install console/inspect: %w", err)}
-			return
-		}
-		if err := topLevelAwait.install(vm); err != nil {
-			initCh <- initResult{err: fmt.Errorf("install top-level await hook: %w", err)}
+		rt := &branchRuntime{vm: vm, loop: loop, router: bootstrap.router, topLevelAwait: bootstrap.topLevelAwait, valueByIndex: make(map[int]goja.Value)}
+		if err := installRuntimeValueLookups(vm, rt.valueByIndex); err != nil {
+			initCh <- initResult{err: err}
 			return
 		}
 
@@ -692,7 +795,11 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 		}
 		configuredState := normalizedState
 		if delegate != nil {
-			configuredState, err = delegate.ConfigureRuntime(ctx, vm, hostFuncBuilder{router: router}, normalizedState)
+			configuredState, err = delegate.ConfigureRuntime(engine.SessionRuntimeContext{
+				SessionID:   ctx.SessionID,
+				BranchID:    ctx.BranchID,
+				RuntimeHash: resolvedHash,
+			}, vm, hostFuncBuilder{router: bootstrap.router}, normalizedState)
 			if err != nil {
 				initCh <- initResult{err: fmt.Errorf("configure runtime: %w", err)}
 				return
@@ -706,12 +813,17 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 		if normalizedConfiguredState != nil {
 			normalizedConfiguredState = append(json.RawMessage(nil), normalizedConfiguredState...)
 		}
+		actualHash := runtimeConfigHash(normalizedConfiguredState)
+		if actualHash != resolvedHash {
+			initCh <- initResult{err: fmt.Errorf("configure runtime: resolved runtime hash %q but delegate produced %q", resolvedHash, actualHash)}
+			return
+		}
 
 		_ = bgCtx
 		initCh <- initResult{
 			runtime:     rt,
 			configured:  normalizedConfiguredState,
-			runtimeHash: runtimeConfigHash(normalizedConfiguredState),
+			runtimeHash: actualHash,
 		}
 	})
 
@@ -854,15 +966,23 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 		})
 		panicJSError(vm, "Error", "%v", err)
 	}
-	live.acc.recordCompleted(effectID, result)
 	if err := r.store.AppendFact(context.Background(), model.EffectCompleted{
 		Session: r.sessionID,
 		Effect:  effectID,
 		Result:  result,
 		At:      time.Now().UTC(),
 	}); err != nil {
-		panicJSError(vm, "Error", "host function %q: journal EffectCompleted: %v", name, err)
+		msg := fmt.Sprintf("host function %q: journal EffectCompleted: %v", name, err)
+		live.acc.recordFailed(effectID, msg)
+		_ = r.store.AppendFact(context.Background(), model.EffectFailed{
+			Session:      r.sessionID,
+			Effect:       effectID,
+			ErrorMessage: msg,
+			At:           time.Now().UTC(),
+		})
+		panicJSError(vm, "Error", "%s", msg)
 	}
+	live.acc.recordCompleted(effectID, result)
 	return bridgeResultToValue(vm, result)
 }
 
@@ -993,13 +1113,24 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 				rejectJSError(vm, reject, "Error", "%v", invokeErr)
 				return
 			}
-			live.acc.recordCompleted(effectID, result)
-			_ = r.store.AppendFact(context.Background(), model.EffectCompleted{
+			if err := r.store.AppendFact(context.Background(), model.EffectCompleted{
 				Session: r.sessionID,
 				Effect:  effectID,
 				Result:  result,
 				At:      now,
-			})
+			}); err != nil {
+				msg := fmt.Sprintf("host function %q: journal EffectCompleted: %v", name, err)
+				live.acc.recordFailed(effectID, msg)
+				_ = r.store.AppendFact(context.Background(), model.EffectFailed{
+					Session:      r.sessionID,
+					Effect:       effectID,
+					ErrorMessage: msg,
+					At:           now,
+				})
+				rejectJSError(vm, reject, "Error", "%s", msg)
+				return
+			}
+			live.acc.recordCompleted(effectID, result)
 			_ = resolve(bridgeResultToValue(vm, result))
 		})
 	}(live.ctx)

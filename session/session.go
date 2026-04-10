@@ -43,9 +43,10 @@ func New() *Engine {
 	return &Engine{}
 }
 
-// StartSession creates a new session configured by cfg. It appends
-// SessionStarted and ManifestAttached facts to the store before returning,
-// so the session is durably recorded before the caller's first Submit.
+// StartSession creates a new session configured by cfg. It fully initialises
+// the runtime and persists the runtime descriptor before appending
+// SessionStarted/ManifestAttached/RuntimeAttached, so failed startup does not
+// leak a partially resumable session.
 //
 // On any store error the method returns the error immediately; no partial
 // state is visible to the caller.
@@ -56,18 +57,9 @@ func (e *Engine) StartSession(ctx context.Context, cfg model.SessionConfig, deps
 
 	mode := runtimeModeOrDefault(deps.RuntimeMode)
 
-	if err := deps.Store.AppendFact(ctx, model.SessionStarted{
-		Session:    sessionID,
-		RootBranch: rootBranchID,
-		At:         now,
-	}); err != nil {
-		return nil, fmt.Errorf("session: StartSession: append SessionStarted: %w", err)
-	}
-
 	rt, runtimeConfig, runtimeHash, err := newBranchRuntime(ctx, engine.SessionRuntimeContext{
-		SessionID:   sessionID,
-		BranchID:    rootBranchID,
-		RuntimeHash: runtimeConfigHash(deps.RuntimeConfig),
+		SessionID: sessionID,
+		BranchID:  rootBranchID,
 	}, deps.Store, deps.VMDelegate, deps.RuntimeConfig, nil)
 	if err != nil {
 		return nil, fmt.Errorf("session: StartSession: init runtime: %w", err)
@@ -75,6 +67,15 @@ func (e *Engine) StartSession(ctx context.Context, cfg model.SessionConfig, deps
 	if err := deps.Store.PutRuntimeConfig(ctx, runtimeHash, runtimeConfig); err != nil {
 		rt.close()
 		return nil, fmt.Errorf("session: StartSession: store runtime config: %w", err)
+	}
+
+	if err := deps.Store.AppendFact(ctx, model.SessionStarted{
+		Session:    sessionID,
+		RootBranch: rootBranchID,
+		At:         now,
+	}); err != nil {
+		rt.close()
+		return nil, fmt.Errorf("session: StartSession: append SessionStarted: %w", err)
 	}
 
 	if err := deps.Store.AppendFact(ctx, model.ManifestAttached{
