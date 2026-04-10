@@ -100,6 +100,15 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 			if err := cmdInspect(ctx, out, sess, model.ValueID(handle)); err != nil {
 				fmt.Fprintf(out, "inspect error: %v\n", err)
 			}
+		case strings.HasPrefix(line, ":logs "):
+			cell := strings.TrimSpace(strings.TrimPrefix(line, ":logs "))
+			if cell == "" {
+				fmt.Fprintln(out, "usage: :logs <cell-id>")
+				continue
+			}
+			if err := cmdLogs(ctx, out, sess, model.CellID(cell)); err != nil {
+				fmt.Fprintf(out, "logs error: %v\n", err)
+			}
 		case strings.HasPrefix(line, ":restore "):
 			cell := strings.TrimSpace(strings.TrimPrefix(line, ":restore "))
 			if cell == "" {
@@ -215,6 +224,7 @@ func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src stri
 	if err != nil {
 		return err
 	}
+	printLogLines(out, res.Log)
 	fmt.Fprintf(out, "ok cell=%s\n", res.Cell)
 	if res.CompletionValue == nil {
 		fmt.Fprintln(out, "completion: <nil>")
@@ -230,9 +240,12 @@ func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src stri
 }
 
 func printSubmitError(out io.Writer, err error) {
+	var submitErr *engine.SubmitFailure
+	if errors.As(err, &submitErr) {
+		printLogLines(out, submitErr.Log)
+	}
 	fmt.Fprintf(out, "submit error: %v\n", err)
 
-	var submitErr *engine.SubmitFailure
 	if !errors.As(err, &submitErr) {
 		return
 	}
@@ -292,6 +305,21 @@ func cmdInspect(ctx context.Context, out io.Writer, sess engine.Session, handle 
 	return nil
 }
 
+func cmdLogs(ctx context.Context, out io.Writer, sess engine.Session, cell model.CellID) error {
+	if _, err := uuid.Parse(string(cell)); err != nil {
+		return fmt.Errorf("invalid cell id %q: %w", cell, err)
+	}
+	logs, err := sess.Logs(ctx, cell)
+	if err != nil {
+		return err
+	}
+	printLogLines(out, logs)
+	if len(logs) == 0 {
+		fmt.Fprintln(out, "logs=<none>")
+	}
+	return nil
+}
+
 func cmdRestore(ctx context.Context, out io.Writer, sess engine.Session, cell model.CellID) error {
 	if _, err := uuid.Parse(string(cell)); err != nil {
 		return fmt.Errorf("invalid cell id %q: %w", cell, err)
@@ -340,9 +368,16 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  <js>                 submit one-line JS cell")
 	fmt.Fprintln(out, "  :submit              submit multi-line JS cell (end with .end)")
 	fmt.Fprintln(out, "  :inspect <value-id>  inspect completion handle")
+	fmt.Fprintln(out, "  :logs <cell-id>      replay one committed cell and print its console.log lines")
 	fmt.Fprintln(out, "  :restore <cell-id>   move active session to a committed cell")
 	fmt.Fprintln(out, "  :fork <cell-id>      fork a new branch from a committed cell")
 	fmt.Fprintln(out, "  :head                show note about head semantics")
 	fmt.Fprintln(out, "  :help                show this help")
 	fmt.Fprintln(out, "  :quit                exit")
+}
+
+func printLogLines(out io.Writer, logs []string) {
+	for i, line := range logs {
+		fmt.Fprintf(out, "log[%d]=%s\n", i, line)
+	}
 }

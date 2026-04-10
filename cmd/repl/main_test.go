@@ -170,6 +170,48 @@ func TestCmdInspect_PrintsSummaryAndFull(t *testing.T) {
 	}
 }
 
+func TestRun_PrintsConsoleLogOnSuccessAndFailure(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader("console.log(\"ok\", { a: 1 }); 1\nconsole.log(\"bad\", { a: 2 }); missingName\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if !strings.Contains(got, `log[0]="ok" {a: 1}`) {
+		t.Fatalf("success log missing from output:\n%s", got)
+	}
+	if !strings.Contains(got, `log[0]="bad" {a: 2}`) {
+		t.Fatalf("failure log missing from output:\n%s", got)
+	}
+}
+
+func TestCmdLogs_ReplaysCellLogs(t *testing.T) {
+	ctx := context.Background()
+	eng := session.New()
+	sess, err := eng.StartSession(ctx, model.SessionConfig{Manifest: defaultManifest()}, engine.SessionDeps{
+		Store: storemem.New(),
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `console.log("hello", { a: 1 }); 1`)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := cmdLogs(ctx, &out, sess, res.Cell); err != nil {
+		t.Fatalf("cmdLogs: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, `log[0]="hello" {a: 1}`) {
+		t.Fatalf(":logs output missing replayed log line:\n%s", got)
+	}
+}
+
 func extractSessionID(t *testing.T, output string) string {
 	t.Helper()
 	for _, line := range strings.Split(output, "\n") {

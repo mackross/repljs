@@ -8,6 +8,7 @@ import (
 	"fmt"
 	mrand "math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,7 @@ type effectAccumulator struct {
 	pendingAsync       int
 	asyncSettled       chan struct{}
 	unhandledRejection map[*goja.Promise]string
+	logs               []string
 }
 
 func cloneBytes(raw []byte) []byte {
@@ -201,6 +203,27 @@ func (a *effectAccumulator) drain() []engine.EffectSummary {
 	a.asyncSettled = nil
 	a.unhandledRejection = nil
 	return effects
+}
+
+func cloneStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	return append([]string(nil), in...)
+}
+
+func (a *effectAccumulator) recordLog(line string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.logs = append(a.logs, line)
+}
+
+func (a *effectAccumulator) drainLogs() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	logs := cloneStrings(a.logs)
+	a.logs = nil
+	return logs
 }
 
 type hostRuntimeWiring struct {
@@ -498,6 +521,33 @@ func disableUnsupportedTimerGlobals(vm *goja.Runtime) error {
 	return nil
 }
 
+func installConsoleAndInspect(vm *goja.Runtime, router *hostFunctionRouter) error {
+	if vm == nil {
+		return nil
+	}
+	console := vm.NewObject()
+	if err := console.Set("log", func(call goja.FunctionCall) goja.Value {
+		if router == nil {
+			return goja.Undefined()
+		}
+		return router.consoleLog(call)
+	}); err != nil {
+		return fmt.Errorf("set console.log: %w", err)
+	}
+	if err := vm.Set("console", console); err != nil {
+		return fmt.Errorf("set console: %w", err)
+	}
+	if err := vm.Set("inspect", func(call goja.FunctionCall) goja.Value {
+		if router == nil {
+			return vm.ToValue("")
+		}
+		return router.inspectSummary(call)
+	}); err != nil {
+		return fmt.Errorf("set inspect: %w", err)
+	}
+	return nil
+}
+
 func encodeBridgeLiteral(value any) ([]byte, error) {
 	return jswire.EncodeGoja(goja.New().ToValue(value))
 }
@@ -558,6 +608,14 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 		}
 		if err := disableUnsupportedTimerGlobals(vm); err != nil {
 			initCh <- initResult{err: fmt.Errorf("disable timer globals: %w", err)}
+			return
+		}
+		if err := vm.Set("_", goja.Undefined()); err != nil {
+			initCh <- initResult{err: fmt.Errorf("install _: %w", err)}
+			return
+		}
+		if err := installConsoleAndInspect(vm, router); err != nil {
+			initCh <- initResult{err: fmt.Errorf("install console/inspect: %w", err)}
 			return
 		}
 		if err := topLevelAwait.install(vm); err != nil {
@@ -759,6 +817,51 @@ func (r *hostFunctionRouter) trackPromiseRejection(p *goja.Promise, operation go
 	live.acc.recordPromiseRejection(p, operation)
 }
 
+func (r *hostFunctionRouter) consoleLog(call goja.FunctionCall) goja.Value {
+	if r == nil || r.vm == nil {
+		return goja.Undefined()
+	}
+	live, err := r.currentLiveState()
+	if err != nil || live == nil || live.acc == nil {
+		return goja.Undefined()
+	}
+	live.acc.recordLog(renderSummaryArgs(call.Arguments))
+	return goja.Undefined()
+}
+
+func (r *hostFunctionRouter) inspectSummary(call goja.FunctionCall) goja.Value {
+	if r == nil || r.vm == nil {
+		return nil
+	}
+	return r.vm.ToValue(renderSummaryArgs(call.Arguments))
+}
+
+func renderSummaryArgs(args []goja.Value) string {
+	if len(args) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, renderSummaryValue(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func renderSummaryValue(v goja.Value) string {
+	if v == nil {
+		return "undefined"
+	}
+	raw, err := jswire.EncodeGoja(v)
+	if err != nil {
+		return v.String()
+	}
+	inspection, err := jswire.Describe(raw)
+	if err != nil || inspection.Summary == "" {
+		return v.String()
+	}
+	return inspection.Summary
+}
+
 func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
 	vm := r.vm
 	promise, resolve, reject := vm.NewPromise()
@@ -875,6 +978,13 @@ type evalResult struct {
 	// It is nil when the value cannot be bridge-encoded or when completionValue
 	// is nil.
 	structured []byte
+
+	// settledValue is the actual JS completion value and is used to rebuild
+	// REPL-managed bindings like `_`.
+	settledValue goja.Value
+
+	// hasSettledValue reports whether settledValue should be applied.
+	hasSettledValue bool
 }
 
 // run evaluates src in the VM using a short default timeout suitable for
@@ -934,6 +1044,21 @@ func (r *branchRuntime) runContext(ctx context.Context, src string) (evalResult,
 	}
 }
 
+func (r *branchRuntime) setLastResult(eval evalResult) error {
+	if r == nil || r.loop == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	r.loop.RunOnLoop(func(vm *goja.Runtime) {
+		value := goja.Undefined()
+		if eval.hasSettledValue {
+			value = eval.settledValue
+		}
+		done <- vm.Set("_", value)
+	})
+	return <-done
+}
+
 func (r *branchRuntime) settleValueAsync(v goja.Value, deliver func(outcome)) {
 	if v == nil {
 		deliver(outcome{res: evalResult{}})
@@ -986,6 +1111,10 @@ func (r *branchRuntime) settleValueAsync(v goja.Value, deliver func(outcome)) {
 }
 
 func valueToEvalResult(val goja.Value) (evalResult, error) {
+	out := evalResult{
+		settledValue:    val,
+		hasSettledValue: true,
+	}
 	var ref *model.ValueRef
 	var structured []byte
 	if val != nil && !goja.IsUndefined(val) && !goja.IsNull(val) {
@@ -998,7 +1127,9 @@ func valueToEvalResult(val goja.Value) (evalResult, error) {
 			structured = b
 		}
 	}
-	return evalResult{completionValue: ref, structured: structured}, nil
+	out.completionValue = ref
+	out.structured = structured
+	return out, nil
 }
 
 // replayPlanIntoRuntime creates a fresh branchRuntime and replays every step in
@@ -1006,16 +1137,27 @@ func valueToEvalResult(val goja.Value) (evalResult, error) {
 // ensures a restored branch starts with exactly the bindings visible at the
 // restore target, and no bindings created after the fork point.
 func replayPlanIntoRuntime(ctx context.Context, plan store.ReplayPlan, rtCtx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate) (*branchRuntime, json.RawMessage, string, error) {
+	return replayPlanPrefixIntoRuntime(ctx, plan, len(plan.Steps), rtCtx, st, delegate)
+}
+
+func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, stepCount int, rtCtx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate) (*branchRuntime, json.RawMessage, string, error) {
 	rt, configuredState, runtimeHash, err := newBranchRuntime(ctx, rtCtx, st, delegate, plan.RuntimeConfig, &plan)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	for _, step := range plan.Steps {
+	if stepCount < 0 {
+		stepCount = 0
+	}
+	if stepCount > len(plan.Steps) {
+		stepCount = len(plan.Steps)
+	}
+	for _, step := range plan.Steps[:stepCount] {
 		if err := rt.beginReplayStep(step.Effects, plan.Decisions); err != nil {
 			rt.close()
 			return nil, nil, "", fmt.Errorf("prepare replay step %q: %w", step.Cell, err)
 		}
-		if _, err := rt.runContext(ctx, step.Source); err != nil {
+		eval, err := rt.runContext(ctx, step.Source)
+		if err != nil {
 			_ = rt.finishReplayStep()
 			rt.close()
 			return nil, nil, "", fmt.Errorf("replay cell %q: %w", step.Cell, err)
@@ -1024,8 +1166,14 @@ func replayPlanIntoRuntime(ctx context.Context, plan store.ReplayPlan, rtCtx eng
 			rt.close()
 			return nil, nil, "", fmt.Errorf("replay cell %q effects: %w", step.Cell, err)
 		}
+		if err := rt.setLastResult(eval); err != nil {
+			rt.close()
+			return nil, nil, "", fmt.Errorf("replay cell %q set _: %w", step.Cell, err)
+		}
 	}
-	rt.activateLiveBindings()
+	if stepCount == len(plan.Steps) {
+		rt.activateLiveBindings()
+	}
 	return rt, configuredState, runtimeHash, nil
 }
 

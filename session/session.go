@@ -267,7 +267,7 @@ func cloneEffectSummaries(in []engine.EffectSummary) []engine.EffectSummary {
 	return out
 }
 
-func newSubmitFailure(failureID model.FailureID, parent model.CellID, phase string, cause error, linkedEffects []engine.EffectSummary) *engine.SubmitFailure {
+func newSubmitFailure(failureID model.FailureID, parent model.CellID, phase string, cause error, linkedEffects []engine.EffectSummary, logs []string) *engine.SubmitFailure {
 	if cause == nil {
 		return nil
 	}
@@ -277,6 +277,7 @@ func newSubmitFailure(failureID model.FailureID, parent model.CellID, phase stri
 		Phase:         phase,
 		ErrorMessage:  cause.Error(),
 		LinkedEffects: cloneEffectSummaries(linkedEffects),
+		Log:           cloneStrings(logs),
 		Cause:         cause,
 	}
 }
@@ -437,6 +438,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	terminalErr := combineSubmitErrors(err, settleErr)
 	if terminalErr != nil {
 		effects := acc.drain()
+		logs := acc.drainLogs()
 		effectIDs := effectIDsFromSummaries(effects)
 		if freshRuntime {
 			evalRuntime.close()
@@ -452,10 +454,11 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, phase, effectIDs, terminalErr); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: %s: %w; record failure: %v", phase, terminalErr, recordErr)
 		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, phase, terminalErr, effects)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, phase, terminalErr, effects, logs)
 	}
 
 	effects := acc.drain()
+	logs := acc.drainLogs()
 	effectIDs := effectIDsFromSummaries(effects)
 	now := time.Now().UTC()
 
@@ -477,7 +480,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_checked", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellChecked: %w; record failure: %v", err, recordErr)
 		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_checked", err, effects)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_checked", err, effects, logs)
 	}
 
 	if err := s.store.AppendFact(ctx, model.CellEvaluated{
@@ -496,7 +499,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_evaluated", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellEvaluated: %w; record failure: %v", err, recordErr)
 		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_evaluated", err, effects)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_evaluated", err, effects, logs)
 	}
 
 	if err := s.store.AppendFact(ctx, model.CellCommitted{
@@ -513,7 +516,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_committed", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellCommitted: %w; record failure: %v", err, recordErr)
 		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_committed", err, effects)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_committed", err, effects, logs)
 	}
 
 	if err := s.store.AppendFact(ctx, model.HeadMoved{
@@ -531,7 +534,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_head_moved", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append HeadMoved: %w; record failure: %v", err, recordErr)
 		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_head_moved", err, effects)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_head_moved", err, effects, logs)
 	}
 
 	// Only advance in-memory head after all durable facts succeed.
@@ -545,6 +548,10 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		if oldRuntime != nil {
 			oldRuntime.close()
 		}
+	}
+	if err := s.runtime.setLastResult(eval); err != nil {
+		s.runtimeDirty = true
+		return engine.SubmitResult{}, fmt.Errorf("session: Submit: set _: %w", err)
 	}
 
 	// Register an inspectable value handle when the eval produced a completion value.
@@ -565,6 +572,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	return engine.SubmitResult{
 		Cell:            cellID,
 		CompletionValue: eval.completionValue,
+		Log:             cloneStrings(logs),
 	}, nil
 }
 
@@ -591,6 +599,47 @@ func (s *session) Inspect(_ context.Context, handle model.ValueID) (engine.Value
 		return engine.ValueView{}, fmt.Errorf("session: Inspect: unknown handle %q", handle)
 	}
 	return view, nil
+}
+
+func (s *session) Logs(ctx context.Context, targetCell model.CellID) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	plan, err := s.store.LoadReplayPlan(ctx, s.id, targetCell)
+	if err != nil {
+		return nil, fmt.Errorf("session: Logs: load replay plan: %w", err)
+	}
+	if len(plan.Steps) == 0 {
+		return nil, nil
+	}
+	target := plan.Steps[len(plan.Steps)-1]
+	rt, _, _, err := replayPlanPrefixIntoRuntime(ctx, plan, len(plan.Steps)-1, engine.SessionRuntimeContext{
+		SessionID:   s.id,
+		BranchID:    plan.Branch,
+		RuntimeHash: plan.RuntimeHash,
+	}, s.store, s.delegate)
+	if err != nil {
+		return nil, fmt.Errorf("session: Logs: replay prefix: %w", err)
+	}
+	defer rt.close()
+
+	acc := &effectAccumulator{}
+	rt.beginCell(ctx, target.Cell, acc)
+	defer rt.endCell()
+	if err := rt.beginReplayStep(target.Effects, plan.Decisions); err != nil {
+		return nil, fmt.Errorf("session: Logs: begin replay step: %w", err)
+	}
+	_, runErr := rt.runContext(ctx, target.Source)
+	settleErr := rt.awaitCellSettled(ctx, acc)
+	finishErr := rt.finishReplayStep()
+	logs := acc.drainLogs()
+	if terminalErr := combineSubmitErrors(runErr, settleErr); terminalErr != nil {
+		return logs, fmt.Errorf("session: Logs: replay target cell: %w", terminalErr)
+	}
+	if finishErr != nil {
+		return logs, fmt.Errorf("session: Logs: finish replay step: %w", finishErr)
+	}
+	return logs, nil
 }
 
 func describeValue(preview string, structured []byte) (summary, full string) {

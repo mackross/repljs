@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1441,6 +1442,88 @@ func TestSessionEngine_OpenSession_PreservesMathRandomAcrossReplay(t *testing.T)
 	}
 }
 
+func TestSession_Submit_UnderscoreTracksLastCompletion(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, "21"); err != nil {
+		t.Fatalf("Submit 21: %v", err)
+	}
+	res, err := sess.Submit(ctx, "_ * 2")
+	if err != nil {
+		t.Fatalf("Submit _*2: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "42" {
+		t.Fatalf("underscore result = %+v, want preview 42", res.CompletionValue)
+	}
+}
+
+func TestSession_Submit_FailedCellDoesNotUpdateUnderscore(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, "5"); err != nil {
+		t.Fatalf("Submit 5: %v", err)
+	}
+	if _, err := sess.Submit(ctx, "missingName"); err == nil {
+		t.Fatal("expected failed submit")
+	}
+	res, err := sess.Submit(ctx, "_")
+	if err != nil {
+		t.Fatalf("Submit _: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "5" {
+		t.Fatalf("underscore after failure = %+v, want preview 5", res.CompletionValue)
+	}
+}
+
+func TestSessionEngine_OpenSession_PreservesUnderscoreAcrossReplay(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	sessID := sess.ID()
+
+	if _, err := sess.Submit(ctx, "7"); err != nil {
+		t.Fatalf("Submit 7: %v", err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close seed session: %v", err)
+	}
+
+	reopened, err := e.OpenSession(ctx, sessID, fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := reopened.Submit(ctx, "_ + 1")
+	if err != nil {
+		t.Fatalf("Submit _ + 1 after reopen: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "8" {
+		t.Fatalf("underscore after reopen = %+v, want preview 8", res.CompletionValue)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TestSessionEngine_StartSessionAndRestoreSession
 // ---------------------------------------------------------------------------
@@ -1999,6 +2082,122 @@ func TestSession_Inspect_LargeCyclicObject_PreviewAndFull(t *testing.T) {
 	}
 	if !strings.Contains(view.Full, `self: *`) && !strings.Contains(view.Full, `self => *`) {
 		t.Fatalf("full should preserve cycle markers, got %q", view.Full)
+	}
+}
+
+func TestSession_Submit_ConsoleLogReturnedOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `console.log("start", { ok: true }); 42`)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if got, want := res.Log, []string{`"start" {ok: true}`}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("res.Log = %#v, want %#v", got, want)
+	}
+}
+
+func TestSession_Submit_ConsoleLogReturnedOnFailure(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	_, err = sess.Submit(ctx, `console.log("before", { ok: true }); missingName`)
+	if err == nil {
+		t.Fatal("expected submit to fail")
+	}
+
+	var submitErr *engine.SubmitFailure
+	if !errors.As(err, &submitErr) {
+		t.Fatalf("expected SubmitFailure, got %T", err)
+	}
+	if got, want := submitErr.Log, []string{`"before" {ok: true}`}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("submitErr.Log = %#v, want %#v", got, want)
+	}
+}
+
+func TestSession_Submit_InspectReturnsSummaryString(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `inspect({ name: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }, [1, 2, 3, 4, 5])`)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value")
+	}
+
+	view, err := sess.Inspect(ctx, res.CompletionValue.ID)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if view.TypeHint != "string" {
+		t.Fatalf("view.TypeHint = %q, want string", view.TypeHint)
+	}
+	if got := decodeBridgeStructured(t, view.Structured); got != `{name: string(45) "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"} Array(5)[1, 2, 3, 4, …+1]` {
+		t.Fatalf("inspect result = %#v", got)
+	}
+}
+
+func TestSession_Logs_ReplaysCommittedCell(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	first, err := sess.Submit(ctx, `const x = 1; console.log("first", { x }); x`)
+	if err != nil {
+		t.Fatalf("first Submit: %v", err)
+	}
+	second, err := sess.Submit(ctx, `const y = 2; console.log("second", { y }); y`)
+	if err != nil {
+		t.Fatalf("second Submit: %v", err)
+	}
+
+	got, err := sess.Logs(ctx, first.Cell)
+	if err != nil {
+		t.Fatalf("Logs(first.Cell): %v", err)
+	}
+	if want := []string{`"first" {x: 1}`}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Logs(first.Cell) = %#v, want %#v", got, want)
+	}
+
+	current, err := sess.Submit(ctx, `x + y`)
+	if err != nil {
+		t.Fatalf("Submit after Logs replay: %v", err)
+	}
+	if current.CompletionValue == nil || current.CompletionValue.Preview != "3" {
+		t.Fatalf("current completion = %#v, want preview 3", current.CompletionValue)
+	}
+	if second.CompletionValue == nil || second.CompletionValue.Preview != "2" {
+		t.Fatalf("second completion = %#v, want preview 2", second.CompletionValue)
 	}
 }
 

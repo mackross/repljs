@@ -65,6 +65,9 @@ type SubmitResult struct {
 
 	// CompletionValue is the runtime completion value, if any.
 	CompletionValue *model.ValueRef
+
+	// Log captures console.log lines produced during this submit.
+	Log []string
 }
 
 // ValueView is the result of inspecting a runtime value.
@@ -135,6 +138,7 @@ type SubmitFailure struct {
 	Phase         string
 	ErrorMessage  string
 	LinkedEffects []EffectSummary
+	Log           []string
 	Cause         error
 }
 
@@ -264,6 +268,10 @@ type Session interface {
 	// The handle must have been obtained from a prior SubmitResult or
 	// async settlement.
 	Inspect(ctx context.Context, handle model.ValueID) (ValueView, error)
+
+	// Logs replays targetCell in a scratch runtime and returns the console.log
+	// lines it produces. Logs are not stored durably.
+	Logs(ctx context.Context, targetCell model.CellID) ([]string, error)
 
 	// Failures returns the durable failed submit attempts for this session in
 	// append order. The last element is therefore the most recent failure.
