@@ -1801,6 +1801,12 @@ func TestSession_Inspect_AfterSubmit(t *testing.T) {
 	if view.Preview != "42" {
 		t.Errorf("view.Preview: want %q, got %q", "42", view.Preview)
 	}
+	if view.Summary != "42" {
+		t.Errorf("view.Summary: want %q, got %q", "42", view.Summary)
+	}
+	if view.Full != "42" {
+		t.Errorf("view.Full: want %q, got %q", "42", view.Full)
+	}
 }
 
 // TestSession_Inspect_NumericPrimitive verifies that a numeric primitive submit
@@ -1862,8 +1868,138 @@ func TestSession_Inspect_PreservesDateCompletionType(t *testing.T) {
 	if len(view.Structured) == 0 {
 		t.Fatal("expected structured bytes for Date completion")
 	}
+	if view.Summary != "Date(2021-02-03T04:05:06.789Z)" {
+		t.Fatalf("view.Summary = %q, want %q", view.Summary, "Date(2021-02-03T04:05:06.789Z)")
+	}
 	requireBridgeExprResult(t, view.Structured, `__value instanceof Date`, true)
 	requireBridgeExprResult(t, view.Structured, `__value.toISOString()`, "2021-02-03T04:05:06.789Z")
+}
+
+func TestSession_Inspect_StoresSummaryAndFullForStructuredValues(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `({
+		name: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+		items: [1, 2, 3, 4, 5, 6]
+	})`)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value")
+	}
+
+	view, err := sess.Inspect(ctx, res.CompletionValue.ID)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if !strings.Contains(view.Summary, `string(45) "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"`) {
+		t.Fatalf("summary should use bounded truncation, got %q", view.Summary)
+	}
+	if !strings.Contains(view.Full, `"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"`) {
+		t.Fatalf("full should retain the full string within bounds, got %q", view.Full)
+	}
+	if strings.Contains(view.Full, `…+`) {
+		t.Fatalf("full should include all array items, got %q", view.Full)
+	}
+}
+
+func TestSession_Inspect_LargeCyclicObject_PreviewAndFull(t *testing.T) {
+	const deepMixedCycleExpr = `(() => {
+		const root = {
+			name: "root",
+			meta: {
+				createdAt: new Date("2021-02-03T04:05:06.789Z"),
+				pattern: /deep-cycle/giu,
+				big: 12345678901234567890123456789012345678901234567890n
+			},
+			levels: []
+		};
+
+		const bytes = new Uint8Array([10, 20, 30, 40, 50, 60, 70, 80]);
+		root.buffer = bytes.buffer;
+		root.midView = new Uint16Array(root.buffer, 2, 2);
+
+		let previous = root;
+		for (let i = 0; i < 7; i += 1) {
+			const node = {
+				index: i,
+				parent: previous,
+				arr: [root, previous, { marker: "m" + i }],
+				map: new Map(),
+				set: new Set()
+			};
+			node.map.set("self", node);
+			node.map.set("root", root);
+			node.map.set(previous, node.arr);
+			node.set.add(root);
+			node.set.add(previous);
+			node.set.add(node.map);
+			node.arr[2].owner = node;
+			previous.child = node;
+			root.levels.push(node);
+			previous = node;
+		}
+
+		previous.tail = root;
+		root.tailSet = new Set([previous, root.levels[1], root.levels[4]]);
+		root.index = new Map(root.levels.map(level => [level, { index: level.index, next: level.child || root }]));
+		root.self = root;
+		root.levels[2].cross = root.levels[5];
+		root.levels[5].cross = root.levels[2];
+		root.levels[3].arr.push(root.index);
+
+		return root;
+	})()`
+
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, deepMixedCycleExpr)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value")
+	}
+
+	view, err := sess.Inspect(ctx, res.CompletionValue.ID)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if got, want := view.Preview, "[object Object]"; got != want {
+		t.Fatalf("view.Preview = %q, want %q", got, want)
+	}
+	if !strings.Contains(view.Summary, `&`) || !strings.Contains(view.Summary, `Map(7){`) || !strings.Contains(view.Summary, `levels: Array(7)[`) {
+		t.Fatalf("summary should show a compact cyclic shape, got %q", view.Summary)
+	}
+	if !strings.Contains(view.Full, `12345678901234567890123456789012345678901234567890n`) {
+		t.Fatalf("full should retain the bigint payload, got %q", view.Full)
+	}
+	if !strings.Contains(view.Full, `Uint16Array(2)[10270, 15410]`) {
+		t.Fatalf("full should include typed-array sample data, got %q", view.Full)
+	}
+	if !strings.Contains(view.Full, `Map(7){`) {
+		t.Fatalf("full should include nested map structure, got %q", view.Full)
+	}
+	if !strings.Contains(view.Full, `self: *`) && !strings.Contains(view.Full, `self => *`) {
+		t.Fatalf("full should preserve cycle markers, got %q", view.Full)
+	}
 }
 
 func TestSession_Submit_HostEffectsRoundTripBridgeTypes(t *testing.T) {

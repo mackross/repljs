@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/solidarity-ai/repl/engine"
+	"github.com/solidarity-ai/repl/jswire"
 	"github.com/solidarity-ai/repl/model"
 	"github.com/solidarity-ai/repl/store"
 )
@@ -550,9 +551,12 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	// This must happen after all durable facts succeed so rejected/pending cells never
 	// get handles — the eval error above returns early before reaching this point.
 	if eval.completionValue != nil {
+		summary, full := describeValue(eval.completionValue.Preview, eval.structured)
 		s.values[eval.completionValue.ID] = engine.ValueView{
 			Handle:     eval.completionValue.ID,
 			Preview:    eval.completionValue.Preview,
+			Summary:    summary,
+			Full:       full,
 			TypeHint:   eval.completionValue.TypeHint,
 			Structured: eval.structured,
 		}
@@ -587,6 +591,25 @@ func (s *session) Inspect(_ context.Context, handle model.ValueID) (engine.Value
 		return engine.ValueView{}, fmt.Errorf("session: Inspect: unknown handle %q", handle)
 	}
 	return view, nil
+}
+
+func describeValue(preview string, structured []byte) (summary, full string) {
+	summary = preview
+	full = preview
+	if len(structured) == 0 {
+		return summary, full
+	}
+	description, err := jswire.Describe(structured)
+	if err != nil {
+		return summary, full
+	}
+	if description.Summary != "" {
+		summary = description.Summary
+	}
+	if description.Full != "" {
+		full = description.Full
+	}
+	return summary, full
 }
 
 // Failures returns durable failed submit attempts for this session in append

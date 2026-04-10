@@ -75,6 +75,14 @@ type ValueView struct {
 	// Preview is a short human-readable representation.
 	Preview string
 
+	// Summary is a compact shape-first rendering intended for low-token
+	// inspection by embedders and LLMs.
+	Summary string
+
+	// Full is a more complete rendering of the value with smarter truncation
+	// than Preview while still remaining bounded.
+	Full string
+
 	// TypeHint is an optional TypeScript type annotation.
 	TypeHint string
 

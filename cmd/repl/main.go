@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -193,7 +192,21 @@ func rewriteTopLevelAwait(src string) string {
 	if strings.HasPrefix(trimmed, "await ") || strings.HasPrefix(trimmed, "await(") {
 		return "(async () => { return " + trimmed + "; })()"
 	}
+	if rewritten, ok := rewriteTopLevelObjectLiteral(trimmed); ok {
+		return rewritten
+	}
 	return src
+}
+
+func rewriteTopLevelObjectLiteral(trimmed string) (string, bool) {
+	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+		return "", false
+	}
+	wrapped := "(" + trimmed + ")"
+	if _, err := goja.Parse("cell.js", wrapped); err != nil {
+		return "", false
+	}
+	return wrapped, true
 }
 
 func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src string) error {
@@ -210,6 +223,9 @@ func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src stri
 	fmt.Fprintf(out, "completion.id=%s\n", res.CompletionValue.ID)
 	fmt.Fprintf(out, "completion.preview=%q\n", res.CompletionValue.Preview)
 	fmt.Fprintf(out, "completion.type=%s\n", res.CompletionValue.TypeHint)
+	if view, err := sess.Inspect(ctx, res.CompletionValue.ID); err == nil {
+		fmt.Fprintf(out, "completion.summary=%q\n", view.Summary)
+	}
 	return nil
 }
 
@@ -253,16 +269,14 @@ func formatStructuredInline(raw []byte) string {
 	if len(raw) == 0 {
 		return "<nil>"
 	}
-	vm := goja.New()
-	decoded, err := jswire.DecodeGoja(vm, raw)
+	inspection, err := jswire.Describe(raw)
 	if err != nil {
-		return fmt.Sprintf("<bridge-decode-error:%v>", err)
+		return fmt.Sprintf("<jswire-describe-error:%v>", err)
 	}
-	b, err := json.Marshal(decoded.Export())
-	if err != nil {
-		return decoded.String()
+	if inspection.Summary == "" {
+		return "<nil>"
 	}
-	return string(b)
+	return inspection.Summary
 }
 
 func cmdInspect(ctx context.Context, out io.Writer, sess engine.Session, handle model.ValueID) error {
@@ -273,11 +287,8 @@ func cmdInspect(ctx context.Context, out io.Writer, sess engine.Session, handle 
 	fmt.Fprintf(out, "handle=%s\n", view.Handle)
 	fmt.Fprintf(out, "preview=%q\n", view.Preview)
 	fmt.Fprintf(out, "type=%s\n", view.TypeHint)
-	if len(view.Structured) == 0 {
-		fmt.Fprintln(out, "structured=<nil>")
-		return nil
-	}
-	fmt.Fprintf(out, "structured=%s\n", formatStructuredInline(view.Structured))
+	fmt.Fprintf(out, "summary=%q\n", view.Summary)
+	fmt.Fprintf(out, "full=%q\n", view.Full)
 	return nil
 }
 

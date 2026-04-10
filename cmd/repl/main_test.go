@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,8 @@ import (
 	"github.com/solidarity-ai/repl/engine"
 	"github.com/solidarity-ai/repl/jswire"
 	"github.com/solidarity-ai/repl/model"
+	"github.com/solidarity-ai/repl/session"
+	storemem "github.com/solidarity-ai/repl/store/mem"
 )
 
 func TestPrintSubmitError_IncludesLinkedEffects(t *testing.T) {
@@ -48,7 +51,7 @@ func TestPrintSubmitError_IncludesLinkedEffects(t *testing.T) {
 		"effect[0].id=effect-1",
 		"effect[0].function=tools.fetch",
 		"effect[0].status=failed",
-		`effect[0].params={"url":"https://example.com"}`,
+		`effect[0].params={url: "https://example.com"}`,
 		`effect[0].error="network down"`,
 	}
 	for _, want := range wantContains {
@@ -91,6 +94,79 @@ func TestRun_SQLiteResumesLatestSession(t *testing.T) {
 	}
 	if !strings.Contains(secondOutput, `completion.preview="1"`) {
 		t.Fatalf("second run should read persisted binding, output:\n%s", secondOutput)
+	}
+}
+
+func TestRun_PrintsCompletionSummary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(`({name: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", items: [1, 2, 3, 4, 5, 6]})
+:quit
+`)
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if !strings.Contains(got, `completion.summary=`) ||
+		!strings.Contains(got, `string(45) \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…\"`) ||
+		!strings.Contains(got, `Array(6)[1, 2, 3, 4, …+2]`) {
+		t.Fatalf("run output missing bounded completion summary:\n%s", got)
+	}
+}
+
+func TestRun_TopLevelObjectLiteralIsTreatedAsExpression(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader("{ a: \"hello\" }\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if !strings.Contains(got, `completion.preview="[object Object]"`) {
+		t.Fatalf("run output should preserve object completion preview:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.summary="{a: \"hello\"}"`) {
+		t.Fatalf("run output should summarize object literal, got:\n%s", got)
+	}
+}
+
+func TestCmdInspect_PrintsSummaryAndFull(t *testing.T) {
+	ctx := context.Background()
+	eng := session.New()
+	sess, err := eng.StartSession(ctx, model.SessionConfig{Manifest: defaultManifest()}, engine.SessionDeps{
+		Store: storemem.New(),
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `({
+		name: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+		items: [1, 2, 3, 4, 5, 6]
+	})`)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value")
+	}
+
+	var out bytes.Buffer
+	if err := cmdInspect(ctx, &out, sess, res.CompletionValue.ID); err != nil {
+		t.Fatalf("cmdInspect: %v", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, `summary=`) ||
+		!strings.Contains(got, `string(45) \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…\"`) ||
+		!strings.Contains(got, `Array(6)[1, 2, 3, 4, …+2]`) {
+		t.Fatalf("inspect output missing summary:\n%s", got)
+	}
+	if !strings.Contains(got, `full=`) ||
+		!strings.Contains(got, `\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"`) ||
+		!strings.Contains(got, `Array(6)[1, 2, 3, 4, 5, 6]`) {
+		t.Fatalf("inspect output missing full rendering:\n%s", got)
 	}
 }
 
