@@ -1442,7 +1442,7 @@ func TestSessionEngine_OpenSession_PreservesMathRandomAcrossReplay(t *testing.T)
 	}
 }
 
-func TestSession_Submit_UnderscoreTracksLastCompletion(t *testing.T) {
+func TestSession_Submit_DollarLastTracksLastCompletion(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
 	fix := newFixture(t)
@@ -1456,16 +1456,19 @@ func TestSession_Submit_UnderscoreTracksLastCompletion(t *testing.T) {
 	if _, err := sess.Submit(ctx, "21"); err != nil {
 		t.Fatalf("Submit 21: %v", err)
 	}
-	res, err := sess.Submit(ctx, "_ * 2")
+	res, err := sess.Submit(ctx, "$last * 2")
 	if err != nil {
-		t.Fatalf("Submit _*2: %v", err)
+		t.Fatalf("Submit $last*2: %v", err)
+	}
+	if res.Index != 2 {
+		t.Fatalf("res.Index = %d, want 2", res.Index)
 	}
 	if res.CompletionValue == nil || res.CompletionValue.Preview != "42" {
-		t.Fatalf("underscore result = %+v, want preview 42", res.CompletionValue)
+		t.Fatalf("$last result = %+v, want preview 42", res.CompletionValue)
 	}
 }
 
-func TestSession_Submit_FailedCellDoesNotUpdateUnderscore(t *testing.T) {
+func TestSession_Submit_FailedCellDoesNotUpdateDollarLast(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
 	fix := newFixture(t)
@@ -1482,16 +1485,16 @@ func TestSession_Submit_FailedCellDoesNotUpdateUnderscore(t *testing.T) {
 	if _, err := sess.Submit(ctx, "missingName"); err == nil {
 		t.Fatal("expected failed submit")
 	}
-	res, err := sess.Submit(ctx, "_")
+	res, err := sess.Submit(ctx, "$last")
 	if err != nil {
-		t.Fatalf("Submit _: %v", err)
+		t.Fatalf("Submit $last: %v", err)
 	}
 	if res.CompletionValue == nil || res.CompletionValue.Preview != "5" {
-		t.Fatalf("underscore after failure = %+v, want preview 5", res.CompletionValue)
+		t.Fatalf("$last after failure = %+v, want preview 5", res.CompletionValue)
 	}
 }
 
-func TestSessionEngine_OpenSession_PreservesUnderscoreAcrossReplay(t *testing.T) {
+func TestSessionEngine_OpenSession_PreservesDollarLastAcrossReplay(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
 	fix := newFixture(t)
@@ -1515,12 +1518,116 @@ func TestSessionEngine_OpenSession_PreservesUnderscoreAcrossReplay(t *testing.T)
 	}
 	defer reopened.Close()
 
-	res, err := reopened.Submit(ctx, "_ + 1")
+	res, err := reopened.Submit(ctx, "$last + 1")
 	if err != nil {
-		t.Fatalf("Submit _ + 1 after reopen: %v", err)
+		t.Fatalf("Submit $last + 1 after reopen: %v", err)
 	}
 	if res.CompletionValue == nil || res.CompletionValue.Preview != "8" {
-		t.Fatalf("underscore after reopen = %+v, want preview 8", res.CompletionValue)
+		t.Fatalf("$last after reopen = %+v, want preview 8", res.CompletionValue)
+	}
+}
+
+func TestSession_Submit_DollarValReferencesVisibleCells(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	first, err := sess.Submit(ctx, "10")
+	if err != nil {
+		t.Fatalf("Submit first: %v", err)
+	}
+	second, err := sess.Submit(ctx, "$val(1) + 5")
+	if err != nil {
+		t.Fatalf("Submit second: %v", err)
+	}
+	if first.Index != 1 || second.Index != 2 {
+		t.Fatalf("indices = (%d,%d), want (1,2)", first.Index, second.Index)
+	}
+	if second.CompletionValue == nil || second.CompletionValue.Preview != "15" {
+		t.Fatalf("$val(1) result = %+v, want preview 15", second.CompletionValue)
+	}
+}
+
+func TestSession_Fork_DollarValUsesVisibleBranchLineage(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	r1, err := sess.Submit(ctx, "10")
+	if err != nil {
+		t.Fatalf("Submit r1: %v", err)
+	}
+	if _, err := sess.Submit(ctx, "20"); err != nil {
+		t.Fatalf("Submit root third-visible cell seed: %v", err)
+	}
+	if _, err := sess.Submit(ctx, "30"); err != nil {
+		t.Fatalf("Submit root later cell: %v", err)
+	}
+	if err := sess.Fork(ctx, r1.Cell); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+
+	forked, err := sess.Submit(ctx, "$val(1) + 1")
+	if err != nil {
+		t.Fatalf("Submit on fork: %v", err)
+	}
+	if forked.Index != 2 {
+		t.Fatalf("forked.Index = %d, want 2", forked.Index)
+	}
+	readBack, err := sess.Submit(ctx, "$val(2)")
+	if err != nil {
+		t.Fatalf("Submit $val(2) on fork: %v", err)
+	}
+	if readBack.CompletionValue == nil || readBack.CompletionValue.Preview != "11" {
+		t.Fatalf("$val(2) on fork = %+v, want preview 11", readBack.CompletionValue)
+	}
+}
+
+func TestSessionEngine_OpenSession_PreservesDollarValAcrossReplay(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	sessID := sess.ID()
+
+	if _, err := sess.Submit(ctx, "10"); err != nil {
+		t.Fatalf("Submit 10: %v", err)
+	}
+	if _, err := sess.Submit(ctx, "20"); err != nil {
+		t.Fatalf("Submit 20: %v", err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close seed session: %v", err)
+	}
+
+	reopened, err := e.OpenSession(ctx, sessID, fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := reopened.Submit(ctx, "$val(1) + $val(2)")
+	if err != nil {
+		t.Fatalf("Submit $val replay read: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "30" {
+		t.Fatalf("$val replay read = %+v, want preview 30", res.CompletionValue)
 	}
 }
 
@@ -2820,8 +2927,8 @@ func TestSession_Submit_ReturnsSubmitFailureWithLinkedEffectSummaries(t *testing
 	if submitErr.Phase != "eval" {
 		t.Fatalf("expected phase eval, got %q", submitErr.Phase)
 	}
-	if submitErr.ErrorMessage != "promise rejected: boom" {
-		t.Fatalf("expected submit error message %q, got %q", "promise rejected: boom", submitErr.ErrorMessage)
+	if submitErr.ErrorMessage != "promise rejected: Error: boom" {
+		t.Fatalf("expected submit error message %q, got %q", "promise rejected: Error: boom", submitErr.ErrorMessage)
 	}
 	if len(submitErr.LinkedEffects) != 1 {
 		t.Fatalf("expected one linked effect summary, got %v", submitErr.LinkedEffects)

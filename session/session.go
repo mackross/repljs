@@ -106,6 +106,7 @@ func (e *Engine) StartSession(ctx context.Context, cfg model.SessionConfig, deps
 		delegate:      deps.VMDelegate,
 		runtimeMode:   mode,
 		runtime:       rt,
+		currentIndex:  0,
 		values:        make(map[model.ValueID]engine.ValueView),
 	}, nil
 }
@@ -160,6 +161,7 @@ func (e *Engine) bootstrapExistingSession(ctx context.Context, sessionID model.S
 		runtimeConfig: cloneRawMessage(state.RuntimeConfig),
 		delegate:      deps.VMDelegate,
 		runtimeMode:   runtimeModeOrDefault(deps.RuntimeMode),
+		currentIndex:  0,
 		values:        make(map[model.ValueID]engine.ValueView),
 	}, nil
 }
@@ -174,6 +176,7 @@ func (e *Engine) openSessionState(ctx context.Context, state store.SessionState,
 		runtimeConfig: cloneRawMessage(state.RuntimeConfig),
 		delegate:      deps.VMDelegate,
 		runtimeMode:   runtimeModeOrDefault(deps.RuntimeMode),
+		currentIndex:  0,
 		values:        make(map[model.ValueID]engine.ValueView),
 	}
 
@@ -205,6 +208,7 @@ func (e *Engine) openSessionState(ctx context.Context, state store.SessionState,
 		if err != nil {
 			return nil, fmt.Errorf("session: OpenSession: replay history: %w", err)
 		}
+		s.currentIndex = len(plan.Steps)
 	}
 
 	s.runtime = rt
@@ -235,6 +239,7 @@ type session struct {
 	runtimeMode   engine.RuntimeMode                 // persistent vs replay-per-submit
 	runtime       *branchRuntime                     // branch-local goja VM; replaced on each Restore
 	runtimeDirty  bool                               // live runtime diverged from durable head after a failed submit; rebuild before reuse
+	currentIndex  int                                // branch-local monotonic index of the current committed head
 	values        map[model.ValueID]engine.ValueView // inspectable value handles for the current branch
 }
 
@@ -426,6 +431,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	freshRuntime := evalRuntime != s.runtime
 	failureID := model.FailureID(uuid.NewString())
 	previousHead := s.head
+	nextIndex := s.currentIndex + 1
 	cellID := model.CellID(uuid.NewString())
 	evalCtx, cancel := withCellSettleTimeout(ctx)
 	defer cancel()
@@ -549,10 +555,11 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 			oldRuntime.close()
 		}
 	}
-	if err := s.runtime.setLastResult(eval); err != nil {
+	if err := s.runtime.setIndexedResult(nextIndex, eval); err != nil {
 		s.runtimeDirty = true
-		return engine.SubmitResult{}, fmt.Errorf("session: Submit: set _: %w", err)
+		return engine.SubmitResult{}, fmt.Errorf("session: Submit: set $last/$val(%d): %w", nextIndex, err)
 	}
+	s.currentIndex = nextIndex
 
 	// Register an inspectable value handle when the eval produced a completion value.
 	// This must happen after all durable facts succeed so rejected/pending cells never
@@ -571,6 +578,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 
 	return engine.SubmitResult{
 		Cell:            cellID,
+		Index:           nextIndex,
 		CompletionValue: eval.completionValue,
 		Log:             cloneStrings(logs),
 	}, nil
@@ -747,6 +755,7 @@ func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) er
 	oldRuntime := s.runtime
 	s.branch = plan.Branch
 	s.head = targetCell
+	s.currentIndex = len(plan.Steps)
 	s.runtimeHash = runtimeHash
 	s.runtimeConfig = cloneRawMessage(runtimeConfig)
 	s.runtime = rt
@@ -800,6 +809,7 @@ func (s *session) forkLocked(ctx context.Context, targetCell model.CellID) error
 	oldRuntime := s.runtime
 	s.branch = newBranchID
 	s.head = targetCell
+	s.currentIndex = len(plan.Steps)
 	s.runtimeHash = runtimeHash
 	s.runtimeConfig = cloneRawMessage(runtimeConfig)
 	s.runtime = rt

@@ -170,11 +170,11 @@ func (s *topLevelAwaitState) pendingCommit() *topLevelAwaitCommitState {
 func (s *topLevelAwaitState) commit(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 	pending := s.pendingCommit()
 	if pending == nil {
-		panic(rt.ToValue("internal commit hook called without pending top-level await state"))
+		panicJSError(rt, "Error", "internal commit hook called without pending top-level await state")
 	}
 	if len(pending.allowed) > 0 {
 		if err := promoteCurrentWrapperStash(rt, pending.allowed, pending.varLike); err != nil {
-			panic(rt.ToValue(err.Error()))
+			panicJSError(rt, "Error", "%v", err)
 		}
 	}
 	if len(call.Arguments) == 0 {
@@ -1377,10 +1377,10 @@ func expressionContainsEvalAnywhere(expr jsast.Expression) bool {
 }
 
 const (
-	stashMaskConst = uint32(1) << 31
-	stashMaskVar   = uint32(1) << 30
+	stashMaskConst  = uint32(1) << 31
+	stashMaskVar    = uint32(1) << 30
 	stashMaskStrict = uint32(1) << 29
-	stashMaskType  = stashMaskConst | stashMaskVar | stashMaskStrict
+	stashMaskType   = stashMaskConst | stashMaskVar | stashMaskStrict
 )
 
 func exposeReflectValue(v reflect.Value) reflect.Value {

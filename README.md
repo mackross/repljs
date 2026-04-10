@@ -25,6 +25,16 @@ project.
 - `Submit(...)` blocks until the cell result and tracked async work created by that cell have settled.
 - Failed submit returns a typed `*engine.SubmitFailure` with linked effect summaries for the effects started by that cell.
 - Successful submit returns a `CompletionValue` handle, and callers can use `Inspect(...)` to obtain richer renderings.
+- Each committed cell also has a branch-local monotonic index in addition to its durable UUID.
+  - UUID remains the durable identity.
+  - The index is the low-token, branch-visible position used for REPL conveniences.
+
+### REPL convenience bindings
+
+- `$last` is the previous successful cell's completion value on the current branch/runtime position.
+- `$val(N)` returns the completion value for visible committed cell index `N` on the current branch lineage.
+- Failed cells do not update `$last`.
+- These bindings are rebuilt during replay/open/restore; they are runtime conveniences, not synthetic user source.
 
 ### Non-determinism
 
@@ -81,6 +91,8 @@ This is project-specific notation inspired by YAML/Lisp-style shared-structure m
 - Host calls cross the effect layer and are journaled durably.
 - Failed submit exposes linked effects directly on the returned error so embedders can decide what to show the LLM.
 - Effect params/results are also encoded through `jswire`, so built-in JS types can survive host crossings better than plain JSON.
+- `console.log(...args)` is not stored durably, but the engine returns the rendered log lines on submit and can replay a committed cell later to re-derive them.
+- `inspect(...args)` is a pure helper that returns the bounded summary string; it is not stored.
 
 ### `jswire`
 

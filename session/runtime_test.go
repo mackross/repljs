@@ -2,9 +2,11 @@ package session
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/dop251/goja"
 	"github.com/solidarity-ai/repl/engine"
 	"github.com/solidarity-ai/repl/jswire"
 )
@@ -16,6 +18,30 @@ func mustNewBranchRuntime(t *testing.T) *branchRuntime {
 		t.Fatalf("newBranchRuntime: %v", err)
 	}
 	return rt
+}
+
+func requireGojaException(t *testing.T, vm *goja.Runtime, err error) *goja.Exception {
+	t.Helper()
+	var ex *goja.Exception
+	if !errors.As(err, &ex) {
+		t.Fatalf("expected goja exception, got %T: %v", err, err)
+	}
+	if ex.Value() == nil {
+		t.Fatal("expected goja exception value, got nil")
+	}
+	return ex
+}
+
+func requireErrorNameMessage(t *testing.T, vm *goja.Runtime, err error, wantName string, wantMessage string) {
+	t.Helper()
+	ex := requireGojaException(t, vm, err)
+	obj := ex.Value().ToObject(vm)
+	if got := obj.Get("name").String(); got != wantName {
+		t.Fatalf("error name = %q, want %q", got, wantName)
+	}
+	if got := obj.Get("message").String(); got != wantMessage {
+		t.Fatalf("error message = %q, want %q", got, wantMessage)
+	}
 }
 
 // TestBranchRuntime_FulfilledAsyncIIFE verifies that a simple async IIFE that
@@ -224,18 +250,57 @@ func TestBranchRuntime_AsyncReturnsObject(t *testing.T) {
 
 func TestBranchRuntime_TimerGlobalsAreUnavailable(t *testing.T) {
 	rt := mustNewBranchRuntime(t)
-	for _, expr := range []string{
-		`setTimeout(() => {}, 1)`,
-		`setInterval(() => {}, 1)`,
-		`clearTimeout(1)`,
-		`clearInterval(1)`,
+	for _, tc := range []struct {
+		expr string
+		msg  string
+	}{
+		{expr: `setTimeout(() => {}, 1)`, msg: "setTimeout is not available in this environment"},
+		{expr: `setInterval(() => {}, 1)`, msg: "setInterval is not available in this environment"},
+		{expr: `clearTimeout(1)`, msg: "clearTimeout is not available in this environment"},
+		{expr: `clearInterval(1)`, msg: "clearInterval is not available in this environment"},
 	} {
-		_, err := rt.run(expr)
+		_, err := rt.run(tc.expr)
 		if err == nil {
-			t.Fatalf("%s: expected error, got nil", expr)
+			t.Fatalf("%s: expected error, got nil", tc.expr)
 		}
-		if !strings.Contains(err.Error(), "not available in this environment") {
-			t.Fatalf("%s: want unavailable-environment error, got %v", expr, err)
-		}
+		requireErrorNameMessage(t, rt.vm, err, "Error", tc.msg)
+	}
+}
+
+func TestBranchRuntime_DollarValThrowsStructuredErrors(t *testing.T) {
+	rt := mustNewBranchRuntime(t)
+
+	for _, tc := range []struct {
+		name    string
+		expr    string
+		errName string
+		msg     string
+	}{
+		{
+			name:    "missing index",
+			expr:    `$val()`,
+			errName: "TypeError",
+			msg:     "$val(index): missing index",
+		},
+		{
+			name:    "non positive index",
+			expr:    `$val(0)`,
+			errName: "RangeError",
+			msg:     "$val(0): index must be positive",
+		},
+		{
+			name:    "unknown visible index",
+			expr:    `$val(1)`,
+			errName: "Error",
+			msg:     "$val(1): no such visible cell value on this branch",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := rt.run(tc.expr)
+			if err == nil {
+				t.Fatalf("%s: expected error, got nil", tc.expr)
+			}
+			requireErrorNameMessage(t, rt.vm, err, tc.errName, tc.msg)
+		})
 	}
 }

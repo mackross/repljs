@@ -57,6 +57,9 @@ type SubmitResult struct {
 	// Cell is the ID assigned to the newly committed cell.
 	Cell model.CellID
 
+	// Index is the branch-local monotonic cell number for this committed cell.
+	Index int
+
 	// Diagnostics lists any TypeScript diagnostics produced during checking.
 	Diagnostics []model.Diagnostic
 

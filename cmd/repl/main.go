@@ -226,6 +226,7 @@ func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src stri
 	}
 	printLogLines(out, res.Log)
 	fmt.Fprintf(out, "ok cell=%s\n", res.Cell)
+	fmt.Fprintf(out, "cell.index=%d\n", res.Index)
 	if res.CompletionValue == nil {
 		fmt.Fprintln(out, "completion: <nil>")
 		return nil

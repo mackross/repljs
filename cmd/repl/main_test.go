@@ -107,6 +107,9 @@ func TestRun_PrintsCompletionSummary(t *testing.T) {
 	}
 
 	got := out.String()
+	if !strings.Contains(got, `cell.index=1`) {
+		t.Fatalf("run output missing cell index:\n%s", got)
+	}
 	if !strings.Contains(got, `completion.summary=`) ||
 		!strings.Contains(got, `string(45) \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…\"`) ||
 		!strings.Contains(got, `Array(6)[1, 2, 3, 4, …+2]`) {

@@ -466,10 +466,52 @@ type hostFuncBuilder struct {
 	router *hostFunctionRouter
 }
 
+func jsErrorObject(vm *goja.Runtime, kind string, format string, args ...any) *goja.Object {
+	message := fmt.Sprintf(format, args...)
+	if vm == nil {
+		return nil
+	}
+	switch kind {
+	case "TypeError":
+		return vm.NewTypeError("%s", message)
+	default:
+		ctor := vm.Get(kind)
+		if ctor != nil && ctor != goja.Undefined() {
+			if obj, err := vm.New(ctor, vm.ToValue(message)); err == nil {
+				return obj
+			}
+		}
+		if kind != "Error" {
+			if obj := jsErrorObject(vm, "Error", "%s", message); obj != nil {
+				return obj
+			}
+		}
+		return vm.NewTypeError("%s", message)
+	}
+}
+
+func panicJSError(vm *goja.Runtime, kind string, format string, args ...any) {
+	if obj := jsErrorObject(vm, kind, format, args...); obj != nil {
+		panic(obj)
+	}
+	panic(fmt.Sprintf(format, args...))
+}
+
+func rejectJSError(vm *goja.Runtime, reject func(interface{}) error, kind string, format string, args ...any) {
+	if reject == nil {
+		return
+	}
+	if obj := jsErrorObject(vm, kind, format, args...); obj != nil {
+		_ = reject(obj)
+		return
+	}
+	_ = reject(goja.Undefined())
+}
+
 func (b hostFuncBuilder) WrapSync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		if b.router == nil || b.router.vm == nil {
-			panic(goja.Undefined())
+			panic("internal runtime: missing host function router")
 		}
 		return b.router.invokeSync(name, replay, invoke, call)
 	}
@@ -513,7 +555,8 @@ func disableUnsupportedTimerGlobals(vm *goja.Runtime) error {
 	for _, name := range []string{"setTimeout", "setInterval", "clearTimeout", "clearInterval"} {
 		timerName := name
 		if err := vm.Set(timerName, func(goja.FunctionCall) goja.Value {
-			panic(vm.ToValue(fmt.Sprintf("%s is not available in this environment", timerName)))
+			panicJSError(vm, "Error", "%s is not available in this environment", timerName)
+			return goja.Undefined()
 		}); err != nil {
 			return fmt.Errorf("set %s: %w", timerName, err)
 		}
@@ -560,6 +603,7 @@ type branchRuntime struct {
 	loop          *eventloop.EventLoop
 	router        *hostFunctionRouter
 	topLevelAwait *topLevelAwaitState
+	valueByIndex  map[int]goja.Value
 }
 
 func normalizeRuntimeConfig(state json.RawMessage) (json.RawMessage, error) {
@@ -610,8 +654,26 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 			initCh <- initResult{err: fmt.Errorf("disable timer globals: %w", err)}
 			return
 		}
-		if err := vm.Set("_", goja.Undefined()); err != nil {
-			initCh <- initResult{err: fmt.Errorf("install _: %w", err)}
+		rt := &branchRuntime{vm: vm, loop: loop, router: router, topLevelAwait: topLevelAwait, valueByIndex: make(map[int]goja.Value)}
+		if err := vm.Set("$last", goja.Undefined()); err != nil {
+			initCh <- initResult{err: fmt.Errorf("install $last: %w", err)}
+			return
+		}
+		if err := vm.Set("$val", func(call goja.FunctionCall) goja.Value {
+			if len(call.Arguments) == 0 {
+				panicJSError(vm, "TypeError", "$val(index): missing index")
+			}
+			index := int(call.Argument(0).ToInteger())
+			if index <= 0 {
+				panicJSError(vm, "RangeError", "$val(%d): index must be positive", index)
+			}
+			value, ok := rt.valueByIndex[index]
+			if !ok {
+				panicJSError(vm, "Error", "$val(%d): no such visible cell value on this branch", index)
+			}
+			return value
+		}); err != nil {
+			initCh <- initResult{err: fmt.Errorf("install $val: %w", err)}
 			return
 		}
 		if err := installConsoleAndInspect(vm, router); err != nil {
@@ -647,7 +709,7 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 
 		_ = bgCtx
 		initCh <- initResult{
-			runtime:     &branchRuntime{vm: vm, loop: loop, router: router, topLevelAwait: topLevelAwait},
+			runtime:     rt,
 			configured:  normalizedConfiguredState,
 			runtimeHash: runtimeConfigHash(normalizedConfiguredState),
 		}
@@ -747,25 +809,25 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 	vm := r.vm
 	params, err := marshalFirstArgument(call)
 	if err != nil {
-		panic(vm.ToValue(err.Error()))
+		panicJSError(vm, "TypeError", "%v", err)
 	}
 	if r.currentMode() == hostFunctionModeReplay {
 		inv, replayErr := r.nextReplayInvocation()
 		if replayErr != nil {
-			panic(vm.ToValue(fmt.Sprintf("host function %q replay: %v", name, replayErr)))
+			panicJSError(vm, "Error", "host function %q replay: %v", name, replayErr)
 		}
 		if inv.decision.Policy == model.ReplayNonReplayable {
-			panic(vm.ToValue(fmt.Sprintf("non-replayable effect: function %q effectID %q cannot be replayed", name, inv.effectID)))
+			panicJSError(vm, "Error", "non-replayable effect: function %q effectID %q cannot be replayed", name, inv.effectID)
 		}
 		if len(inv.decision.RecordedResult) == 0 {
-			panic(vm.ToValue(fmt.Sprintf("host function %q replay: missing recorded result for effect %q", name, inv.effectID)))
+			panicJSError(vm, "Error", "host function %q replay: missing recorded result for effect %q", name, inv.effectID)
 		}
 		return bridgeResultToValue(vm, inv.decision.RecordedResult)
 	}
 
 	live, err := r.currentLiveState()
 	if err != nil {
-		panic(vm.ToValue(fmt.Sprintf("host function %q: %v", name, err)))
+		panicJSError(vm, "Error", "host function %q: %v", name, err)
 	}
 	effectID := model.EffectID(uuid.NewString())
 	if err := r.store.AppendFact(context.Background(), model.EffectStarted{
@@ -777,7 +839,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 		ReplayPolicy: replay,
 		At:           time.Now().UTC(),
 	}); err != nil {
-		panic(vm.ToValue(fmt.Sprintf("host function %q: journal EffectStarted: %v", name, err)))
+		panicJSError(vm, "Error", "host function %q: journal EffectStarted: %v", name, err)
 	}
 	live.acc.recordStarted(effectID, name, params, replay)
 
@@ -790,7 +852,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 			ErrorMessage: err.Error(),
 			At:           time.Now().UTC(),
 		})
-		panic(vm.ToValue(err.Error()))
+		panicJSError(vm, "Error", "%v", err)
 	}
 	live.acc.recordCompleted(effectID, result)
 	if err := r.store.AppendFact(context.Background(), model.EffectCompleted{
@@ -799,7 +861,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 		Result:  result,
 		At:      time.Now().UTC(),
 	}); err != nil {
-		panic(vm.ToValue(fmt.Sprintf("host function %q: journal EffectCompleted: %v", name, err)))
+		panicJSError(vm, "Error", "host function %q: journal EffectCompleted: %v", name, err)
 	}
 	return bridgeResultToValue(vm, result)
 }
@@ -868,22 +930,22 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 
 	params, err := marshalFirstArgument(call)
 	if err != nil {
-		_ = reject(vm.ToValue(err.Error()))
+		rejectJSError(vm, reject, "TypeError", "%v", err)
 		return vm.ToValue(promise)
 	}
 
 	if r.currentMode() == hostFunctionModeReplay {
 		inv, replayErr := r.nextReplayInvocation()
 		if replayErr != nil {
-			_ = reject(vm.ToValue(fmt.Sprintf("host function %q replay: %v", name, replayErr)))
+			rejectJSError(vm, reject, "Error", "host function %q replay: %v", name, replayErr)
 			return vm.ToValue(promise)
 		}
 		if inv.decision.Policy == model.ReplayNonReplayable {
-			_ = reject(vm.ToValue(fmt.Sprintf("non-replayable effect: function %q effectID %q cannot be replayed", name, inv.effectID)))
+			rejectJSError(vm, reject, "Error", "non-replayable effect: function %q effectID %q cannot be replayed", name, inv.effectID)
 			return vm.ToValue(promise)
 		}
 		if len(inv.decision.RecordedResult) == 0 {
-			_ = reject(vm.ToValue(fmt.Sprintf("host function %q replay: missing recorded result for effect %q", name, inv.effectID)))
+			rejectJSError(vm, reject, "Error", "host function %q replay: missing recorded result for effect %q", name, inv.effectID)
 			return vm.ToValue(promise)
 		}
 		order := inv.decision.CompletionOrder
@@ -898,7 +960,7 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 
 	live, stateErr := r.currentLiveState()
 	if stateErr != nil {
-		_ = reject(vm.ToValue(fmt.Sprintf("host function %q: %v", name, stateErr)))
+		rejectJSError(vm, reject, "Error", "host function %q: %v", name, stateErr)
 		return vm.ToValue(promise)
 	}
 	effectID := model.EffectID(uuid.NewString())
@@ -911,7 +973,7 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 		ReplayPolicy: replay,
 		At:           time.Now().UTC(),
 	}); err != nil {
-		_ = reject(vm.ToValue(fmt.Sprintf("host function %q: journal EffectStarted: %v", name, err)))
+		rejectJSError(vm, reject, "Error", "host function %q: journal EffectStarted: %v", name, err)
 		return vm.ToValue(promise)
 	}
 	live.acc.addAsync(effectID, name, params, replay)
@@ -928,7 +990,7 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 					ErrorMessage: invokeErr.Error(),
 					At:           now,
 				})
-				_ = reject(vm.ToValue(invokeErr.Error()))
+				rejectJSError(vm, reject, "Error", "%v", invokeErr)
 				return
 			}
 			live.acc.recordCompleted(effectID, result)
@@ -980,7 +1042,7 @@ type evalResult struct {
 	structured []byte
 
 	// settledValue is the actual JS completion value and is used to rebuild
-	// REPL-managed bindings like `_`.
+	// REPL-managed bindings like `$last` and `$val(n)`.
 	settledValue goja.Value
 
 	// hasSettledValue reports whether settledValue should be applied.
@@ -1044,7 +1106,7 @@ func (r *branchRuntime) runContext(ctx context.Context, src string) (evalResult,
 	}
 }
 
-func (r *branchRuntime) setLastResult(eval evalResult) error {
+func (r *branchRuntime) setIndexedResult(index int, eval evalResult) error {
 	if r == nil || r.loop == nil {
 		return nil
 	}
@@ -1054,7 +1116,19 @@ func (r *branchRuntime) setLastResult(eval evalResult) error {
 		if eval.hasSettledValue {
 			value = eval.settledValue
 		}
-		done <- vm.Set("_", value)
+		if err := vm.Set("$last", value); err != nil {
+			done <- err
+			return
+		}
+		if index > 0 {
+			if r.valueByIndex == nil {
+				r.valueByIndex = make(map[int]goja.Value)
+			}
+			r.valueByIndex[index] = value
+			done <- nil
+			return
+		}
+		done <- nil
 	})
 	return <-done
 }
@@ -1151,7 +1225,7 @@ func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, ste
 	if stepCount > len(plan.Steps) {
 		stepCount = len(plan.Steps)
 	}
-	for _, step := range plan.Steps[:stepCount] {
+	for stepIndex, step := range plan.Steps[:stepCount] {
 		if err := rt.beginReplayStep(step.Effects, plan.Decisions); err != nil {
 			rt.close()
 			return nil, nil, "", fmt.Errorf("prepare replay step %q: %w", step.Cell, err)
@@ -1166,9 +1240,9 @@ func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, ste
 			rt.close()
 			return nil, nil, "", fmt.Errorf("replay cell %q effects: %w", step.Cell, err)
 		}
-		if err := rt.setLastResult(eval); err != nil {
+		if err := rt.setIndexedResult(stepIndex+1, eval); err != nil {
 			rt.close()
-			return nil, nil, "", fmt.Errorf("replay cell %q set _: %w", step.Cell, err)
+			return nil, nil, "", fmt.Errorf("replay cell %q set $last/$val(%d): %w", step.Cell, stepIndex+1, err)
 		}
 	}
 	if stepCount == len(plan.Steps) {
