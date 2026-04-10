@@ -135,8 +135,8 @@ func TestManifestJSONRoundTrip(t *testing.T) {
 	}
 }
 
-// TestValueRefAndPromiseRef verifies JSON round-trips for reference types.
-func TestValueRefAndPromiseRef(t *testing.T) {
+// TestValueRef verifies JSON round-trips for reference types.
+func TestValueRef(t *testing.T) {
 	vr := ValueRef{ID: "v1", Preview: "42", TypeHint: "number"}
 	data, err := json.Marshal(vr)
 	if err != nil {
@@ -150,16 +150,4 @@ func TestValueRefAndPromiseRef(t *testing.T) {
 		t.Errorf("ValueRef round-trip mismatch: %+v", vr2)
 	}
 
-	pr := PromiseRef{ID: "p1", State: PromisePending}
-	data2, err := json.Marshal(pr)
-	if err != nil {
-		t.Fatalf("PromiseRef marshal: %v", err)
-	}
-	var pr2 PromiseRef
-	if err := json.Unmarshal(data2, &pr2); err != nil {
-		t.Fatalf("PromiseRef unmarshal: %v", err)
-	}
-	if pr2.ID != pr.ID || pr2.State != pr.State {
-		t.Errorf("PromiseRef round-trip mismatch: %+v", pr2)
-	}
 }

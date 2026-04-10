@@ -9,21 +9,20 @@ import (
 
 	"github.com/dop251/goja"
 	"github.com/solidarity-ai/repl/engine"
+	"github.com/solidarity-ai/repl/jswire"
 	"github.com/solidarity-ai/repl/model"
 )
 
 type fetchDelegate struct{}
 
-type fetchResult struct {
-	Status int    `json:"status"`
-	OK     bool   `json:"ok"`
-	Body   string `json:"body"`
-}
-
 func (fetchDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
-	rawFetch := host.WrapAsync("fetch", model.ReplayReadonly, func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
-		var url string
-		if err := json.Unmarshal(params, &url); err != nil || url == "" {
+	rawFetch := host.WrapAsync("fetch", model.ReplayReadonly, func(_ context.Context, params []byte) ([]byte, error) {
+		decoded, err := jswire.DecodeGoja(goja.New(), params)
+		if err != nil {
+			return nil, fmt.Errorf("fetch: decode url: %w", err)
+		}
+		url, _ := decoded.Export().(string)
+		if url == "" {
 			return nil, fmt.Errorf("fetch: url required")
 		}
 		resp, err := http.Get(url)
@@ -35,11 +34,11 @@ func (fetchDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.R
 		if err != nil {
 			return nil, fmt.Errorf("fetch read body failed: %w", err)
 		}
-		return json.Marshal(fetchResult{
-			Status: resp.StatusCode,
-			OK:     resp.StatusCode >= 200 && resp.StatusCode < 300,
-			Body:   string(body),
-		})
+		return jswire.EncodeGoja(goja.New().ToValue(map[string]any{
+			"status": resp.StatusCode,
+			"ok":     resp.StatusCode >= 200 && resp.StatusCode < 300,
+			"body":   string(body),
+		}))
 	})
 
 	if err := rt.Set("fetch", func(call goja.FunctionCall) goja.Value {

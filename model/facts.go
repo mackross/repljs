@@ -1,9 +1,6 @@
 package model
 
-import (
-	"encoding/json"
-	"time"
-)
+import "time"
 
 // Fact is implemented by every append-only fact struct.
 // The store uses FactType() to route and index facts without falling back to
@@ -36,9 +33,9 @@ const (
 
 // SessionStarted is appended when a new session is created.
 type SessionStarted struct {
-	Session    SessionID  `json:"session"`
-	RootBranch BranchID   `json:"root_branch"`
-	At         time.Time  `json:"at"`
+	Session    SessionID `json:"session"`
+	RootBranch BranchID  `json:"root_branch"`
+	At         time.Time `json:"at"`
 }
 
 func (SessionStarted) FactType() string { return FactTypeSessionStarted }
@@ -97,15 +94,14 @@ func (CellChecked) FactType() string { return FactTypeCellChecked }
 
 // CellEvaluated is appended when the runtime has finished evaluating a cell.
 type CellEvaluated struct {
-	Session          SessionID    `json:"session"`
-	Branch           BranchID     `json:"branch"`
-	Cell             CellID       `json:"cell"`
-	CreatedBindings  []string     `json:"created_bindings,omitempty"`
-	CreatedPromises  []PromiseRef `json:"created_promises,omitempty"`
-	LinkedEffects    []EffectID   `json:"linked_effects,omitempty"`
-	CompletionValue  *ValueRef    `json:"completion_value,omitempty"`
-	ErrorMessage     string       `json:"error_message,omitempty"`
-	At               time.Time    `json:"at"`
+	Session         SessionID  `json:"session"`
+	Branch          BranchID   `json:"branch"`
+	Cell            CellID     `json:"cell"`
+	CreatedBindings []string   `json:"created_bindings,omitempty"`
+	LinkedEffects   []EffectID `json:"linked_effects,omitempty"`
+	CompletionValue *ValueRef  `json:"completion_value,omitempty"`
+	ErrorMessage    string     `json:"error_message,omitempty"`
+	At              time.Time  `json:"at"`
 }
 
 func (CellEvaluated) FactType() string { return FactTypeCellEvaluated }
@@ -147,12 +143,12 @@ func (CellFailed) FactType() string { return FactTypeCellFailed }
 // populate ReplayDecision.Policy directly from facts without re-querying the
 // manifest.
 type EffectStarted struct {
-	Session        SessionID       `json:"session"`
-	Effect         EffectID        `json:"effect"`
-	Cell           CellID          `json:"cell"`
-	FunctionName   string          `json:"function_name"`
-	Params         json.RawMessage `json:"params,omitempty"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	Session        SessionID `json:"session"`
+	Effect         EffectID  `json:"effect"`
+	Cell           CellID    `json:"cell"`
+	FunctionName   string    `json:"function_name"`
+	Params         []byte    `json:"params,omitempty"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
 	// ReplayPolicy is the policy in effect for this function at the time the
 	// effect was started, copied from HostFunctionSpec.Replay. Recording it
 	// here means the replay layer does not need to re-derive it from the
@@ -165,10 +161,10 @@ func (EffectStarted) FactType() string { return FactTypeEffectStarted }
 
 // EffectCompleted is appended when a host function invocation succeeds.
 type EffectCompleted struct {
-	Session SessionID       `json:"session"`
-	Effect  EffectID        `json:"effect"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	At      time.Time       `json:"at"`
+	Session SessionID `json:"session"`
+	Effect  EffectID  `json:"effect"`
+	Result  []byte    `json:"result,omitempty"`
+	At      time.Time `json:"at"`
 }
 
 func (EffectCompleted) FactType() string { return FactTypeEffectCompleted }
@@ -187,13 +183,13 @@ func (EffectFailed) FactType() string { return FactTypeEffectFailed }
 
 // PromiseSettled is appended when an async value reaches a terminal state.
 type PromiseSettled struct {
-	Session SessionID       `json:"session"`
-	Promise PromiseID       `json:"promise"`
-	Effect  EffectID        `json:"effect,omitempty"`
-	State   PromiseState    `json:"state"`
-	Value   json.RawMessage `json:"value,omitempty"`
-	Error   string          `json:"error,omitempty"`
-	At      time.Time       `json:"at"`
+	Session SessionID    `json:"session"`
+	Promise PromiseID    `json:"promise"`
+	Effect  EffectID     `json:"effect,omitempty"`
+	State   PromiseState `json:"state"`
+	Value   []byte       `json:"value,omitempty"`
+	Error   string       `json:"error,omitempty"`
+	At      time.Time    `json:"at"`
 }
 
 func (PromiseSettled) FactType() string { return FactTypePromiseSettled }

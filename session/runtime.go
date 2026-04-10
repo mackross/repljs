@@ -14,42 +14,192 @@ import (
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/google/uuid"
 	"github.com/solidarity-ai/repl/engine"
+	"github.com/solidarity-ai/repl/jswire"
 	"github.com/solidarity-ai/repl/model"
 	"github.com/solidarity-ai/repl/store"
 )
 
 const directRunTimeout = 100 * time.Millisecond
 
-// effectAccumulator collects the EffectIDs and PromiseRefs launched during a
+// effectAccumulator collects the EffectIDs launched during a
 // single cell evaluation. It is goroutine-safe; both the JS event-loop
 // goroutine (via add*) and the caller (via drain) may touch it concurrently.
 type effectAccumulator struct {
-	mu       sync.Mutex
-	effects  []model.EffectID
-	promises []model.PromiseRef
+	mu                 sync.Mutex
+	order              []model.EffectID
+	effects            map[model.EffectID]engine.EffectSummary
+	asyncEffects       map[model.EffectID]struct{}
+	pendingAsync       int
+	asyncSettled       chan struct{}
+	unhandledRejection map[*goja.Promise]string
 }
 
-func (a *effectAccumulator) addEffect(effectID model.EffectID) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.effects = append(a.effects, effectID)
+func cloneBytes(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	return append([]byte(nil), raw...)
 }
 
-func (a *effectAccumulator) addAsync(effectID model.EffectID, promiseRef model.PromiseRef) {
+func (a *effectAccumulator) recordStarted(effectID model.EffectID, name string, params []byte, replay model.ReplayPolicy) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.effects = append(a.effects, effectID)
-	a.promises = append(a.promises, promiseRef)
+	if a.effects == nil {
+		a.effects = make(map[model.EffectID]engine.EffectSummary)
+	}
+	if _, exists := a.effects[effectID]; !exists {
+		a.order = append(a.order, effectID)
+	}
+	a.effects[effectID] = engine.EffectSummary{
+		Effect:       effectID,
+		FunctionName: name,
+		Params:       cloneBytes(params),
+		ReplayPolicy: replay,
+		Status:       engine.EffectStatusPending,
+	}
 }
 
-func (a *effectAccumulator) drain() ([]model.EffectID, []model.PromiseRef) {
+func (a *effectAccumulator) addAsync(effectID model.EffectID, name string, params []byte, replay model.ReplayPolicy) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	effects := a.effects
-	promises := a.promises
+	if a.effects == nil {
+		a.effects = make(map[model.EffectID]engine.EffectSummary)
+	}
+	if _, exists := a.effects[effectID]; !exists {
+		a.order = append(a.order, effectID)
+	}
+	a.effects[effectID] = engine.EffectSummary{
+		Effect:       effectID,
+		FunctionName: name,
+		Params:       cloneBytes(params),
+		ReplayPolicy: replay,
+		Status:       engine.EffectStatusPending,
+	}
+	if a.asyncEffects == nil {
+		a.asyncEffects = make(map[model.EffectID]struct{})
+	}
+	a.asyncEffects[effectID] = struct{}{}
+	a.pendingAsync++
+}
+
+func (a *effectAccumulator) recordCompleted(effectID model.EffectID, result []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	summary, ok := a.effects[effectID]
+	if !ok {
+		return
+	}
+	summary.Status = engine.EffectStatusCompleted
+	summary.Result = cloneBytes(result)
+	summary.ErrorMessage = ""
+	a.effects[effectID] = summary
+	a.markAsyncSettledLocked(effectID)
+}
+
+func (a *effectAccumulator) recordFailed(effectID model.EffectID, errorMessage string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	summary, ok := a.effects[effectID]
+	if !ok {
+		return
+	}
+	summary.Status = engine.EffectStatusFailed
+	summary.Result = nil
+	summary.ErrorMessage = errorMessage
+	a.effects[effectID] = summary
+	a.markAsyncSettledLocked(effectID)
+}
+
+func (a *effectAccumulator) markAsyncSettledLocked(effectID model.EffectID) {
+	if _, ok := a.asyncEffects[effectID]; !ok {
+		return
+	}
+	delete(a.asyncEffects, effectID)
+	if a.pendingAsync > 0 {
+		a.pendingAsync--
+	}
+	if a.pendingAsync == 0 && a.asyncSettled != nil {
+		close(a.asyncSettled)
+		a.asyncSettled = nil
+	}
+}
+
+func (a *effectAccumulator) waitPendingAsync(ctx context.Context) error {
+	for {
+		a.mu.Lock()
+		if a.pendingAsync == 0 {
+			a.mu.Unlock()
+			return nil
+		}
+		ch := a.asyncSettled
+		if ch == nil {
+			ch = make(chan struct{})
+			a.asyncSettled = ch
+		}
+		a.mu.Unlock()
+
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (a *effectAccumulator) pendingAsyncCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.pendingAsync
+}
+
+func (a *effectAccumulator) recordPromiseRejection(p *goja.Promise, operation goja.PromiseRejectionOperation) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	switch operation {
+	case goja.PromiseRejectionReject:
+		if a.unhandledRejection == nil {
+			a.unhandledRejection = make(map[*goja.Promise]string)
+		}
+		reason := ""
+		if result := p.Result(); result != nil {
+			reason = result.String()
+		}
+		a.unhandledRejection[p] = reason
+	case goja.PromiseRejectionHandle:
+		delete(a.unhandledRejection, p)
+		if len(a.unhandledRejection) == 0 {
+			a.unhandledRejection = nil
+		}
+	}
+}
+
+func (a *effectAccumulator) unhandledPromiseError() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, reason := range a.unhandledRejection {
+		return fmt.Errorf("promise rejected: %s", reason)
+	}
+	return nil
+}
+
+func (a *effectAccumulator) drain() []engine.EffectSummary {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	effects := make([]engine.EffectSummary, 0, len(a.order))
+	for _, effectID := range a.order {
+		summary := a.effects[effectID]
+		summary.Params = cloneBytes(summary.Params)
+		summary.Result = cloneBytes(summary.Result)
+		effects = append(effects, summary)
+	}
+	a.order = nil
 	a.effects = nil
-	a.promises = nil
-	return effects, promises
+	a.asyncEffects = nil
+	a.pendingAsync = 0
+	a.asyncSettled = nil
+	a.unhandledRejection = nil
+	return effects
 }
 
 type hostRuntimeWiring struct {
@@ -359,6 +509,7 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 	loop.RunOnLoop(func(vm *goja.Runtime) {
 		engine.BindRuntimeLoop(vm, loop.RunOnLoop)
 		router := newHostFunctionRouter(vm, &hostRuntimeWiring{store: st, sessionID: ctx.SessionID, replayPlan: replayPlan})
+		vm.SetPromiseRejectionTracker(router.trackPromiseRejection)
 		if err := topLevelAwait.install(vm); err != nil {
 			initCh <- initResult{err: fmt.Errorf("install top-level await hook: %w", err)}
 			return
@@ -440,6 +591,40 @@ func (r *branchRuntime) activateLiveBindings() {
 	r.router.activateLive()
 }
 
+func (r *branchRuntime) flushLoop(ctx context.Context) error {
+	if r == nil || r.loop == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	r.loop.RunOnLoop(func(*goja.Runtime) {
+		close(done)
+	})
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *branchRuntime) awaitCellSettled(ctx context.Context, acc *effectAccumulator) error {
+	if acc == nil {
+		return r.flushLoop(ctx)
+	}
+	for {
+		if err := acc.waitPendingAsync(ctx); err != nil {
+			return err
+		}
+		if err := r.flushLoop(ctx); err != nil {
+			return err
+		}
+		if acc.pendingAsyncCount() == 0 {
+			break
+		}
+	}
+	return acc.unhandledPromiseError()
+}
+
 func (r *branchRuntime) close() {
 	if r == nil || r.loop == nil {
 		return
@@ -467,7 +652,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 		if len(inv.decision.RecordedResult) == 0 {
 			panic(vm.ToValue(fmt.Sprintf("host function %q replay: missing recorded result for effect %q", name, inv.effectID)))
 		}
-		return jsonResultToValue(vm, inv.decision.RecordedResult)
+		return bridgeResultToValue(vm, inv.decision.RecordedResult)
 	}
 
 	live, err := r.currentLiveState()
@@ -486,10 +671,11 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 	}); err != nil {
 		panic(vm.ToValue(fmt.Sprintf("host function %q: journal EffectStarted: %v", name, err)))
 	}
-	live.acc.addEffect(effectID)
+	live.acc.recordStarted(effectID, name, params, replay)
 
 	result, err := invoke(live.ctx, params)
 	if err != nil {
+		live.acc.recordFailed(effectID, err.Error())
 		_ = r.store.AppendFact(context.Background(), model.EffectFailed{
 			Session:      r.sessionID,
 			Effect:       effectID,
@@ -498,6 +684,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 		})
 		panic(vm.ToValue(err.Error()))
 	}
+	live.acc.recordCompleted(effectID, result)
 	if err := r.store.AppendFact(context.Background(), model.EffectCompleted{
 		Session: r.sessionID,
 		Effect:  effectID,
@@ -506,7 +693,20 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 	}); err != nil {
 		panic(vm.ToValue(fmt.Sprintf("host function %q: journal EffectCompleted: %v", name, err)))
 	}
-	return jsonResultToValue(vm, result)
+	return bridgeResultToValue(vm, result)
+}
+
+func (r *hostFunctionRouter) trackPromiseRejection(p *goja.Promise, operation goja.PromiseRejectionOperation) {
+	if r == nil {
+		return
+	}
+	r.liveMu.RLock()
+	live := r.live
+	r.liveMu.RUnlock()
+	if live == nil || live.acc == nil {
+		return
+	}
+	live.acc.recordPromiseRejection(p, operation)
 }
 
 func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
@@ -538,7 +738,7 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 			order = int(time.Now().UnixNano())
 		}
 		r.queueReplayAsync(order, func(vm *goja.Runtime) {
-			_ = resolve(jsonResultToValue(vm, inv.decision.RecordedResult))
+			_ = resolve(bridgeResultToValue(vm, inv.decision.RecordedResult))
 		})
 		return vm.ToValue(promise)
 	}
@@ -549,7 +749,6 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 		return vm.ToValue(promise)
 	}
 	effectID := model.EffectID(uuid.NewString())
-	promiseID := model.PromiseID(uuid.NewString())
 	if err := r.store.AppendFact(context.Background(), model.EffectStarted{
 		Session:      r.sessionID,
 		Effect:       effectID,
@@ -562,13 +761,14 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 		_ = reject(vm.ToValue(fmt.Sprintf("host function %q: journal EffectStarted: %v", name, err)))
 		return vm.ToValue(promise)
 	}
-	live.acc.addAsync(effectID, model.PromiseRef{ID: promiseID, State: model.PromisePending})
+	live.acc.addAsync(effectID, name, params, replay)
 
 	go func(callCtx context.Context) {
 		result, invokeErr := invoke(callCtx, params)
 		engine.RunOnRuntimeLoop(vm, func(vm *goja.Runtime) {
 			now := time.Now().UTC()
 			if invokeErr != nil {
+				live.acc.recordFailed(effectID, invokeErr.Error())
 				_ = r.store.AppendFact(context.Background(), model.EffectFailed{
 					Session:      r.sessionID,
 					Effect:       effectID,
@@ -578,39 +778,40 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 				_ = reject(vm.ToValue(invokeErr.Error()))
 				return
 			}
+			live.acc.recordCompleted(effectID, result)
 			_ = r.store.AppendFact(context.Background(), model.EffectCompleted{
 				Session: r.sessionID,
 				Effect:  effectID,
 				Result:  result,
 				At:      now,
 			})
-			_ = resolve(jsonResultToValue(vm, result))
+			_ = resolve(bridgeResultToValue(vm, result))
 		})
 	}(live.ctx)
 
 	return vm.ToValue(promise)
 }
 
-func marshalFirstArgument(call goja.FunctionCall) (json.RawMessage, error) {
-	if len(call.Arguments) == 0 || goja.IsUndefined(call.Arguments[0]) || goja.IsNull(call.Arguments[0]) {
-		return json.RawMessage("null"), nil
+func marshalFirstArgument(call goja.FunctionCall) ([]byte, error) {
+	if len(call.Arguments) == 0 {
+		return jswire.EncodeGoja(goja.Undefined())
 	}
-	b, err := json.Marshal(call.Arguments[0].Export())
+	b, err := jswire.EncodeGoja(call.Arguments[0])
 	if err != nil {
 		return nil, fmt.Errorf("marshal params: %w", err)
 	}
 	return b, nil
 }
 
-func jsonResultToValue(vm *goja.Runtime, raw json.RawMessage) goja.Value {
+func bridgeResultToValue(vm *goja.Runtime, raw []byte) goja.Value {
 	if len(raw) == 0 {
 		return vm.ToValue(nil)
 	}
-	var decoded any
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return vm.ToValue(string(raw))
+	decoded, err := jswire.DecodeGoja(vm, raw)
+	if err != nil {
+		return vm.ToValue(fmt.Sprintf("bridge decode failed: %v", err))
 	}
-	return vm.ToValue(decoded)
+	return decoded
 }
 
 // evalResult carries the output of a single evaluation.
@@ -620,9 +821,9 @@ type evalResult struct {
 	// undefined).
 	completionValue *model.ValueRef
 
-	// structured carries the JSON-encoded export of the completion value.
-	// It is nil when the value cannot be JSON-marshaled (cyclic objects,
-	// functions, etc.) or when completionValue is nil.
+	// structured carries the versioned bridge encoding of the completion value.
+	// It is nil when the value cannot be bridge-encoded or when completionValue
+	// is nil.
 	structured []byte
 }
 
@@ -743,10 +944,8 @@ func valueToEvalResult(val goja.Value) (evalResult, error) {
 			Preview:  val.String(),
 			TypeHint: gojaTypeHint(val),
 		}
-		if exported := val.Export(); exported != nil {
-			if b, merr := json.Marshal(exported); merr == nil {
-				structured = b
-			}
+		if b, merr := jswire.EncodeGoja(val); merr == nil {
+			structured = b
 		}
 	}
 	return evalResult{completionValue: ref, structured: structured}, nil

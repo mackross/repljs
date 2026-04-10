@@ -4,14 +4,17 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
+	"github.com/dop251/goja"
 	"github.com/google/uuid"
 	"github.com/solidarity-ai/repl/engine"
+	"github.com/solidarity-ai/repl/jswire"
 	"github.com/solidarity-ai/repl/model"
 	"github.com/solidarity-ai/repl/session"
 	"github.com/solidarity-ai/repl/store"
@@ -113,11 +116,11 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 				continue
 			}
 			if err := cmdSubmit(ctx, out, sess, src); err != nil {
-				fmt.Fprintf(out, "submit error: %v\n", err)
+				printSubmitError(out, err)
 			}
 		default:
 			if err := cmdSubmit(ctx, out, sess, line); err != nil {
-				fmt.Fprintf(out, "submit error: %v\n", err)
+				printSubmitError(out, err)
 			}
 		}
 	}
@@ -177,6 +180,58 @@ func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src stri
 	return nil
 }
 
+func printSubmitError(out io.Writer, err error) {
+	fmt.Fprintf(out, "submit error: %v\n", err)
+
+	var submitErr *engine.SubmitFailure
+	if !errors.As(err, &submitErr) {
+		return
+	}
+	fmt.Fprintf(out, "failure.id=%s\n", submitErr.Failure)
+	if submitErr.Parent != "" {
+		fmt.Fprintf(out, "failure.parent=%s\n", submitErr.Parent)
+	}
+	if submitErr.Phase != "" {
+		fmt.Fprintf(out, "failure.phase=%s\n", submitErr.Phase)
+	}
+	if len(submitErr.LinkedEffects) == 0 {
+		fmt.Fprintln(out, "linked_effects=<none>")
+		return
+	}
+	fmt.Fprintf(out, "linked_effects=%d\n", len(submitErr.LinkedEffects))
+	for i, effect := range submitErr.LinkedEffects {
+		fmt.Fprintf(out, "effect[%d].id=%s\n", i, effect.Effect)
+		fmt.Fprintf(out, "effect[%d].function=%s\n", i, effect.FunctionName)
+		fmt.Fprintf(out, "effect[%d].status=%s\n", i, effect.Status)
+		fmt.Fprintf(out, "effect[%d].replay_policy=%s\n", i, effect.ReplayPolicy)
+		if len(effect.Params) != 0 {
+			fmt.Fprintf(out, "effect[%d].params=%s\n", i, formatStructuredInline(effect.Params))
+		}
+		if len(effect.Result) != 0 {
+			fmt.Fprintf(out, "effect[%d].result=%s\n", i, formatStructuredInline(effect.Result))
+		}
+		if effect.ErrorMessage != "" {
+			fmt.Fprintf(out, "effect[%d].error=%q\n", i, effect.ErrorMessage)
+		}
+	}
+}
+
+func formatStructuredInline(raw []byte) string {
+	if len(raw) == 0 {
+		return "<nil>"
+	}
+	vm := goja.New()
+	decoded, err := jswire.DecodeGoja(vm, raw)
+	if err != nil {
+		return fmt.Sprintf("<bridge-decode-error:%v>", err)
+	}
+	b, err := json.Marshal(decoded.Export())
+	if err != nil {
+		return decoded.String()
+	}
+	return string(b)
+}
+
 func cmdInspect(ctx context.Context, out io.Writer, sess engine.Session, handle model.ValueID) error {
 	view, err := sess.Inspect(ctx, handle)
 	if err != nil {
@@ -189,13 +244,7 @@ func cmdInspect(ctx context.Context, out io.Writer, sess engine.Session, handle 
 		fmt.Fprintln(out, "structured=<nil>")
 		return nil
 	}
-	var pretty any
-	if err := json.Unmarshal(view.Structured, &pretty); err != nil {
-		fmt.Fprintf(out, "structured(raw)=%s\n", string(view.Structured))
-		return nil
-	}
-	b, _ := json.MarshalIndent(pretty, "", "  ")
-	fmt.Fprintf(out, "structured=%s\n", string(b))
+	fmt.Fprintf(out, "structured=%s\n", formatStructuredInline(view.Structured))
 	return nil
 }
 

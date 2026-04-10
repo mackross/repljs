@@ -375,11 +375,6 @@ type ValueRef struct {
  TypeHint string
 }
 
-type PromiseRef struct {
- ID    PromiseID
- State PromiseState
-}
-
 type PromiseState string
 
 const (

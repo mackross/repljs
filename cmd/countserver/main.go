@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"sync/atomic"
+	"time"
 )
 
 func main() {
@@ -18,6 +19,7 @@ func main() {
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddUint64(&counter, 1)
+		time.Sleep(2000 * time.Millisecond)
 		log.Printf("request %d %s %s", n, r.Method, r.URL.Path)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = fmt.Fprintf(w, "%d\n", n)

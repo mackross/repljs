@@ -173,6 +173,55 @@ func (s *session) ID() model.SessionID {
 	return s.id
 }
 
+func effectIDsFromSummaries(summaries []engine.EffectSummary) []model.EffectID {
+	if len(summaries) == 0 {
+		return nil
+	}
+	ids := make([]model.EffectID, 0, len(summaries))
+	for _, summary := range summaries {
+		ids = append(ids, summary.Effect)
+	}
+	return ids
+}
+
+func cloneEffectSummaries(in []engine.EffectSummary) []engine.EffectSummary {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]engine.EffectSummary, 0, len(in))
+	for _, summary := range in {
+		summary.Params = cloneBytes(summary.Params)
+		summary.Result = cloneBytes(summary.Result)
+		out = append(out, summary)
+	}
+	return out
+}
+
+func newSubmitFailure(failureID model.FailureID, parent model.CellID, phase string, cause error, linkedEffects []engine.EffectSummary) *engine.SubmitFailure {
+	if cause == nil {
+		return nil
+	}
+	return &engine.SubmitFailure{
+		Failure:       failureID,
+		Parent:        parent,
+		Phase:         phase,
+		ErrorMessage:  cause.Error(),
+		LinkedEffects: cloneEffectSummaries(linkedEffects),
+		Cause:         cause,
+	}
+}
+
+func combineSubmitErrors(primary, secondary error) error {
+	switch {
+	case primary == nil:
+		return secondary
+	case secondary == nil:
+		return primary
+	default:
+		return fmt.Errorf("%v; awaiting cell settlement: %w", primary, secondary)
+	}
+}
+
 func withCellSettleTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
@@ -310,20 +359,30 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	defer evalRuntime.endCell()
 
 	eval, err := evalRuntime.runContext(evalCtx, src)
-	if err != nil {
-		effects, _ := acc.drain()
+	settleErr := evalRuntime.awaitCellSettled(evalCtx, acc)
+	terminalErr := combineSubmitErrors(err, settleErr)
+	if terminalErr != nil {
+		effects := acc.drain()
+		effectIDs := effectIDsFromSummaries(effects)
 		if freshRuntime {
 			evalRuntime.close()
 		} else {
 			s.runtimeDirty = true
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "eval", effects, err); recordErr != nil {
-			return engine.SubmitResult{}, fmt.Errorf("session: Submit: eval: %w; record failure: %v", err, recordErr)
+		phase := "eval"
+		if err == nil && settleErr != nil {
+			phase = "await_cell_settlement"
+		} else if err != nil && settleErr != nil {
+			phase = "eval_and_await_cell_settlement"
 		}
-		return engine.SubmitResult{}, fmt.Errorf("session: Submit: eval: %w", err)
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, phase, effectIDs, terminalErr); recordErr != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: %s: %w; record failure: %v", phase, terminalErr, recordErr)
+		}
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, phase, terminalErr, effects)
 	}
 
-	effects, promises := acc.drain()
+	effects := acc.drain()
+	effectIDs := effectIDsFromSummaries(effects)
 	now := time.Now().UTC()
 
 	if err := s.store.AppendFact(ctx, model.CellChecked{
@@ -341,18 +400,17 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		} else {
 			s.runtimeDirty = true
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_checked", effects, err); recordErr != nil {
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_checked", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellChecked: %w; record failure: %v", err, recordErr)
 		}
-		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellChecked: %w", err)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_checked", err, effects)
 	}
 
 	if err := s.store.AppendFact(ctx, model.CellEvaluated{
 		Session:         s.id,
 		Branch:          s.branch,
 		Cell:            cellID,
-		CreatedPromises: promises,
-		LinkedEffects:   effects,
+		LinkedEffects:   effectIDs,
 		CompletionValue: eval.completionValue,
 		At:              now,
 	}); err != nil {
@@ -361,10 +419,10 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		} else {
 			s.runtimeDirty = true
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_evaluated", effects, err); recordErr != nil {
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_evaluated", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellEvaluated: %w; record failure: %v", err, recordErr)
 		}
-		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellEvaluated: %w", err)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_evaluated", err, effects)
 	}
 
 	if err := s.store.AppendFact(ctx, model.CellCommitted{
@@ -378,10 +436,10 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		} else {
 			s.runtimeDirty = true
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_committed", effects, err); recordErr != nil {
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_committed", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellCommitted: %w; record failure: %v", err, recordErr)
 		}
-		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellCommitted: %w", err)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_committed", err, effects)
 	}
 
 	if err := s.store.AppendFact(ctx, model.HeadMoved{
@@ -396,10 +454,10 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		} else {
 			s.runtimeDirty = true
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_head_moved", effects, err); recordErr != nil {
+		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_head_moved", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append HeadMoved: %w; record failure: %v", err, recordErr)
 		}
-		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append HeadMoved: %w", err)
+		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_head_moved", err, effects)
 	}
 
 	// Only advance in-memory head after all durable facts succeed.
@@ -430,7 +488,6 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	return engine.SubmitResult{
 		Cell:            cellID,
 		CompletionValue: eval.completionValue,
-		CreatedPromises: promises,
 	}, nil
 }
 

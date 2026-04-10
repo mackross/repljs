@@ -53,12 +53,3 @@ type ValueRef struct {
 	// TypeHint carries an optional TypeScript type annotation for display.
 	TypeHint string `json:"type_hint,omitempty"`
 }
-
-// PromiseRef is a JSON-safe handle to a tracked async value.
-type PromiseRef struct {
-	// ID is the opaque promise identifier.
-	ID PromiseID `json:"id"`
-
-	// State is the current settlement status of the promise.
-	State PromiseState `json:"state"`
-}

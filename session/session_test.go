@@ -17,6 +17,7 @@ import (
 
 	"github.com/dop251/goja"
 	"github.com/solidarity-ai/repl/engine"
+	"github.com/solidarity-ai/repl/jswire"
 	"github.com/solidarity-ai/repl/model"
 	"github.com/solidarity-ai/repl/session"
 	"github.com/solidarity-ai/repl/session/sessiontest"
@@ -196,9 +197,9 @@ func (d *blockingHostDelegate) CallCount(sessionID model.SessionID) int {
 }
 
 func (d *blockingHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
-	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
-		var value string
-		if err := json.Unmarshal(params, &value); err != nil {
+	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params []byte) ([]byte, error) {
+		value, err := decodeJSONStringParam(params)
+		if err != nil {
 			return nil, fmt.Errorf("hostAsync: value required")
 		}
 		d.recordCall(ctx.SessionID)
@@ -208,7 +209,7 @@ func (d *blockingHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext
 		if d.release != nil {
 			<-d.release
 		}
-		return json.Marshal(value)
+		return mustEncodeBridgeValue(value), nil
 	})); err != nil {
 		return nil, err
 	}
@@ -228,6 +229,78 @@ func (d *blockingHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext
 		return append(json.RawMessage(nil), state...), nil
 	}
 	return json.RawMessage(`{"kind":"blocking-host-test","version":1}`), nil
+}
+
+type scriptedAsyncCall struct {
+	result    []byte
+	err       error
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+}
+
+type scriptedAsyncHostDelegate struct {
+	mu    sync.Mutex
+	calls map[string]int
+	cases map[string]*scriptedAsyncCall
+}
+
+func newScriptedAsyncHostDelegate(cases map[string]*scriptedAsyncCall) *scriptedAsyncHostDelegate {
+	return &scriptedAsyncHostDelegate{cases: cases}
+}
+
+func (d *scriptedAsyncHostDelegate) CallCount(name string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls[name]
+}
+
+func (d *scriptedAsyncHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	d.mu.Lock()
+	cases := make(map[string]*scriptedAsyncCall, len(d.cases))
+	for name, call := range d.cases {
+		cases[name] = call
+	}
+	d.mu.Unlock()
+
+	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(ctx context.Context, params []byte) ([]byte, error) {
+		value, err := decodeJSONStringParam(params)
+		if err != nil {
+			return nil, err
+		}
+
+		d.mu.Lock()
+		call := cases[value]
+		if d.calls == nil {
+			d.calls = make(map[string]int)
+		}
+		d.calls[value]++
+		d.mu.Unlock()
+		if call == nil {
+			return nil, fmt.Errorf("hostAsync: missing scripted value %q", value)
+		}
+		call.startOnce.Do(func() {
+			close(call.started)
+		})
+		if call.release != nil {
+			select {
+			case <-call.release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if call.err != nil {
+			return nil, call.err
+		}
+		return cloneJSON(call.result), nil
+	})); err != nil {
+		return nil, err
+	}
+
+	if len(state) != 0 {
+		return append(json.RawMessage(nil), state...), nil
+	}
+	return json.RawMessage(`{"kind":"scripted-async-host-test","version":1}`), nil
 }
 
 func (d *asyncHostDelegate) registerHandle(sessionID model.SessionID, value string) *asyncPendingCall {
@@ -306,12 +379,15 @@ func (d *asyncHostDelegate) CallCount(sessionID model.SessionID) int {
 }
 
 func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
-	baseHostAsync := host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
-		var payload struct {
-			ID    string `json:"id"`
-			Value string `json:"value"`
+	baseHostAsync := host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params []byte) ([]byte, error) {
+		decoded, err := jswire.DecodeGoja(goja.New(), params)
+		if err != nil {
+			return nil, fmt.Errorf("hostAsync: decode payload: %w", err)
 		}
-		if err := json.Unmarshal(params, &payload); err != nil || payload.ID == "" || payload.Value == "" {
+		payload, _ := decoded.Export().(map[string]any)
+		id, _ := payload["id"].(string)
+		value, _ := payload["value"].(string)
+		if id == "" || value == "" {
 			return nil, fmt.Errorf("hostAsync: value required")
 		}
 
@@ -325,16 +401,16 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 		defer atomic.AddInt32(&d.current, -1)
 
 		if d.enter != nil {
-			d.enter <- payload.Value
+			d.enter <- value
 		}
 		if d.release != nil {
 			<-d.release
 		}
 
 		st := d.sessionState(ctx.SessionID)
-		pc := d.lookupHandle(ctx.SessionID, payload.ID)
+		pc := d.lookupHandle(ctx.SessionID, id)
 		if pc == nil {
-			return nil, fmt.Errorf("hostAsync: missing handle %q", payload.ID)
+			return nil, fmt.Errorf("hostAsync: missing handle %q", id)
 		}
 
 		d.mu.Lock()
@@ -344,7 +420,7 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 			st.pending = make(map[string]*asyncPendingCall)
 		}
 		round := st.round
-		st.pending[payload.ID] = pc
+		st.pending[id] = pc
 		if len(st.pending) == 2 {
 			pending := st.pending
 			st.pending = nil
@@ -374,7 +450,7 @@ func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, r
 		d.mu.Unlock()
 
 		<-pc.proceed
-		return json.Marshal(payload.Value)
+		return mustEncodeBridgeValue(value), nil
 	})
 
 	if err := rt.Set("hostAsync", func(call goja.FunctionCall) goja.Value {
@@ -454,8 +530,8 @@ func (d *syncRandomDelegate) CallCount(sessionID model.SessionID) int {
 
 func (d *syncRandomDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
 	mathObj := rt.Get("Math").ToObject(rt)
-	if err := mathObj.Set("random", host.WrapSync("Math.random", model.ReplayReadonly, func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
-		return json.Marshal(d.next(ctx.SessionID))
+	if err := mathObj.Set("random", host.WrapSync("Math.random", model.ReplayReadonly, func(_ context.Context, _ []byte) ([]byte, error) {
+		return mustEncodeBridgeValue(d.next(ctx.SessionID)), nil
 	})); err != nil {
 		return nil, err
 	}
@@ -501,7 +577,7 @@ func (d *effectHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt
 	for name, invoke := range invokes {
 		name := name
 		invoke := invoke
-		if err := rt.Set(name, host.WrapAsync(name, model.ReplayReadonly, func(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+		if err := rt.Set(name, host.WrapAsync(name, model.ReplayReadonly, func(ctx context.Context, params []byte) ([]byte, error) {
 			d.mu.Lock()
 			if d.calls == nil {
 				d.calls = make(map[string]int)
@@ -519,15 +595,73 @@ func (d *effectHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt
 	return json.RawMessage(`{"kind":"effect-host-test","version":1}`), nil
 }
 
-func decodeJSONStringParam(params json.RawMessage) (string, error) {
+func decodeJSONStringParam(params []byte) (string, error) {
 	if len(params) == 0 {
 		return "", nil
 	}
-	var value string
-	if err := json.Unmarshal(params, &value); err != nil {
+	decoded, err := jswire.DecodeGoja(goja.New(), params)
+	if err != nil {
 		return "", err
 	}
+	value, _ := decoded.Export().(string)
 	return value, nil
+}
+
+func cloneJSON(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	return append([]byte(nil), raw...)
+}
+
+func mustEncodeBridgeValue(value any) []byte {
+	b, err := jswire.EncodeGoja(goja.New().ToValue(value))
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func decodeBridgeStructured(t *testing.T, raw []byte) any {
+	t.Helper()
+	decoded, err := jswire.DecodeGoja(goja.New(), raw)
+	if err != nil {
+		t.Fatalf("DecodeGoja: %v", err)
+	}
+	return decoded.Export()
+}
+
+func mustEncodeBridgeExpr(t *testing.T, expr string) []byte {
+	t.Helper()
+	vm := goja.New()
+	value, err := vm.RunString(expr)
+	if err != nil {
+		t.Fatalf("RunString(%q): %v", expr, err)
+	}
+	b, err := jswire.EncodeGoja(value)
+	if err != nil {
+		t.Fatalf("EncodeGoja(%q): %v", expr, err)
+	}
+	return b
+}
+
+func requireBridgeExprResult(t *testing.T, raw []byte, expr string, want any) {
+	t.Helper()
+	vm := goja.New()
+	value, err := jswire.DecodeGoja(vm, raw)
+	if err != nil {
+		t.Fatalf("DecodeGoja: %v", err)
+	}
+	if err := vm.Set("__value", value); err != nil {
+		t.Fatalf("Set __value: %v", err)
+	}
+	got, err := vm.RunString(expr)
+	if err != nil {
+		t.Fatalf("RunString(%q): %v", expr, err)
+	}
+	if exported := got.Export(); exported != want {
+		t.Fatalf("%s = %#v, want %#v", expr, exported, want)
+	}
 }
 
 func factsCellEvaluated(facts []model.Fact, cell model.CellID) (model.CellEvaluated, bool) {
@@ -1547,10 +1681,94 @@ func TestSession_Inspect_NumericPrimitive(t *testing.T) {
 	if view.Structured == nil {
 		t.Error("expected non-nil Structured bytes for numeric primitive")
 	}
-	// JSON encoding of a number should be the digits.
-	if string(view.Structured) != "99" {
-		t.Errorf("Structured: want %q, got %q", "99", string(view.Structured))
+	if got := decodeBridgeStructured(t, view.Structured); got != int64(99) {
+		t.Errorf("Structured decoded value: want %v, got %#v", int64(99), got)
 	}
+}
+
+func TestSession_Inspect_PreservesDateCompletionType(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `new Date("2021-02-03T04:05:06.789Z")`)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value for Date")
+	}
+
+	view, err := sess.Inspect(ctx, res.CompletionValue.ID)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if len(view.Structured) == 0 {
+		t.Fatal("expected structured bytes for Date completion")
+	}
+	requireBridgeExprResult(t, view.Structured, `__value instanceof Date`, true)
+	requireBridgeExprResult(t, view.Structured, `__value.toISOString()`, "2021-02-03T04:05:06.789Z")
+}
+
+func TestSession_Submit_HostEffectsRoundTripBridgeTypes(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := newEffectHostDelegate()
+
+	delegate.SetAsync("hostDate", func(_ context.Context, params []byte) ([]byte, error) {
+		requireBridgeExprResult(t, params, `__value instanceof Date`, true)
+		requireBridgeExprResult(t, params, `__value.toISOString()`, "2021-02-03T04:05:06.789Z")
+		return mustEncodeBridgeExpr(t, `new Date("2022-05-06T07:08:09.123Z")`), nil
+	})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `(async () => {
+		const value = await hostDate(new Date("2021-02-03T04:05:06.789Z"))
+		return [value instanceof Date, value.toISOString()]
+	})()`)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value from hostDate")
+	}
+
+	view, err := sess.Inspect(ctx, res.CompletionValue.ID)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	got, _ := decodeBridgeStructured(t, view.Structured).([]any)
+	if len(got) != 2 || got[0] != true || got[1] != "2022-05-06T07:08:09.123Z" {
+		t.Fatalf("completion structured = %#v, want [true 2022-05-06T07:08:09.123Z]", got)
+	}
+
+	facts := fix.st.Facts()
+	started := factsEffectStartedForCell(facts, res.Cell)
+	if len(started) != 1 {
+		t.Fatalf("expected one EffectStarted, got %d", len(started))
+	}
+	requireBridgeExprResult(t, started[0].Params, `__value instanceof Date`, true)
+	requireBridgeExprResult(t, started[0].Params, `__value.toISOString()`, "2021-02-03T04:05:06.789Z")
+
+	completed, ok := factsEffectCompletedByID(facts, started[0].Effect)
+	if !ok {
+		t.Fatalf("EffectCompleted not recorded for %q", started[0].Effect)
+	}
+	requireBridgeExprResult(t, completed.Result, `__value instanceof Date`, true)
+	requireBridgeExprResult(t, completed.Result, `__value.toISOString()`, "2022-05-06T07:08:09.123Z")
 }
 
 // ---------------------------------------------------------------------------
@@ -1958,9 +2176,6 @@ func TestSession_Submit_WithoutHostBindings_LeavesEffectFieldsEmpty(t *testing.T
 	if err != nil {
 		t.Fatalf("Submit without host bindings: %v", err)
 	}
-	if len(res.CreatedPromises) != 0 {
-		t.Fatalf("expected no created promises without host bindings, got %d", len(res.CreatedPromises))
-	}
 
 	evalFact, ok := factsCellEvaluated(fix.st.Facts(), res.Cell)
 	if !ok {
@@ -1968,9 +2183,6 @@ func TestSession_Submit_WithoutHostBindings_LeavesEffectFieldsEmpty(t *testing.T
 	}
 	if len(evalFact.LinkedEffects) != 0 {
 		t.Fatalf("expected no linked effects without host bindings, got %v", evalFact.LinkedEffects)
-	}
-	if len(evalFact.CreatedPromises) != 0 {
-		t.Fatalf("expected no created promises in CellEvaluated without host bindings, got %v", evalFact.CreatedPromises)
 	}
 }
 
@@ -2050,7 +2262,7 @@ func TestSession_Submit_FailuresIncludeLinkedEffects(t *testing.T) {
 	e := session.New()
 	fix := newRecordingFixture(t)
 	delegate := newEffectHostDelegate()
-	delegate.SetAsync("boom", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	delegate.SetAsync("boom", func(_ context.Context, _ []byte) ([]byte, error) {
 		return nil, errors.New("boom")
 	})
 	fix.deps.VMDelegate = delegate
@@ -2087,6 +2299,80 @@ func TestSession_Submit_FailuresIncludeLinkedEffects(t *testing.T) {
 	}
 }
 
+func TestSession_Submit_ReturnsSubmitFailureWithLinkedEffectSummaries(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := newEffectHostDelegate()
+	delegate.SetAsync("boom", func(_ context.Context, _ []byte) ([]byte, error) {
+		return nil, errors.New("boom")
+	})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `const stable = 1`); err != nil {
+		t.Fatalf("Submit stable cell: %v", err)
+	}
+	_, err = sess.Submit(ctx, `const repaired = await boom(null); repaired`)
+	if err == nil {
+		t.Fatal("expected failed submit")
+	}
+
+	var submitErr *engine.SubmitFailure
+	if !errors.As(err, &submitErr) {
+		t.Fatalf("expected SubmitFailure, got %T (%v)", err, err)
+	}
+	if submitErr.Parent == "" {
+		t.Fatal("expected failed submit to report parent cell")
+	}
+	if submitErr.Phase != "eval" {
+		t.Fatalf("expected phase eval, got %q", submitErr.Phase)
+	}
+	if submitErr.ErrorMessage != "promise rejected: boom" {
+		t.Fatalf("expected submit error message %q, got %q", "promise rejected: boom", submitErr.ErrorMessage)
+	}
+	if len(submitErr.LinkedEffects) != 1 {
+		t.Fatalf("expected one linked effect summary, got %v", submitErr.LinkedEffects)
+	}
+	effect := submitErr.LinkedEffects[0]
+	if effect.FunctionName != "boom" {
+		t.Fatalf("expected linked effect function boom, got %q", effect.FunctionName)
+	}
+	if effect.Status != engine.EffectStatusFailed {
+		t.Fatalf("expected linked effect status failed, got %q", effect.Status)
+	}
+	if effect.ErrorMessage != "boom" {
+		t.Fatalf("expected linked effect error boom, got %q", effect.ErrorMessage)
+	}
+	if decoded := decodeBridgeStructured(t, effect.Params); decoded != nil {
+		t.Fatalf("expected linked effect params null, got %#v", decoded)
+	}
+	if len(effect.Result) != 0 {
+		t.Fatalf("expected failed linked effect to have no result, got %s", string(effect.Result))
+	}
+	if delegate.CallCount("boom") != 1 {
+		t.Fatalf("expected one boom invocation, got %d", delegate.CallCount("boom"))
+	}
+
+	failures, err := sess.Failures(ctx)
+	if err != nil {
+		t.Fatalf("Failures: %v", err)
+	}
+	if len(failures) != 1 {
+		t.Fatalf("expected one durable failure, got %d", len(failures))
+	}
+	if failures[0].Failure != submitErr.Failure {
+		t.Fatalf("submit failure id %q does not match durable failure id %q", submitErr.Failure, failures[0].Failure)
+	}
+}
+
 func TestSession_Submit_SingleEffectRecordsLinkedEffects(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -2094,12 +2380,12 @@ func TestSession_Submit_SingleEffectRecordsLinkedEffects(t *testing.T) {
 	e := session.New()
 	fix := newRecordingFixture(t)
 	delegate := newEffectHostDelegate()
-	delegate.SetAsync("hostOne", func(_ context.Context, params json.RawMessage) (json.RawMessage, error) {
+	delegate.SetAsync("hostOne", func(_ context.Context, params []byte) ([]byte, error) {
 		value, err := decodeJSONStringParam(params)
 		if err != nil {
 			return nil, err
 		}
-		return json.Marshal("echo:" + value)
+		return mustEncodeBridgeValue("echo:" + value), nil
 	})
 	fix.deps.VMDelegate = delegate
 
@@ -2112,9 +2398,6 @@ func TestSession_Submit_SingleEffectRecordsLinkedEffects(t *testing.T) {
 	res, err := sess.Submit(ctx, `(async () => await hostOne("alpha"))()`)
 	if err != nil {
 		t.Fatalf("Submit single effect: %v", err)
-	}
-	if len(res.CreatedPromises) != 1 {
-		t.Fatalf("expected one created promise in submit result, got %d", len(res.CreatedPromises))
 	}
 
 	plan, err := fix.st.LoadReplayPlan(ctx, sess.ID(), res.Cell)
@@ -2136,12 +2419,6 @@ func TestSession_Submit_SingleEffectRecordsLinkedEffects(t *testing.T) {
 	}
 	if len(evalFact.LinkedEffects) != 1 || evalFact.LinkedEffects[0] != linkedEffect {
 		t.Fatalf("CellEvaluated linked effects = %v, want [%s]", evalFact.LinkedEffects, linkedEffect)
-	}
-	if len(evalFact.CreatedPromises) != 1 {
-		t.Fatalf("expected one created promise in CellEvaluated, got %v", evalFact.CreatedPromises)
-	}
-	if evalFact.CreatedPromises[0].ID != res.CreatedPromises[0].ID {
-		t.Fatalf("created promise mismatch: CellEvaluated=%q SubmitResult=%q", evalFact.CreatedPromises[0].ID, res.CreatedPromises[0].ID)
 	}
 
 	started := factsEffectStartedForCell(facts, res.Cell)
@@ -2175,7 +2452,7 @@ func TestSession_Submit_ConcurrentEffectsRecordBothCompletions(t *testing.T) {
 	var max int32
 
 	mkInvoke := func(name string) engine.HostFuncInvoke {
-		return func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		return func(_ context.Context, _ []byte) ([]byte, error) {
 			cur := atomic.AddInt32(&current, 1)
 			for {
 				observed := atomic.LoadInt32(&max)
@@ -2186,7 +2463,7 @@ func TestSession_Submit_ConcurrentEffectsRecordBothCompletions(t *testing.T) {
 			defer atomic.AddInt32(&current, -1)
 			enter <- name
 			<-release
-			return json.Marshal(name)
+			return mustEncodeBridgeValue(name), nil
 		}
 	}
 	delegate.SetAsync("left", mkInvoke("left"))
@@ -2237,9 +2514,6 @@ func TestSession_Submit_ConcurrentEffectsRecordBothCompletions(t *testing.T) {
 	if outcome.err != nil {
 		t.Fatalf("Submit concurrent effects: %v", outcome.err)
 	}
-	if len(outcome.res.CreatedPromises) != 2 {
-		t.Fatalf("expected two created promises in submit result, got %d", len(outcome.res.CreatedPromises))
-	}
 
 	plan, err := fix.st.LoadReplayPlan(ctx, sess.ID(), outcome.res.Cell)
 	if err != nil {
@@ -2259,9 +2533,6 @@ func TestSession_Submit_ConcurrentEffectsRecordBothCompletions(t *testing.T) {
 	}
 	if len(evalFact.LinkedEffects) != 2 {
 		t.Fatalf("expected two linked effects in CellEvaluated, got %v", evalFact.LinkedEffects)
-	}
-	if len(evalFact.CreatedPromises) != 2 {
-		t.Fatalf("expected two created promises in CellEvaluated, got %v", evalFact.CreatedPromises)
 	}
 	started := factsEffectStartedForCell(facts, outcome.res.Cell)
 	if len(started) != 2 {
@@ -2284,7 +2555,7 @@ func TestSession_Submit_EffectFailureDoesNotCommitCell(t *testing.T) {
 	e := session.New()
 	fix := newRecordingFixture(t)
 	delegate := newEffectHostDelegate()
-	delegate.SetAsync("boom", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	delegate.SetAsync("boom", func(_ context.Context, _ []byte) ([]byte, error) {
 		return nil, errors.New("boom")
 	})
 	fix.deps.VMDelegate = delegate
@@ -2358,7 +2629,7 @@ func TestSession_Submit_ContextCancelMidEffectDoesNotCommitCell(t *testing.T) {
 	delegate := newEffectHostDelegate()
 	started := make(chan struct{}, 1)
 	returned := make(chan error, 1)
-	delegate.SetAsync("slow", func(callCtx context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	delegate.SetAsync("slow", func(callCtx context.Context, _ []byte) ([]byte, error) {
 		select {
 		case started <- struct{}{}:
 		default:
@@ -2466,10 +2737,7 @@ func TestSession_Submit_SingleAwaitChainedHostPromise(t *testing.T) {
 	if len(view.Structured) == 0 {
 		t.Fatal("expected structured value, got nil")
 	}
-	var got map[string]any
-	if err := json.Unmarshal(view.Structured, &got); err != nil {
-		t.Fatalf("Unmarshal structured: %v", err)
-	}
+	got, _ := decodeBridgeStructured(t, view.Structured).(map[string]any)
 	if got["value"] != "alpha" {
 		t.Fatalf("structured value = %v, want alpha", got["value"])
 	}
@@ -2557,6 +2825,297 @@ func TestSession_Submit_CancelledWhileWaitingOnHostPromise(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("submit did not return after cancellation")
+	}
+}
+
+func TestSession_Submit_UnawaitedAsyncHostSuccessWaitsForSettlement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newFixture(t)
+	call := &scriptedAsyncCall{
+		result:  mustEncodeBridgeValue("ok"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	delegate := newScriptedAsyncHostDelegate(map[string]*scriptedAsyncCall{"ok": call})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	type submitOutcome struct {
+		res engine.SubmitResult
+		err error
+	}
+	outcomeCh := make(chan submitOutcome, 1)
+	go func() {
+		res, err := sess.Submit(ctx, `hostAsync("ok"); 1`)
+		outcomeCh <- submitOutcome{res: res, err: err}
+	}()
+
+	select {
+	case <-call.started:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for un-awaited host call to start")
+	}
+	select {
+	case outcome := <-outcomeCh:
+		t.Fatalf("Submit returned before un-awaited host work settled: %+v", outcome)
+	default:
+	}
+
+	close(call.release)
+
+	var outcome submitOutcome
+	select {
+	case outcome = <-outcomeCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for submit result after releasing host call")
+	}
+	if outcome.err != nil {
+		t.Fatalf("Submit after host settlement: %v", outcome.err)
+	}
+	if outcome.res.CompletionValue == nil || outcome.res.CompletionValue.Preview != "1" {
+		t.Fatalf("expected completion value 1 after waiting for host settlement, got %+v", outcome.res.CompletionValue)
+	}
+}
+
+func TestSession_Submit_UnawaitedAsyncHostFailureFailsCell(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	call := &scriptedAsyncCall{
+		err:     errors.New("boom"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	delegate := newScriptedAsyncHostDelegate(map[string]*scriptedAsyncCall{"boom": call})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := sess.Submit(ctx, `hostAsync("boom"); 1`)
+		errCh <- err
+	}()
+
+	select {
+	case <-call.started:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for un-awaited failing host call to start")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("Submit returned before un-awaited failing host work settled: %v", err)
+	default:
+	}
+
+	close(call.release)
+
+	var submitErr *engine.SubmitFailure
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected submit failure after un-awaited host failure")
+		}
+		if !errors.As(err, &submitErr) {
+			t.Fatalf("expected SubmitFailure, got %T (%v)", err, err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for submit failure after releasing host call")
+	}
+	if len(submitErr.LinkedEffects) != 1 || submitErr.LinkedEffects[0].Status != engine.EffectStatusFailed {
+		t.Fatalf("expected failed linked effect summary, got %+v", submitErr.LinkedEffects)
+	}
+
+	facts := fix.st.Facts()
+	if countCellCommittedFacts(facts) != 0 {
+		t.Fatalf("expected no committed cells after un-awaited host failure, got %d", countCellCommittedFacts(facts))
+	}
+}
+
+func TestSession_Submit_UnawaitedAsyncChainRejectionFailsCell(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newFixture(t)
+	call := &scriptedAsyncCall{
+		result:  mustEncodeBridgeValue("ok"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	delegate := newScriptedAsyncHostDelegate(map[string]*scriptedAsyncCall{"ok": call})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := sess.Submit(ctx, `hostAsync("ok").then(() => { throw new Error("boom") }); 1`)
+		errCh <- err
+	}()
+
+	select {
+	case <-call.started:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for un-awaited rejection chain to start")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("Submit returned before rejection chain settled: %v", err)
+	default:
+	}
+
+	close(call.release)
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected submit failure after rejection chain settles")
+		}
+		if !strings.Contains(err.Error(), "boom") {
+			t.Fatalf("expected rejection reason boom, got %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for rejection-chain submit result")
+	}
+}
+
+func TestSession_Submit_HandledUnawaitedAsyncChainStillWaitsForSettlement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newFixture(t)
+	call := &scriptedAsyncCall{
+		result:  mustEncodeBridgeValue("ok"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	delegate := newScriptedAsyncHostDelegate(map[string]*scriptedAsyncCall{"ok": call})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	type submitOutcome struct {
+		res engine.SubmitResult
+		err error
+	}
+	outcomeCh := make(chan submitOutcome, 1)
+	go func() {
+		res, err := sess.Submit(ctx, `hostAsync("ok").then(() => { throw new Error("boom") }).catch(() => { globalThis.caught = 1 }); 1`)
+		outcomeCh <- submitOutcome{res: res, err: err}
+	}()
+
+	select {
+	case <-call.started:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for handled rejection chain to start")
+	}
+	select {
+	case outcome := <-outcomeCh:
+		t.Fatalf("Submit returned before handled chain settled: %+v", outcome)
+	default:
+	}
+
+	close(call.release)
+
+	var outcome submitOutcome
+	select {
+	case outcome = <-outcomeCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for handled-chain submit result")
+	}
+	if outcome.err != nil {
+		t.Fatalf("expected handled chain to succeed, got %v", outcome.err)
+	}
+
+	check, err := sess.Submit(ctx, `caught`)
+	if err != nil {
+		t.Fatalf("Submit caught check: %v", err)
+	}
+	if check.CompletionValue == nil || check.CompletionValue.Preview != "1" {
+		t.Fatalf("expected caught side effect to be visible when submit returns, got %+v", check.CompletionValue)
+	}
+}
+
+func TestSession_Submit_SyncThrowAfterStartingAsyncWaitsForSettlement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	call := &scriptedAsyncCall{
+		result:  mustEncodeBridgeValue("ok"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	delegate := newScriptedAsyncHostDelegate(map[string]*scriptedAsyncCall{"ok": call})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := sess.Submit(ctx, `hostAsync("ok"); throw new Error("boom")`)
+		errCh <- err
+	}()
+
+	select {
+	case <-call.started:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for async work before sync throw to start")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("Submit returned before started async work settled: %v", err)
+	default:
+	}
+
+	close(call.release)
+
+	var submitErr *engine.SubmitFailure
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected submit failure after sync throw")
+		}
+		if !errors.As(err, &submitErr) {
+			t.Fatalf("expected SubmitFailure, got %T (%v)", err, err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for sync-throw submit failure")
+	}
+	if len(submitErr.LinkedEffects) != 1 || submitErr.LinkedEffects[0].Status != engine.EffectStatusCompleted {
+		t.Fatalf("expected completed linked effect before failure returns, got %+v", submitErr.LinkedEffects)
+	}
+	if got := decodeBridgeStructured(t, submitErr.LinkedEffects[0].Result); got != "ok" {
+		t.Fatalf("expected completed linked effect result %q, got %#v", "ok", got)
 	}
 }
 
@@ -2672,10 +3231,7 @@ func TestSession_Submit_PromiseAllHostFnsRunConcurrently(t *testing.T) {
 	if len(view.Structured) == 0 {
 		t.Fatal("expected structured array result, got nil")
 	}
-	var got []string
-	if err := json.Unmarshal(view.Structured, &got); err != nil {
-		t.Fatalf("Unmarshal Promise.all structured: %v", err)
-	}
+	got, _ := decodeBridgeStructured(t, view.Structured).([]any)
 	if len(got) != 2 || got[0] != "left" || got[1] != "right" {
 		t.Fatalf("Promise.all result = %v, want [left right]", got)
 	}
@@ -3131,7 +3687,7 @@ func TestSession_FailedSubmit_DoesNotLeakRuntimeStateAcrossModes(t *testing.T) {
 
 	t.Run("host failure after mutation", func(t *testing.T) {
 		delegate := newEffectHostDelegate()
-		delegate.SetAsync("boom", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		delegate.SetAsync("boom", func(_ context.Context, _ []byte) ([]byte, error) {
 			return nil, errors.New("boom")
 		})
 
@@ -3301,8 +3857,8 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 			},
 		},
 		{
-			name: "labelled break with await preserves control flow",
-			knownGap: true,
+			name:         "labelled break with await preserves control flow",
+			knownGap:     true,
 			gapRationale: "goja currently rejects the wrapped labelled-loop form once await appears in the labelled body",
 			steps: []topLevelAwaitAction{
 				expectTopLevelAwaitPreview(`let out = 0; outer: for (const n of [1, 2, 3]) { for (const m of [1, 2, 3]) { out += await Promise.resolve(m); break outer; } }; out`, "1"),
@@ -3310,8 +3866,8 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 			},
 		},
 		{
-			name: "labelled continue with await preserves control flow",
-			knownGap: true,
+			name:         "labelled continue with await preserves control flow",
+			knownGap:     true,
 			gapRationale: "goja currently rejects the wrapped labelled-loop form once await appears in the labelled body",
 			steps: []topLevelAwaitAction{
 				expectTopLevelAwaitPreview("let hits = []; outer: for (const n of [1, 2, 3]) { for (const m of [1, 2, 3]) { if (await Promise.resolve(m === 2)) continue outer; hits.push(`${n}:${m}`) } }; hits.join(',')", "1:1,2:1,3:1"),
@@ -3427,8 +3983,8 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 			},
 		},
 		{
-			name: "array destructuring default with await is promoted",
-			knownGap: true,
+			name:         "array destructuring default with await is promoted",
+			knownGap:     true,
 			gapRationale: "goja currently rejects await inside destructuring default initializers even inside the async wrapper",
 			steps: []topLevelAwaitAction{
 				expectTopLevelAwaitNoCompletion(`const [x = await Promise.resolve(5)] = []`),
@@ -3436,8 +3992,8 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 			},
 		},
 		{
-			name: "object destructuring default with await is promoted",
-			knownGap: true,
+			name:         "object destructuring default with await is promoted",
+			knownGap:     true,
 			gapRationale: "goja currently rejects await inside destructuring default initializers even inside the async wrapper",
 			steps: []topLevelAwaitAction{
 				expectTopLevelAwaitNoCompletion(`const {x = await Promise.resolve(5)} = {}`),
@@ -3573,7 +4129,7 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 		{
 			name: "for await of reports a rewrite hint",
 			steps: []topLevelAwaitAction{
-				expectTopLevelAwaitErrorContains(`let sum = 0; for await (const n of [1, 2, 3]) { sum += n }; sum`, "for example: `for (const item of items) { const value = await item; /* body using value */ }`") ,
+				expectTopLevelAwaitErrorContains(`let sum = 0; for await (const n of [1, 2, 3]) { sum += n }; sum`, "for example: `for (const item of items) { const value = await item; /* body using value */ }`"),
 			},
 		},
 		{
@@ -3656,7 +4212,7 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 // configurable replay policy and tracks how many times the live invoke fires.
 type policyTestDelegate struct {
 	policy model.ReplayPolicy
-	result json.RawMessage
+	result []byte
 
 	mu    sync.Mutex
 	calls int
@@ -3669,7 +4225,7 @@ func (d *policyTestDelegate) CallCount() int {
 }
 
 func (d *policyTestDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
-	if err := rt.Set("hostFn", host.WrapSync("hostFn", d.policy, func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	if err := rt.Set("hostFn", host.WrapSync("hostFn", d.policy, func(_ context.Context, _ []byte) ([]byte, error) {
 		d.mu.Lock()
 		d.calls++
 		d.mu.Unlock()
@@ -3699,7 +4255,7 @@ func TestSession_Restore_ReadonlyEffects_ReusesRecordedResult(t *testing.T) {
 	fix := newFixture(t)
 	delegate := &policyTestDelegate{
 		policy: model.ReplayReadonly,
-		result: json.RawMessage(`"recorded-value"`),
+		result: mustEncodeBridgeValue("recorded-value"),
 	}
 	fix.deps.VMDelegate = delegate
 
@@ -3753,7 +4309,7 @@ func TestSession_Restore_NonReplayableEffect_ReturnsError(t *testing.T) {
 	fix := newRecordingFixture(t)
 	delegate := &policyTestDelegate{
 		policy: model.ReplayNonReplayable,
-		result: json.RawMessage(`"side-effect-result"`),
+		result: mustEncodeBridgeValue("side-effect-result"),
 	}
 	fix.deps.VMDelegate = delegate
 
@@ -3797,7 +4353,7 @@ func TestSession_Restore_PreEffectCell_WorksNormally(t *testing.T) {
 	fix := newFixture(t)
 	delegate := &policyTestDelegate{
 		policy: model.ReplayNonReplayable,
-		result: json.RawMessage(`"side-effect-result"`),
+		result: mustEncodeBridgeValue("side-effect-result"),
 	}
 	fix.deps.VMDelegate = delegate
 

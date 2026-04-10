@@ -5,10 +5,13 @@ go 1.26.1
 require (
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c
 	github.com/dop251/goja_nodejs v0.0.0-20211022123610-8dd9abb0616d
+	github.com/fastschema/qjs v0.0.6
 	github.com/google/uuid v1.6.0
 	github.com/mus-format/mus-go v0.9.1
 	modernc.org/sqlite v1.48.1
 )
+
+replace github.com/fastschema/qjs => github.com/mackross/qjs v0.0.7-0.20260409233706-931ab4cd91ce
 
 require (
 	github.com/dlclark/regexp2 v1.11.4 // indirect
@@ -19,6 +22,7 @@ require (
 	github.com/mus-format/common-go v0.0.0-20260324174526-3d8f1741b5a2 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/tetratelabs/wazero v1.9.0 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.3.8 // indirect

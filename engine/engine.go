@@ -9,6 +9,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -64,10 +65,6 @@ type SubmitResult struct {
 
 	// CompletionValue is the runtime completion value, if any.
 	CompletionValue *model.ValueRef
-
-	// CreatedPromises lists any async values that were created but not yet
-	// settled by the time the cell committed.
-	CreatedPromises []model.PromiseRef
 }
 
 // ValueView is the result of inspecting a runtime value.
@@ -81,7 +78,7 @@ type ValueView struct {
 	// TypeHint is an optional TypeScript type annotation.
 	TypeHint string
 
-	// Structured carries a JSON-serialisable representation of the value when
+	// Structured carries the versioned bridge encoding of the value when
 	// available. Nil for values that can only be previewed as a string.
 	Structured []byte
 }
@@ -99,6 +96,55 @@ type FailureView struct {
 	ErrorMessage  string
 	LinkedEffects []model.EffectID
 	At            time.Time
+}
+
+type EffectStatus string
+
+const (
+	EffectStatusPending   EffectStatus = "pending"
+	EffectStatusCompleted EffectStatus = "completed"
+	EffectStatusFailed    EffectStatus = "failed"
+)
+
+// EffectSummary is a compact view of one host/tool effect started by a cell.
+// Embedders can filter or present these however they want.
+type EffectSummary struct {
+	Effect       model.EffectID
+	FunctionName string
+	Params       []byte
+	Result       []byte
+	ErrorMessage string
+	ReplayPolicy model.ReplayPolicy
+	Status       EffectStatus
+}
+
+// SubmitFailure is returned as the error value from Session.Submit when a cell
+// fails after evaluation has begun. It carries the durable failure id together
+// with the effects started by that cell so embedders can surface them.
+type SubmitFailure struct {
+	Failure       model.FailureID
+	Parent        model.CellID
+	Phase         string
+	ErrorMessage  string
+	LinkedEffects []EffectSummary
+	Cause         error
+}
+
+func (e *SubmitFailure) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Phase != "" {
+		return fmt.Sprintf("session: Submit: %s: %s", e.Phase, e.ErrorMessage)
+	}
+	return fmt.Sprintf("session: Submit: %s", e.ErrorMessage)
+}
+
+func (e *SubmitFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 // SessionDeps bundles the external collaborators needed to start or restore a
@@ -120,9 +166,9 @@ type SessionRuntimeContext struct {
 }
 
 // HostFuncInvoke is the Go implementation behind one journaled host call.
-// params is the JSON-serialised first argument passed from JS. The returned
-// bytes must be valid JSON.
-type HostFuncInvoke func(ctx context.Context, params json.RawMessage) (json.RawMessage, error)
+// params is the bridge-encoded first argument passed from JS. The returned
+// bytes must use the same bridge encoding.
+type HostFuncInvoke func(ctx context.Context, params []byte) ([]byte, error)
 
 // HostFuncBuilder wraps Go implementations with the runtime's effect-journaling
 // and replay machinery. The delegate chooses where the returned callables are
@@ -196,12 +242,12 @@ type Session interface {
 
 	// Submit type-checks src, evaluates it in the live runtime, and commits
 	// the resulting cell to durable history. The call blocks until the cell
-	// commits (which may be before all async effects settle).
+	// and any tracked async work it started have settled.
 	Submit(ctx context.Context, src string) (SubmitResult, error)
 
 	// Inspect returns a view of the runtime value identified by handle.
 	// The handle must have been obtained from a prior SubmitResult or
-	// PromiseRef settlement.
+	// async settlement.
 	Inspect(ctx context.Context, handle model.ValueID) (ValueView, error)
 
 	// Failures returns the durable failed submit attempts for this session in

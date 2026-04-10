@@ -2,11 +2,11 @@ package session
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/solidarity-ai/repl/engine"
+	"github.com/solidarity-ai/repl/jswire"
 )
 
 func mustNewBranchRuntime(t *testing.T) *branchRuntime {
@@ -39,9 +39,12 @@ func TestBranchRuntime_FulfilledAsyncIIFE(t *testing.T) {
 	if res.structured == nil {
 		t.Fatal("expected structured bytes, got nil")
 	}
-	var got interface{}
-	if err := json.Unmarshal(res.structured, &got); err != nil {
-		t.Fatalf("structured bytes are not valid JSON: %v", err)
+	got, err := jswire.DecodeGoja(rt.vm, res.structured)
+	if err != nil {
+		t.Fatalf("structured bytes are not valid bridge payload: %v", err)
+	}
+	if exported := got.Export(); exported != int64(42) {
+		t.Fatalf("structured decoded value = %#v, want 42", exported)
 	}
 }
 
@@ -209,10 +212,11 @@ func TestBranchRuntime_AsyncReturnsObject(t *testing.T) {
 	if res.structured == nil {
 		t.Fatal("expected structured bytes for plain object, got nil")
 	}
-	var got map[string]interface{}
-	if err := json.Unmarshal(res.structured, &got); err != nil {
-		t.Fatalf("structured bytes are not valid JSON object: %v", err)
+	gotVal, err := jswire.DecodeGoja(rt.vm, res.structured)
+	if err != nil {
+		t.Fatalf("structured bytes are not valid bridge object: %v", err)
 	}
+	got, _ := gotVal.Export().(map[string]interface{})
 	if got["x"] == nil || got["y"] == nil {
 		t.Errorf("expected x and y fields in structured output, got %v", got)
 	}
