@@ -61,6 +61,9 @@ type ReplayPlan struct {
 	// Session is the session being restored.
 	Session model.SessionID
 
+	// Branch is the branch that owns TargetCell.
+	Branch model.BranchID
+
 	// TargetCell is the cell at which replay should stop (inclusive).
 	TargetCell model.CellID
 
@@ -90,6 +93,25 @@ type HeadRecord struct {
 	// Head is the most-recently committed cell on this branch.
 	// An empty CellID indicates the branch has no committed cells yet.
 	Head model.CellID
+}
+
+// SessionState describes the active branch/head cursor for a session.
+type SessionState struct {
+	// Session is the owning session.
+	Session model.SessionID
+
+	// Branch is the currently active branch.
+	Branch model.BranchID
+
+	// Head is the currently active committed cell. An empty value means the
+	// session has not committed any cells yet.
+	Head model.CellID
+
+	// RuntimeHash is the runtime descriptor attached to the session.
+	RuntimeHash string
+
+	// RuntimeConfig is the canonical runtime descriptor payload.
+	RuntimeConfig json.RawMessage
 }
 
 // StaticEnvSnapshot carries the information needed by the type service to
@@ -151,4 +173,8 @@ type Store interface {
 	// LoadFailures returns the durable failed submit attempts for the given
 	// session in append order.
 	LoadFailures(ctx context.Context, session model.SessionID) ([]model.CellFailed, error)
+
+	// LoadSessionState returns the active branch/head cursor for the given
+	// session together with its attached runtime descriptor.
+	LoadSessionState(ctx context.Context, session model.SessionID) (SessionState, error)
 }

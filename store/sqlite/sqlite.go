@@ -59,6 +59,29 @@ type Store struct {
 	db *sql.DB
 }
 
+// LatestSessionID returns the most recently started session in the database.
+func (s *Store) LatestSessionID(ctx context.Context) (model.SessionID, error) {
+	const q = `
+SELECT payload FROM facts
+WHERE fact_type = ?
+ORDER BY id DESC
+LIMIT 1`
+
+	row := s.db.QueryRowContext(ctx, q, model.FactTypeSessionStarted)
+	var payload string
+	if err := row.Scan(&payload); err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("sqlite: LatestSessionID scan: %w", err)
+	}
+	var f model.SessionStarted
+	if err := json.Unmarshal([]byte(payload), &f); err != nil {
+		return "", fmt.Errorf("sqlite: LatestSessionID decode: %w", err)
+	}
+	return f.Session, nil
+}
+
 // Open opens (or creates) a SQLite database at the given DSN, configures WAL
 // mode and busy timeout, applies the schema migrations, and returns a ready
 // Store. The DSN may be a file path or the special ":memory:" string for an
@@ -291,6 +314,7 @@ func (s *Store) LoadReplayPlan(ctx context.Context, session model.SessionID, tar
 
 	return store.ReplayPlan{
 		Session:       session,
+		Branch:        branch,
 		TargetCell:    targetCell,
 		RuntimeHash:   runtime.RuntimeHash,
 		RuntimeConfig: config,
@@ -332,6 +356,86 @@ ORDER BY id ASC`
 		return nil, fmt.Errorf("sqlite: LoadFailures rows: %w", rowsErr)
 	}
 	return failures, nil
+}
+
+// LoadSessionState returns the active branch/head cursor for a session.
+func (s *Store) LoadSessionState(ctx context.Context, session model.SessionID) (store.SessionState, error) {
+	started, err := s.loadSessionStarted(ctx, session)
+	if err != nil {
+		return store.SessionState{}, err
+	}
+	runtime, err := s.loadRuntimeAttached(ctx, session)
+	if err != nil {
+		return store.SessionState{}, err
+	}
+	config, err := s.LoadRuntimeConfig(ctx, runtime.RuntimeHash)
+	if err != nil {
+		return store.SessionState{}, err
+	}
+
+	state := store.SessionState{
+		Session:       session,
+		Branch:        started.RootBranch,
+		RuntimeHash:   runtime.RuntimeHash,
+		RuntimeConfig: config,
+	}
+
+	const q = `
+SELECT fact_type, payload FROM facts
+WHERE session = ? AND fact_type IN (?, ?)
+ORDER BY id ASC`
+	rows, err := s.db.QueryContext(ctx, q, string(session), model.FactTypeHeadMoved, model.FactTypeRestoreCompleted)
+	if err != nil {
+		return store.SessionState{}, fmt.Errorf("sqlite: LoadSessionState query: %w", err)
+	}
+	for rows.Next() {
+		var factType, payload string
+		if err := rows.Scan(&factType, &payload); err != nil {
+			_ = rows.Close()
+			return store.SessionState{}, fmt.Errorf("sqlite: LoadSessionState scan: %w", err)
+		}
+		switch factType {
+		case model.FactTypeRestoreCompleted:
+			var f model.RestoreCompleted
+			if err := json.Unmarshal([]byte(payload), &f); err != nil {
+				_ = rows.Close()
+				return store.SessionState{}, fmt.Errorf("sqlite: LoadSessionState decode restore: %w", err)
+			}
+			if f.TargetCell == "" {
+				continue
+			}
+			if f.NewBranch != "" {
+				state.Branch = f.NewBranch
+				state.Head = f.TargetCell
+				continue
+			}
+			branch, err := s.branchForCell(ctx, session, f.TargetCell)
+			if err != nil {
+				_ = rows.Close()
+				return store.SessionState{}, err
+			}
+			state.Branch = branch
+			state.Head = f.TargetCell
+		case model.FactTypeHeadMoved:
+			var f model.HeadMoved
+			if err := json.Unmarshal([]byte(payload), &f); err != nil {
+				_ = rows.Close()
+				return store.SessionState{}, fmt.Errorf("sqlite: LoadSessionState decode head: %w", err)
+			}
+			state.Branch = f.Branch
+			state.Head = f.Next
+		default:
+			_ = rows.Close()
+			return store.SessionState{}, fmt.Errorf("sqlite: LoadSessionState: unexpected fact type %q", factType)
+		}
+	}
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	if rowsErr != nil {
+		return store.SessionState{}, fmt.Errorf("sqlite: LoadSessionState rows: %w", rowsErr)
+	}
+
+	return state, nil
 }
 
 // --- internal helpers ---
@@ -418,6 +522,28 @@ LIMIT 1`
 	var f model.ManifestAttached
 	if err := json.Unmarshal([]byte(payload), &f); err != nil {
 		return model.ManifestAttached{}, fmt.Errorf("sqlite: loadManifestAttached decode: %w", err)
+	}
+	return f, nil
+}
+
+func (s *Store) loadSessionStarted(ctx context.Context, session model.SessionID) (model.SessionStarted, error) {
+	const q = `
+SELECT payload FROM facts
+WHERE session = ? AND fact_type = ?
+ORDER BY id ASC
+LIMIT 1`
+
+	row := s.db.QueryRowContext(ctx, q, string(session), model.FactTypeSessionStarted)
+	var payload string
+	if err := row.Scan(&payload); err != nil {
+		if err == sql.ErrNoRows {
+			return model.SessionStarted{}, fmt.Errorf("sqlite: loadSessionStarted: no session %q", session)
+		}
+		return model.SessionStarted{}, fmt.Errorf("sqlite: loadSessionStarted scan: %w", err)
+	}
+	var f model.SessionStarted
+	if err := json.Unmarshal([]byte(payload), &f); err != nil {
+		return model.SessionStarted{}, fmt.Errorf("sqlite: loadSessionStarted decode: %w", err)
 	}
 	return f, nil
 }

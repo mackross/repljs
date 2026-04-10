@@ -79,11 +79,11 @@ func TestSQLiteStore_AppendFactRoundTrip(t *testing.T) {
 			At:        time.Now().UTC(),
 		},
 		model.CellEvaluated{
-			Session:      sessionID,
-			Branch:       branchID,
-			Cell:         cellID1,
+			Session:       sessionID,
+			Branch:        branchID,
+			Cell:          cellID1,
 			LinkedEffects: []model.EffectID{effectID},
-			At:           time.Now().UTC(),
+			At:            time.Now().UTC(),
 		},
 		model.EffectStarted{
 			Session:      sessionID,
@@ -658,7 +658,7 @@ func TestSQLiteStore_EffectReplayPolicyPreserved(t *testing.T) {
 			Cell:         cell,
 			FunctionName: "tools.send.email",
 			Params:       json.RawMessage(`{"to":"a@b.com"}`),
-			ReplayPolicy: model.ReplayAtMostOnce,
+			ReplayPolicy: model.ReplayNonReplayable,
 			At:           time.Now().UTC(),
 		},
 		model.CellCommitted{Session: session, Branch: branch, Cell: cell, At: time.Now().UTC()},
@@ -677,8 +677,8 @@ func TestSQLiteStore_EffectReplayPolicyPreserved(t *testing.T) {
 	if !ok {
 		t.Fatalf("no decision for effect %q", effectID)
 	}
-	if dec.Policy != model.ReplayAtMostOnce {
-		t.Errorf("Policy: got %q, want %q", dec.Policy, model.ReplayAtMostOnce)
+	if dec.Policy != model.ReplayNonReplayable {
+		t.Errorf("Policy: got %q, want %q", dec.Policy, model.ReplayNonReplayable)
 	}
 	if dec.RecordedResult != nil {
 		t.Errorf("RecordedResult: got %q, want nil (effect not completed)", dec.RecordedResult)

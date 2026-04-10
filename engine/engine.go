@@ -220,10 +220,17 @@ type Engine interface {
 	// Session is ready for its first Submit call.
 	StartSession(ctx context.Context, cfg model.SessionConfig, deps SessionDeps) (Session, error)
 
+	// OpenSession reopens an existing durable session at its current active
+	// branch/head cursor.
+	OpenSession(ctx context.Context, sessionID model.SessionID, deps SessionDeps) (Session, error)
+
 	// RestoreSession replays history up to targetCell and returns a Session
-	// positioned at that cell. Implementations create a new branch when
-	// callers intend to continue execution from the restored point.
+	// positioned at that existing committed cell on its owning branch.
 	RestoreSession(ctx context.Context, sessionID model.SessionID, targetCell model.CellID, deps SessionDeps) (Session, error)
+
+	// ForkSession replays history up to targetCell and returns a Session on a
+	// newly created branch rooted at that cell.
+	ForkSession(ctx context.Context, sessionID model.SessionID, targetCell model.CellID, deps SessionDeps) (Session, error)
 }
 
 // Session represents one persistent interactive context within a repl engine.
@@ -255,10 +262,13 @@ type Session interface {
 	Failures(ctx context.Context) ([]FailureView, error)
 
 	// Restore positions this session at targetCell by replaying history up to
-	// that point. If the session has already committed cells beyond
-	// targetCell, Restore forks a new branch. The method blocks until replay
-	// is complete.
+	// that existing committed cell on its owning branch. The method blocks
+	// until replay is complete.
 	Restore(ctx context.Context, targetCell model.CellID) error
+
+	// Fork creates a new branch rooted at targetCell, replays history into a
+	// fresh runtime, and makes the new branch active.
+	Fork(ctx context.Context, targetCell model.CellID) error
 
 	// Close releases all resources associated with the session. Callers must
 	// not use the Session after Close returns.

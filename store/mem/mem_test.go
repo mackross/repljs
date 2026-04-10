@@ -451,7 +451,7 @@ func TestMemStore_LoadStaticEnv(t *testing.T) {
 //	fork branch:  (forked at cell1)  → cell3
 //
 // cell1 has one effect (fx1, ReplayReadonly, completed).
-// cell2 has one effect (fx2, ReplayAtMostOnce, NOT completed).
+// cell2 has one effect (fx2, ReplayNonReplayable, NOT completed).
 // cell3 has one effect (fx3, ReplayIdempotent, completed).
 func TestMemStore_LoadReplayPlan(t *testing.T) {
 	ctx := context.Background()
@@ -479,7 +479,7 @@ func TestMemStore_LoadReplayPlan(t *testing.T) {
 					ID: "m-rp",
 					Functions: []model.HostFunctionSpec{
 						{Name: "fn.read", ParamsSchema: json.RawMessage(`{}`), ResultSchema: json.RawMessage(`{}`), Replay: model.ReplayReadonly},
-						{Name: "fn.send", ParamsSchema: json.RawMessage(`{}`), ResultSchema: json.RawMessage(`{}`), Replay: model.ReplayAtMostOnce},
+						{Name: "fn.send", ParamsSchema: json.RawMessage(`{}`), ResultSchema: json.RawMessage(`{}`), Replay: model.ReplayNonReplayable},
 						{Name: "fn.idempotent", ParamsSchema: json.RawMessage(`{}`), ResultSchema: json.RawMessage(`{}`), Replay: model.ReplayIdempotent},
 					},
 				},
@@ -495,7 +495,7 @@ func TestMemStore_LoadReplayPlan(t *testing.T) {
 			// -- root: cell2 --
 			model.CellChecked{Session: session, Branch: root, Cell: cell2, Source: "src2", EmittedJS: "js2", At: time.Now().UTC()},
 			model.CellEvaluated{Session: session, Branch: root, Cell: cell2, LinkedEffects: []model.EffectID{fx2}, At: time.Now().UTC()},
-			model.EffectStarted{Session: session, Effect: fx2, Cell: cell2, FunctionName: "fn.send", ReplayPolicy: model.ReplayAtMostOnce, At: time.Now().UTC()},
+			model.EffectStarted{Session: session, Effect: fx2, Cell: cell2, FunctionName: "fn.send", ReplayPolicy: model.ReplayNonReplayable, At: time.Now().UTC()},
 			// fx2 NOT completed.
 			model.CellCommitted{Session: session, Branch: root, Cell: cell2, At: time.Now().UTC()},
 			model.HeadMoved{Session: session, Branch: root, Previous: cell1, Next: cell2, At: time.Now().UTC()},
@@ -569,8 +569,8 @@ func TestMemStore_LoadReplayPlan(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing decision for %q", fx2)
 		}
-		if dec2.Policy != model.ReplayAtMostOnce {
-			t.Errorf("fx2 Policy: got %q, want AtMostOnce", dec2.Policy)
+		if dec2.Policy != model.ReplayNonReplayable {
+			t.Errorf("fx2 Policy: got %q, want NonReplayable", dec2.Policy)
 		}
 		if dec2.RecordedResult != nil {
 			t.Errorf("fx2 RecordedResult: got %q, want nil (not completed)", dec2.RecordedResult)

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	mrand "math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -460,6 +461,47 @@ func (b hostFuncBuilder) WrapAsync(name string, replay model.ReplayPolicy, invok
 	}
 }
 
+func installReplayAwareGojaNondeterminism(vm *goja.Runtime, host hostFuncBuilder) error {
+	if vm == nil || host.router == nil {
+		return nil
+	}
+
+	randomSource := host.WrapSync("Math.random", model.ReplayReadonly, func(_ context.Context, _ []byte) ([]byte, error) {
+		return encodeBridgeLiteral(mrand.Float64())
+	})
+	timeSource := host.WrapSync("Date.now", model.ReplayReadonly, func(_ context.Context, _ []byte) ([]byte, error) {
+		return encodeBridgeLiteral(time.Now().UTC().UnixMilli())
+	})
+
+	vm.SetRandSource(func() float64 {
+		return randomSource(goja.FunctionCall{}).ToFloat()
+	})
+	vm.SetTimeSource(func() time.Time {
+		ms := timeSource(goja.FunctionCall{}).ToInteger()
+		return time.UnixMilli(ms).UTC()
+	})
+	return nil
+}
+
+func disableUnsupportedTimerGlobals(vm *goja.Runtime) error {
+	if vm == nil {
+		return nil
+	}
+	for _, name := range []string{"setTimeout", "setInterval", "clearTimeout", "clearInterval"} {
+		timerName := name
+		if err := vm.Set(timerName, func(goja.FunctionCall) goja.Value {
+			panic(vm.ToValue(fmt.Sprintf("%s is not available in this environment", timerName)))
+		}); err != nil {
+			return fmt.Errorf("set %s: %w", timerName, err)
+		}
+	}
+	return nil
+}
+
+func encodeBridgeLiteral(value any) ([]byte, error) {
+	return jswire.EncodeGoja(goja.New().ToValue(value))
+}
+
 // branchRuntime holds a single goja VM that persists across successful submits
 // on one branch. Each new branch (including after Restore) gets its own VM so
 // bindings from sibling branches are never visible to one another.
@@ -510,6 +552,14 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 		engine.BindRuntimeLoop(vm, loop.RunOnLoop)
 		router := newHostFunctionRouter(vm, &hostRuntimeWiring{store: st, sessionID: ctx.SessionID, replayPlan: replayPlan})
 		vm.SetPromiseRejectionTracker(router.trackPromiseRejection)
+		if err := installReplayAwareGojaNondeterminism(vm, hostFuncBuilder{router: router}); err != nil {
+			initCh <- initResult{err: fmt.Errorf("install replay-aware goja nondeterminism: %w", err)}
+			return
+		}
+		if err := disableUnsupportedTimerGlobals(vm); err != nil {
+			initCh <- initResult{err: fmt.Errorf("disable timer globals: %w", err)}
+			return
+		}
 		if err := topLevelAwait.install(vm); err != nil {
 			initCh <- initResult{err: fmt.Errorf("install top-level await hook: %w", err)}
 			return

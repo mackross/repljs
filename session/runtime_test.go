@@ -221,3 +221,21 @@ func TestBranchRuntime_AsyncReturnsObject(t *testing.T) {
 		t.Errorf("expected x and y fields in structured output, got %v", got)
 	}
 }
+
+func TestBranchRuntime_TimerGlobalsAreUnavailable(t *testing.T) {
+	rt := mustNewBranchRuntime(t)
+	for _, expr := range []string{
+		`setTimeout(() => {}, 1)`,
+		`setInterval(() => {}, 1)`,
+		`clearTimeout(1)`,
+		`clearInterval(1)`,
+	} {
+		_, err := rt.run(expr)
+		if err == nil {
+			t.Fatalf("%s: expected error, got nil", expr)
+		}
+		if !strings.Contains(err.Error(), "not available in this environment") {
+			t.Fatalf("%s: want unavailable-environment error, got %v", expr, err)
+		}
+	}
+}

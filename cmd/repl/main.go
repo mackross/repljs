@@ -53,18 +53,19 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 	}
 
 	eng := session.New()
-	sess, err := eng.StartSession(ctx, model.SessionConfig{Manifest: defaultManifest()}, engine.SessionDeps{
+	deps := engine.SessionDeps{
 		Store:       st,
 		VMDelegate:  fetchDelegate{},
 		RuntimeMode: mode,
-	})
+	}
+	sess, resumed, err := openOrStartSession(ctx, eng, st, *backend, deps)
 	if err != nil {
-		return fmt.Errorf("start session: %w", err)
+		return err
 	}
 	defer sess.Close()
 
 	fmt.Fprintf(out, "repl started\n")
-	fmt.Fprintf(out, "session=%s backend=%s runtime_mode=%s\n", sess.ID(), *backend, mode)
+	fmt.Fprintf(out, "session=%s backend=%s runtime_mode=%s resumed=%t\n", sess.ID(), *backend, mode, resumed)
 	printHelp(out)
 
 	scanner := bufio.NewScanner(in)
@@ -109,6 +110,15 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 			if err := cmdRestore(ctx, out, sess, model.CellID(cell)); err != nil {
 				fmt.Fprintf(out, "restore error: %v\n", err)
 			}
+		case strings.HasPrefix(line, ":fork "):
+			cell := strings.TrimSpace(strings.TrimPrefix(line, ":fork "))
+			if cell == "" {
+				fmt.Fprintln(out, "usage: :fork <cell-id>")
+				continue
+			}
+			if err := cmdFork(ctx, out, sess, model.CellID(cell)); err != nil {
+				fmt.Fprintf(out, "fork error: %v\n", err)
+			}
 		case line == ":submit":
 			src, ok := readMultiline(scanner, out)
 			if !ok {
@@ -124,6 +134,29 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 			}
 		}
 	}
+}
+
+func openOrStartSession(ctx context.Context, eng *session.Engine, st store.Store, backend string, deps engine.SessionDeps) (engine.Session, bool, error) {
+	if backend == "sqlite" {
+		if sqliteStore, ok := st.(*storesqlite.Store); ok {
+			sessionID, err := sqliteStore.LatestSessionID(ctx)
+			if err != nil {
+				return nil, false, fmt.Errorf("load latest sqlite session: %w", err)
+			}
+			if sessionID != "" {
+				sess, err := eng.OpenSession(ctx, sessionID, deps)
+				if err != nil {
+					return nil, false, fmt.Errorf("open session: %w", err)
+				}
+				return sess, true, nil
+			}
+		}
+	}
+	sess, err := eng.StartSession(ctx, model.SessionConfig{Manifest: defaultManifest()}, deps)
+	if err != nil {
+		return nil, false, fmt.Errorf("start session: %w", err)
+	}
+	return sess, false, nil
 }
 
 func parseRuntimeMode(raw string) (engine.RuntimeMode, error) {
@@ -259,6 +292,17 @@ func cmdRestore(ctx context.Context, out io.Writer, sess engine.Session, cell mo
 	return nil
 }
 
+func cmdFork(ctx context.Context, out io.Writer, sess engine.Session, cell model.CellID) error {
+	if _, err := uuid.Parse(string(cell)); err != nil {
+		return fmt.Errorf("invalid cell id %q: %w", cell, err)
+	}
+	if err := sess.Fork(ctx, cell); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "forked from cell=%s\n", cell)
+	return nil
+}
+
 func readMultiline(scanner *bufio.Scanner, out io.Writer) (string, bool) {
 	fmt.Fprintln(out, "enter JS, end with a line containing only .end")
 	var lines []string
@@ -285,7 +329,8 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  <js>                 submit one-line JS cell")
 	fmt.Fprintln(out, "  :submit              submit multi-line JS cell (end with .end)")
 	fmt.Fprintln(out, "  :inspect <value-id>  inspect completion handle")
-	fmt.Fprintln(out, "  :restore <cell-id>   fork/restore to a committed cell")
+	fmt.Fprintln(out, "  :restore <cell-id>   move active session to a committed cell")
+	fmt.Fprintln(out, "  :fork <cell-id>      fork a new branch from a committed cell")
 	fmt.Fprintln(out, "  :head                show note about head semantics")
 	fmt.Fprintln(out, "  :help                show this help")
 	fmt.Fprintln(out, "  :quit                exit")

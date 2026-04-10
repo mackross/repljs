@@ -12,6 +12,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -108,46 +109,114 @@ func (e *Engine) StartSession(ctx context.Context, cfg model.SessionConfig, deps
 	}, nil
 }
 
-// RestoreSession replays history up to targetCell and returns a Session
-// positioned at that cell. It loads the current head after restoring so the
-// returned session reflects durable state.
-//
-// RestoreSession calls Restore internally to record the fork facts, then
-// fetches the resulting head from the store to ground the returned session's
-// in-memory state.
-func (e *Engine) RestoreSession(ctx context.Context, sessionID model.SessionID, targetCell model.CellID, deps engine.SessionDeps) (engine.Session, error) {
-	// Bootstrap a minimal session so restoreLocked can do its work. The branch
-	// and head fields here are placeholders; restoreLocked replaces them
-	// atomically after validating targetCell, replaying committed history into a
-	// fresh VM, and durably appending the fork facts.
-	//
-	// The placeholder branch is never committed against — BranchCreated records
-	// the fork from targetCell, not from this placeholder — so store invariants
-	// are not violated.
-	mode := runtimeModeOrDefault(deps.RuntimeMode)
-	s := &session{
-		id:            sessionID,
-		store:         deps.Store,
-		branch:        model.BranchID("__restore_bootstrap__"),
-		head:          targetCell,
-		runtimeHash:   runtimeConfigHash(deps.RuntimeConfig),
-		runtimeConfig: append([]byte(nil), deps.RuntimeConfig...),
-		delegate:      deps.VMDelegate,
-		runtimeMode:   mode,
+// OpenSession reopens an existing durable session at its current active
+// branch/head cursor without appending any new facts.
+func (e *Engine) OpenSession(ctx context.Context, sessionID model.SessionID, deps engine.SessionDeps) (engine.Session, error) {
+	state, err := deps.Store.LoadSessionState(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("session: OpenSession: load state: %w", err)
 	}
+	return e.openSessionState(ctx, state, deps)
+}
 
+// RestoreSession replays history up to targetCell and returns a Session
+// positioned at that existing committed cell on its owning branch.
+func (e *Engine) RestoreSession(ctx context.Context, sessionID model.SessionID, targetCell model.CellID, deps engine.SessionDeps) (engine.Session, error) {
+	s, err := e.bootstrapExistingSession(ctx, sessionID, deps)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.Restore(ctx, targetCell); err != nil {
 		return nil, fmt.Errorf("session: RestoreSession: %w", err)
 	}
+	return s, nil
+}
 
-	// Confirm the new branch is durably recorded. The fork branch has no
-	// HeadMoved facts yet so LoadHead returns an empty Head; we keep s.head =
-	// targetCell (set by restoreLocked) as the parent for the first Submit.
-	if _, err := deps.Store.LoadHead(ctx, sessionID, s.branch); err != nil {
-		return nil, fmt.Errorf("session: RestoreSession: LoadHead after restore: %w", err)
+// ForkSession creates a new branch rooted at targetCell and returns a Session
+// positioned on that new branch.
+func (e *Engine) ForkSession(ctx context.Context, sessionID model.SessionID, targetCell model.CellID, deps engine.SessionDeps) (engine.Session, error) {
+	s, err := e.bootstrapExistingSession(ctx, sessionID, deps)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Fork(ctx, targetCell); err != nil {
+		return nil, fmt.Errorf("session: ForkSession: %w", err)
+	}
+	return s, nil
+}
+
+func (e *Engine) bootstrapExistingSession(ctx context.Context, sessionID model.SessionID, deps engine.SessionDeps) (*session, error) {
+	state, err := deps.Store.LoadSessionState(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("session: bootstrapExistingSession: load state: %w", err)
+	}
+	return &session{
+		id:            sessionID,
+		store:         deps.Store,
+		branch:        state.Branch,
+		head:          state.Head,
+		runtimeHash:   state.RuntimeHash,
+		runtimeConfig: cloneRawMessage(state.RuntimeConfig),
+		delegate:      deps.VMDelegate,
+		runtimeMode:   runtimeModeOrDefault(deps.RuntimeMode),
+		values:        make(map[model.ValueID]engine.ValueView),
+	}, nil
+}
+
+func (e *Engine) openSessionState(ctx context.Context, state store.SessionState, deps engine.SessionDeps) (engine.Session, error) {
+	s := &session{
+		id:            state.Session,
+		store:         deps.Store,
+		branch:        state.Branch,
+		head:          state.Head,
+		runtimeHash:   state.RuntimeHash,
+		runtimeConfig: cloneRawMessage(state.RuntimeConfig),
+		delegate:      deps.VMDelegate,
+		runtimeMode:   runtimeModeOrDefault(deps.RuntimeMode),
+		values:        make(map[model.ValueID]engine.ValueView),
 	}
 
+	var (
+		rt            *branchRuntime
+		runtimeConfig json.RawMessage
+		runtimeHash   string
+		err           error
+	)
+	if state.Head == "" {
+		rt, runtimeConfig, runtimeHash, err = newBranchRuntime(ctx, engine.SessionRuntimeContext{
+			SessionID:   state.Session,
+			BranchID:    state.Branch,
+			RuntimeHash: state.RuntimeHash,
+		}, deps.Store, deps.VMDelegate, state.RuntimeConfig, nil)
+		if err != nil {
+			return nil, fmt.Errorf("session: OpenSession: init runtime: %w", err)
+		}
+	} else {
+		plan, err := deps.Store.LoadReplayPlan(ctx, state.Session, state.Head)
+		if err != nil {
+			return nil, fmt.Errorf("session: OpenSession: load replay plan: %w", err)
+		}
+		rt, runtimeConfig, runtimeHash, err = replayPlanIntoRuntime(ctx, plan, engine.SessionRuntimeContext{
+			SessionID:   state.Session,
+			BranchID:    state.Branch,
+			RuntimeHash: plan.RuntimeHash,
+		}, deps.Store, deps.VMDelegate)
+		if err != nil {
+			return nil, fmt.Errorf("session: OpenSession: replay history: %w", err)
+		}
+	}
+
+	s.runtime = rt
+	s.runtimeHash = runtimeHash
+	s.runtimeConfig = cloneRawMessage(runtimeConfig)
 	return s, nil
+}
+
+func cloneRawMessage(in json.RawMessage) json.RawMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), in...)
 }
 
 // session is the concrete implementation of engine.Session. It is bound to
@@ -343,6 +412,10 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.ensureSubmitCursorWritable(ctx); err != nil {
+		return engine.SubmitResult{}, fmt.Errorf("session: Submit: %w", err)
+	}
+
 	// --- Step 1: evaluate in the live goja VM before touching durable state ---
 	evalRuntime, evalRuntimeConfig, evalRuntimeHash, err := s.prepareSubmitRuntime(ctx)
 	if err != nil {
@@ -491,6 +564,17 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	}, nil
 }
 
+func (s *session) ensureSubmitCursorWritable(ctx context.Context) error {
+	head, err := s.store.LoadHead(ctx, s.id, s.branch)
+	if err != nil {
+		return fmt.Errorf("load branch head: %w", err)
+	}
+	if head.Head == "" || head.Head == s.head {
+		return nil
+	}
+	return fmt.Errorf("active cursor is at cell %q while branch %q head is %q; fork before submitting", s.head, s.branch, head.Head)
+}
+
 // Inspect returns a view of the runtime value identified by handle. It looks up
 // the handle in the branch-local value registry. Unknown or stale handles return
 // an explicit error; callers must not treat a missing handle as an empty view.
@@ -532,15 +616,14 @@ func (s *session) Failures(ctx context.Context) ([]engine.FailureView, error) {
 	return out, nil
 }
 
-// Restore positions this session at targetCell by forking a new branch. It
-// appends BranchCreated and RestoreCompleted facts, then updates the session's
-// active branch and head to the new branch.
+// Restore positions this session at targetCell on the existing branch that
+// owns it. It appends RestoreCompleted, then updates the session's active
+// branch and head to the restored point.
 //
 // Fact sequence appended:
-//  1. BranchCreated  (records the fork point)
-//  2. RestoreCompleted (records the restore event)
+//  1. RestoreCompleted (records the restore event)
 //
-// s.branch and s.head are only updated after both facts succeed durably.
+// s.branch and s.head are only updated after the durable fact succeeds.
 func (s *session) Restore(ctx context.Context, targetCell model.CellID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -548,70 +631,52 @@ func (s *session) Restore(ctx context.Context, targetCell model.CellID) error {
 	return s.restoreLocked(ctx, targetCell)
 }
 
+// Fork creates a new branch rooted at targetCell and makes it active.
+func (s *session) Fork(ctx context.Context, targetCell model.CellID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.forkLocked(ctx, targetCell)
+}
+
 // restoreLocked implements Restore without acquiring the mutex. It must be
-// called with s.mu held. This allows RestoreSession (which also calls Restore
-// via the public method) to share the implementation without double-locking.
+// called with s.mu held.
 //
 // The method loads the replay plan for targetCell first: if targetCell is
 // unknown the store returns an error here and the session is left unchanged.
-// It then replays committed history into a fresh VM before appending any
-// durable facts, so an evaluation failure during replay also aborts cleanly
-// without creating a dangling branch.
+// It then replays committed history into a fresh VM before appending the
+// durable RestoreCompleted fact, so an evaluation failure during replay also
+// aborts cleanly without changing session state.
 func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) error {
-	// Step 1: validate targetCell and load the ordered replay plan.
-	// An unknown cell causes the store to return an error here, aborting
-	// restore before any branch is created.
 	plan, err := s.store.LoadReplayPlan(ctx, s.id, targetCell)
 	if err != nil {
 		return fmt.Errorf("session: Restore: load replay plan: %w", err)
 	}
-	newBranchID := model.BranchID(uuid.NewString())
 
-	// Step 2: replay committed history into a fresh VM. We do this before
-	// appending any durable facts so that a replay failure leaves both
-	// in-memory state and the store unchanged.
 	rt, runtimeConfig, runtimeHash, err := replayPlanIntoRuntime(ctx, plan, engine.SessionRuntimeContext{
 		SessionID:   s.id,
-		BranchID:    newBranchID,
+		BranchID:    plan.Branch,
 		RuntimeHash: plan.RuntimeHash,
 	}, s.store, s.delegate)
 	if err != nil {
 		return fmt.Errorf("session: Restore: replay history: %w", err)
 	}
 
-	// Step 3: append the fork facts now that the runtime is ready.
 	now := time.Now().UTC()
-
-	if err := s.store.AppendFact(ctx, model.BranchCreated{
-		Session:    s.id,
-		Branch:     newBranchID,
-		ParentCell: targetCell,
-		At:         now,
-	}); err != nil {
-		rt.close()
-		return fmt.Errorf("session: Restore: append BranchCreated: %w", err)
-	}
-
 	if err := s.store.AppendFact(ctx, model.RestoreCompleted{
 		Session:    s.id,
 		TargetCell: targetCell,
-		NewBranch:  newBranchID,
 		At:         now,
 	}); err != nil {
 		rt.close()
 		return fmt.Errorf("session: Restore: append RestoreCompleted: %w", err)
 	}
 
-	// Step 4: commit in-memory state only after all durable facts succeed.
-	// The replayed runtime contains exactly the bindings visible at targetCell
-	// on the ancestor branch — no post-fork bindings bleed in.
-	// The value registry is reset so pre-fork handles are not accessible on
-	// the new branch; callers that need a handle must re-submit the cell.
 	oldRuntime := s.runtime
-	s.branch = newBranchID
+	s.branch = plan.Branch
 	s.head = targetCell
 	s.runtimeHash = runtimeHash
-	s.runtimeConfig = append([]byte(nil), runtimeConfig...)
+	s.runtimeConfig = cloneRawMessage(runtimeConfig)
 	s.runtime = rt
 	s.runtimeDirty = false
 	s.values = make(map[model.ValueID]engine.ValueView)
@@ -619,6 +684,58 @@ func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) er
 		oldRuntime.close()
 	}
 
+	return nil
+}
+
+// forkLocked implements Fork without acquiring the mutex. It must be called
+// with s.mu held.
+func (s *session) forkLocked(ctx context.Context, targetCell model.CellID) error {
+	plan, err := s.store.LoadReplayPlan(ctx, s.id, targetCell)
+	if err != nil {
+		return fmt.Errorf("session: Fork: load replay plan: %w", err)
+	}
+	newBranchID := model.BranchID(uuid.NewString())
+
+	rt, runtimeConfig, runtimeHash, err := replayPlanIntoRuntime(ctx, plan, engine.SessionRuntimeContext{
+		SessionID:   s.id,
+		BranchID:    newBranchID,
+		RuntimeHash: plan.RuntimeHash,
+	}, s.store, s.delegate)
+	if err != nil {
+		return fmt.Errorf("session: Fork: replay history: %w", err)
+	}
+
+	now := time.Now().UTC()
+	if err := s.store.AppendFact(ctx, model.BranchCreated{
+		Session:    s.id,
+		Branch:     newBranchID,
+		ParentCell: targetCell,
+		At:         now,
+	}); err != nil {
+		rt.close()
+		return fmt.Errorf("session: Fork: append BranchCreated: %w", err)
+	}
+	if err := s.store.AppendFact(ctx, model.RestoreCompleted{
+		Session:    s.id,
+		TargetCell: targetCell,
+		NewBranch:  newBranchID,
+		At:         now,
+	}); err != nil {
+		rt.close()
+		return fmt.Errorf("session: Fork: append RestoreCompleted: %w", err)
+	}
+
+	oldRuntime := s.runtime
+	s.branch = newBranchID
+	s.head = targetCell
+	s.runtimeHash = runtimeHash
+	s.runtimeConfig = cloneRawMessage(runtimeConfig)
+	s.runtime = rt
+	s.runtimeDirty = false
+	s.values = make(map[model.ValueID]engine.ValueView)
+	if oldRuntime != nil {
+		oldRuntime.close()
+	}
 	return nil
 }
 

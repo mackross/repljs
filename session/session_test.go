@@ -88,6 +88,10 @@ func (s *recordingStore) LoadFailures(ctx context.Context, sess model.SessionID)
 	return s.wrapped.LoadFailures(ctx, sess)
 }
 
+func (s *recordingStore) LoadSessionState(ctx context.Context, sess model.SessionID) (store.SessionState, error) {
+	return s.wrapped.LoadSessionState(ctx, sess)
+}
+
 func (s *recordingStore) Facts() []model.Fact {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -841,9 +845,8 @@ func TestSession_Submit_EmptySource(t *testing.T) {
 // TestSession_Restore
 // ---------------------------------------------------------------------------
 
-// TestSession_Restore verifies that Restore forks a new branch and that
-// subsequent Submits on the restored session use the target cell as the
-// parent.
+// TestSession_Restore verifies that Restore moves the active cursor to an
+// existing committed cell and blocks further submits until the caller forks.
 func TestSession_Restore(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
@@ -865,23 +868,24 @@ func TestSession_Restore(t *testing.T) {
 		t.Fatalf("Submit 2: %v", err)
 	}
 
-	// Restore to cell 1; this should fork a new branch.
+	// Restore to cell 1 on the existing branch.
 	if err := sess.Restore(ctx, r1.Cell); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
-	// Submit on the new branch — should succeed and use r1.Cell as parent.
-	r3, err := sess.Submit(ctx, "const c = 3;")
-	if err != nil {
-		t.Fatalf("Submit after Restore: %v", err)
+	// Submit must now fail because continuing history requires an explicit fork.
+	_, err = sess.Submit(ctx, "const c = 3;")
+	if err == nil {
+		t.Fatal("expected submit after restore to require explicit fork")
 	}
-	if r3.Cell == "" {
-		t.Error("expected non-empty cell ID after restore-and-submit")
+	if !strings.Contains(err.Error(), "fork before submitting") {
+		t.Fatalf("submit after restore: want fork guidance, got %v", err)
 	}
 }
 
 // TestSession_Restore_ToCurrentHead verifies that restoring to the current
-// head still forks a new branch (boundary condition from the task plan).
+// head keeps the session writable because the cursor is already at the durable
+// branch head.
 func TestSession_Restore_ToCurrentHead(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
@@ -898,12 +902,12 @@ func TestSession_Restore_ToCurrentHead(t *testing.T) {
 		t.Fatalf("Submit: %v", err)
 	}
 
-	// Restore to the current head — should still fork a new branch.
+	// Restore to the current head — continuing should still be writable.
 	if err := sess.Restore(ctx, r1.Cell); err != nil {
 		t.Fatalf("Restore to current head: %v", err)
 	}
 
-	// Continuing after restore on a new branch.
+	// Continuing after restore on the current head remains on the same branch.
 	r2, err := sess.Submit(ctx, "const y = 2;")
 	if err != nil {
 		t.Fatalf("Submit after restore-to-current-head: %v", err)
@@ -984,9 +988,9 @@ func TestSession_BranchedLifecycle(t *testing.T) {
 		}
 	}
 
-	// Restore to cell 1 — forks a new branch on the same session.
-	if err := sess.Restore(ctx, r1.Cell); err != nil {
-		t.Fatalf("Restore to r1: %v", err)
+	// Fork to cell 1 — creates a new branch on the same session.
+	if err := sess.Fork(ctx, r1.Cell); err != nil {
+		t.Fatalf("Fork to r1: %v", err)
 	}
 
 	// Submit 2 cells on the new fork branch.
@@ -1103,10 +1107,10 @@ func TestSession_BranchedLifecycle_StaticEnv(t *testing.T) {
 		t.Fatalf("Submit 3: %v", err)
 	}
 
-	// RestoreSession to r1 — creates fork session with known branch/head.
-	forked, err := e.RestoreSession(ctx, sessID, r1.Cell, fix.deps)
+	// ForkSession to r1 — creates fork session with known branch/head.
+	forked, err := e.ForkSession(ctx, sessID, r1.Cell, fix.deps)
 	if err != nil {
-		t.Fatalf("RestoreSession: %v", err)
+		t.Fatalf("ForkSession: %v", err)
 	}
 	defer forked.Close()
 
@@ -1225,7 +1229,7 @@ func TestSessionEngine_RestoreSession(t *testing.T) {
 		t.Fatalf("Submit 3: %v", err)
 	}
 
-	// RestoreSession to r1 — this creates a new fork branch from durable history.
+	// RestoreSession to r1 — this reopens the session at r1 on the owning branch.
 	restored, err := e.RestoreSession(ctx, sessID, r1.Cell, fix.deps)
 	if err != nil {
 		t.Fatalf("RestoreSession: %v", err)
@@ -1237,34 +1241,14 @@ func TestSessionEngine_RestoreSession(t *testing.T) {
 		t.Errorf("restored session ID: want %q, got %q", sessID, restored.ID())
 	}
 
-	// Submit on the restored session must succeed and produce a new cell.
-	rc, err := restored.Submit(ctx, "const w = 40;")
-	if err != nil {
-		t.Fatalf("Submit on restored: %v", err)
+	// Submit on the restored session must require an explicit fork because the
+	// durable branch still has later committed cells beyond r1.
+	_, err = restored.Submit(ctx, "const w = 40;")
+	if err == nil {
+		t.Fatal("expected submit after RestoreSession to require fork")
 	}
-	if rc.Cell == "" {
-		t.Error("expected non-empty cell ID on restored session")
-	}
-
-	// The restored session's fork ancestry must include r1 then rc.
-	planRC, err := fix.st.LoadReplayPlan(ctx, sessID, rc.Cell)
-	if err != nil {
-		t.Fatalf("LoadReplayPlan for restored-session cell: %v", err)
-	}
-	if len(planRC.Steps) != 2 {
-		t.Fatalf("expected 2 steps (r1 + rc), got %d: %v", len(planRC.Steps), planRC.Steps)
-	}
-	if planRC.Steps[0].Cell != r1.Cell {
-		t.Errorf("step[0]: want r1 %q, got %q", r1.Cell, planRC.Steps[0].Cell)
-	}
-	if planRC.Steps[1].Cell != rc.Cell {
-		t.Errorf("step[1]: want rc %q, got %q", rc.Cell, planRC.Steps[1].Cell)
-	}
-	if planRC.Steps[0].Source != "const x = 10;" {
-		t.Errorf("step[0] source: want %q, got %q", "const x = 10;", planRC.Steps[0].Source)
-	}
-	if planRC.Steps[1].Source != "const w = 40;" {
-		t.Errorf("step[1] source: want %q, got %q", "const w = 40;", planRC.Steps[1].Source)
+	if !strings.Contains(err.Error(), "fork before submitting") {
+		t.Fatalf("submit after RestoreSession: want fork guidance, got %v", err)
 	}
 }
 
@@ -1295,14 +1279,176 @@ func TestSessionEngine_RestoreSession_UnknownCell(t *testing.T) {
 	}
 }
 
+func TestSessionEngine_OpenSession_ReopensRestoredCursor(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	sessID := sess.ID()
+
+	r1, err := sess.Submit(ctx, "const x = 1;")
+	if err != nil {
+		t.Fatalf("Submit x: %v", err)
+	}
+	if _, err := sess.Submit(ctx, "const y = 2;"); err != nil {
+		t.Fatalf("Submit y: %v", err)
+	}
+	if err := sess.Restore(ctx, r1.Cell); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close seed session: %v", err)
+	}
+
+	reopened, err := e.OpenSession(ctx, sessID, fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	_, err = reopened.Submit(ctx, "x")
+	if err == nil {
+		t.Fatal("expected reopened restored cursor to require fork before submit")
+	}
+	if !strings.Contains(err.Error(), "fork before submitting") {
+		t.Fatalf("submit on reopened restored cursor: want fork guidance, got %v", err)
+	}
+}
+
+func TestSessionEngine_OpenSession_ReopensForkCursor(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	sessID := sess.ID()
+
+	r1, err := sess.Submit(ctx, "const x = 10;")
+	if err != nil {
+		t.Fatalf("Submit x: %v", err)
+	}
+	if _, err := sess.Submit(ctx, "const y = 20;"); err != nil {
+		t.Fatalf("Submit y: %v", err)
+	}
+	if err := sess.Fork(ctx, r1.Cell); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close seed session: %v", err)
+	}
+
+	reopened, err := e.OpenSession(ctx, sessID, fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := reopened.Submit(ctx, "x + 1")
+	if err != nil {
+		t.Fatalf("Submit on reopened fork cursor: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "11" {
+		t.Fatalf("submit on reopened fork cursor: want %q, got %+v", "11", res.CompletionValue)
+	}
+}
+
+func TestSessionEngine_OpenSession_PreservesDateAcrossReplay(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	sessID := sess.ID()
+
+	initial, err := sess.Submit(ctx, "const d = new Date(); d.getTime()")
+	if err != nil {
+		t.Fatalf("Submit initial date cell: %v", err)
+	}
+	if initial.CompletionValue == nil {
+		t.Fatal("expected initial completion value")
+	}
+	initialPreview := initial.CompletionValue.Preview
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close seed session: %v", err)
+	}
+
+	reopened, err := e.OpenSession(ctx, sessID, fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	replayed, err := reopened.Submit(ctx, "d.getTime()")
+	if err != nil {
+		t.Fatalf("Submit replayed date read: %v", err)
+	}
+	if replayed.CompletionValue == nil {
+		t.Fatal("expected replayed completion value")
+	}
+	if replayed.CompletionValue.Preview != initialPreview {
+		t.Fatalf("replayed date changed across reopen: initial=%q replayed=%q", initialPreview, replayed.CompletionValue.Preview)
+	}
+}
+
+func TestSessionEngine_OpenSession_PreservesMathRandomAcrossReplay(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	sessID := sess.ID()
+
+	initial, err := sess.Submit(ctx, "const x = Math.random(); x")
+	if err != nil {
+		t.Fatalf("Submit initial random cell: %v", err)
+	}
+	if initial.CompletionValue == nil {
+		t.Fatal("expected initial completion value")
+	}
+	initialPreview := initial.CompletionValue.Preview
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close seed session: %v", err)
+	}
+
+	reopened, err := e.OpenSession(ctx, sessID, fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	replayed, err := reopened.Submit(ctx, "x")
+	if err != nil {
+		t.Fatalf("Submit replayed random read: %v", err)
+	}
+	if replayed.CompletionValue == nil {
+		t.Fatal("expected replayed completion value")
+	}
+	if replayed.CompletionValue.Preview != initialPreview {
+		t.Fatalf("replayed Math.random changed across reopen: initial=%q replayed=%q", initialPreview, replayed.CompletionValue.Preview)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TestSessionEngine_StartSessionAndRestoreSession
 // ---------------------------------------------------------------------------
 
-// TestSessionEngine_StartSessionAndRestoreSession is the integration test named
+// TestSessionEngine_StartSessionAndForkSession is the integration test named
 // in the slice plan verification section. It starts a session, submits cells,
-// then calls RestoreSession to verify both branches are visible in the store.
-func TestSessionEngine_StartSessionAndRestoreSession(t *testing.T) {
+// then calls ForkSession to verify both branches are visible in the store.
+func TestSessionEngine_StartSessionAndForkSession(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
 	fix := newFixture(t)
@@ -1327,10 +1473,10 @@ func TestSessionEngine_StartSessionAndRestoreSession(t *testing.T) {
 		t.Fatalf("Submit 3: %v", err)
 	}
 
-	// RestoreSession to cell 1 — should fork and return a new session.
-	restored, err := e.RestoreSession(ctx, sess.ID(), r1.Cell, fix.deps)
+	// ForkSession to cell 1 — should fork and return a new session.
+	restored, err := e.ForkSession(ctx, sess.ID(), r1.Cell, fix.deps)
 	if err != nil {
-		t.Fatalf("RestoreSession: %v", err)
+		t.Fatalf("ForkSession: %v", err)
 	}
 	defer restored.Close()
 
@@ -1357,10 +1503,10 @@ func TestSessionEngine_StartSessionAndRestoreSession(t *testing.T) {
 // TestSession_SubmitAndRestoreLifecycle
 // ---------------------------------------------------------------------------
 
-// TestSession_SubmitAndRestoreLifecycle exercises the full demo from the slice
-// plan: start a session, submit 3 cells, restore to cell 1, submit 2 more on
+// TestSession_SubmitAndForkLifecycle exercises the full demo from the slice
+// plan: start a session, submit 3 cells, fork to cell 1, submit 2 more on
 // the new branch — both branches visible in the store with correct heads.
-func TestSession_SubmitAndRestoreLifecycle(t *testing.T) {
+func TestSession_SubmitAndForkLifecycle(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
 	fix := newFixture(t)
@@ -1389,9 +1535,9 @@ func TestSession_SubmitAndRestoreLifecycle(t *testing.T) {
 		t.Error("all three cell IDs must be distinct")
 	}
 
-	// Restore to cell 1 on the same session (in-process branch fork).
-	if err := sess.Restore(ctx, r1.Cell); err != nil {
-		t.Fatalf("Restore: %v", err)
+	// Fork to cell 1 on the same session (in-process branch fork).
+	if err := sess.Fork(ctx, r1.Cell); err != nil {
+		t.Fatalf("Fork: %v", err)
 	}
 
 	// Submit 2 cells on the new branch.
@@ -1413,16 +1559,16 @@ func TestSession_SubmitAndRestoreLifecycle(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestSession_Restore_RebuildsForkRuntime — fork runtime isolation
+// TestSession_Fork_RebuildsForkRuntime — fork runtime isolation
 // ---------------------------------------------------------------------------
 
-// TestSession_Restore_RebuildsForkRuntime verifies that after Restore the
+// TestSession_Fork_RebuildsForkRuntime verifies that after Fork the
 // forked branch sees bindings that were committed before the fork point and
 // does NOT see bindings committed after it on the original branch.
 //
 // This is the primary must-have verification for T02: replay rebuilds a fresh
 // VM from committed history rather than sharing the old branch's runtime.
-func TestSession_Restore_RebuildsForkRuntime(t *testing.T) {
+func TestSession_Fork_RebuildsForkRuntime(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
 	fix := newFixture(t)
@@ -1443,9 +1589,9 @@ func TestSession_Restore_RebuildsForkRuntime(t *testing.T) {
 		t.Fatalf("Submit y: %v", err)
 	}
 
-	// Restore to r1 — the fork branch should replay only the first cell.
-	if err := sess.Restore(ctx, r1.Cell); err != nil {
-		t.Fatalf("Restore to r1: %v", err)
+	// Fork to r1 — the fork branch should replay only the first cell.
+	if err := sess.Fork(ctx, r1.Cell); err != nil {
+		t.Fatalf("Fork to r1: %v", err)
 	}
 
 	// x was committed before the fork point: it must be visible on the fork branch.
@@ -1467,10 +1613,10 @@ func TestSession_Restore_RebuildsForkRuntime(t *testing.T) {
 	}
 }
 
-// TestSession_Engine_RestoreSession_RebuildsForkRuntime verifies the same
-// binding isolation when the fork is created via RestoreSession (the Engine
-// entry-point) instead of Restore.
-func TestSession_Engine_RestoreSession_RebuildsForkRuntime(t *testing.T) {
+// TestSession_Engine_ForkSession_RebuildsForkRuntime verifies the same
+// binding isolation when the fork is created via ForkSession (the Engine
+// entry-point) instead of Fork.
+func TestSession_Engine_ForkSession_RebuildsForkRuntime(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
 	fix := newFixture(t)
@@ -1490,10 +1636,10 @@ func TestSession_Engine_RestoreSession_RebuildsForkRuntime(t *testing.T) {
 		t.Fatalf("Submit y: %v", err)
 	}
 
-	// RestoreSession to r1 — should replay x into the fresh runtime.
-	forked, err := e.RestoreSession(ctx, sess.ID(), r1.Cell, fix.deps)
+	// ForkSession to r1 — should replay x into the fresh runtime.
+	forked, err := e.ForkSession(ctx, sess.ID(), r1.Cell, fix.deps)
 	if err != nil {
-		t.Fatalf("RestoreSession: %v", err)
+		t.Fatalf("ForkSession: %v", err)
 	}
 	defer forked.Close()
 
@@ -1568,6 +1714,10 @@ func (f *failingStore) LoadReplayPlan(ctx context.Context, sess model.SessionID,
 
 func (f *failingStore) LoadFailures(ctx context.Context, sess model.SessionID) ([]model.CellFailed, error) {
 	return f.wrapped.LoadFailures(ctx, sess)
+}
+
+func (f *failingStore) LoadSessionState(ctx context.Context, sess model.SessionID) (store.SessionState, error) {
+	return f.wrapped.LoadSessionState(ctx, sess)
 }
 
 // TestSession_Submit_AppendErrorDoesNotAdvanceHead verifies that a store
@@ -1884,7 +2034,7 @@ func TestSession_Restore_HandleIsolation(t *testing.T) {
 		t.Fatal("expected error for pre-restore handle after Restore, got nil")
 	}
 
-	// A new submit on the fork branch registers a new inspectable handle.
+	// Restoring to the current head keeps the cursor writable.
 	r2, err := sess.Submit(ctx, "200")
 	if err != nil {
 		t.Fatalf("Submit after restore: %v", err)
@@ -1901,9 +2051,9 @@ func TestSession_Restore_HandleIsolation(t *testing.T) {
 	}
 }
 
-// TestSession_Restore_PreRestoreHandleAfterFork verifies that the pre-restore
-// handle is inaccessible after RestoreSession (Engine entry-point path).
-func TestSession_Restore_PreRestoreHandleAfterFork(t *testing.T) {
+// TestSession_Fork_PreRestoreHandleAfterFork verifies that the pre-fork handle
+// is inaccessible after ForkSession (Engine entry-point path).
+func TestSession_Fork_PreRestoreHandleAfterFork(t *testing.T) {
 	ctx := context.Background()
 	e := session.New()
 	fix := newFixture(t)
@@ -1923,10 +2073,10 @@ func TestSession_Restore_PreRestoreHandleAfterFork(t *testing.T) {
 	}
 	preHandle := r1.CompletionValue.ID
 
-	// Fork via RestoreSession — the forked session must have an empty registry.
-	forked, err := e.RestoreSession(ctx, sess.ID(), r1.Cell, fix.deps)
+	// Fork via ForkSession — the forked session must have an empty registry.
+	forked, err := e.ForkSession(ctx, sess.ID(), r1.Cell, fix.deps)
 	if err != nil {
-		t.Fatalf("RestoreSession: %v", err)
+		t.Fatalf("ForkSession: %v", err)
 	}
 	defer forked.Close()
 
@@ -4290,13 +4440,14 @@ func TestSession_Restore_ReadonlyEffects_ReusesRecordedResult(t *testing.T) {
 		t.Fatalf("expected readonly effect reused without re-invocation during restore, got %d calls", delegate.CallCount())
 	}
 
-	// The forked runtime should be fully operational.
-	res, err := sess.Submit(ctx, `"fork-ok"`)
+	// Submit on a restored cursor must require an explicit fork.
+	_, err = sess.Submit(ctx, `"fork-ok"`)
 	if err != nil {
-		t.Fatalf("Submit on fork: %v", err)
-	}
-	if res.CompletionValue == nil || res.CompletionValue.Preview != "fork-ok" {
-		t.Fatalf("expected fork-ok completion value, got %+v", res.CompletionValue)
+		if !strings.Contains(err.Error(), "fork before submitting") {
+			t.Fatalf("Submit after restore: want fork guidance, got %v", err)
+		}
+	} else {
+		t.Fatal("expected submit after restore to require fork")
 	}
 }
 
@@ -4381,13 +4532,14 @@ func TestSession_Restore_PreEffectCell_WorksNormally(t *testing.T) {
 		t.Fatalf("Restore to pre-effect cell: %v", err)
 	}
 
-	// The forked runtime should contain x and be fully usable.
-	res, err := sess.Submit(ctx, `x + 1`)
+	// Continuing from this point requires an explicit fork.
+	_, err = sess.Submit(ctx, `x + 1`)
 	if err != nil {
-		t.Fatalf("Submit on fork: %v", err)
-	}
-	if res.CompletionValue == nil || res.CompletionValue.Preview != "43" {
-		t.Fatalf("expected completion value %q, got %+v", "43", res.CompletionValue)
+		if !strings.Contains(err.Error(), "fork before submitting") {
+			t.Fatalf("Submit after restore: want fork guidance, got %v", err)
+		}
+	} else {
+		t.Fatal("expected submit after restore to require fork")
 	}
 }
 
@@ -4405,11 +4557,11 @@ func TestSession_TopLevelAwaitRestoreForkParity(t *testing.T) {
 	}
 	_ = submitTopLevelAwaitPair(t, ctx, h, `const y = 2`)
 
-	if err := h.Persistent.Restore(ctx, first.PersistentResult.Cell); err != nil {
-		t.Fatalf("Persistent.Restore: %v", err)
+	if err := h.Persistent.Fork(ctx, first.PersistentResult.Cell); err != nil {
+		t.Fatalf("Persistent.Fork: %v", err)
 	}
-	if err := h.Replay.Restore(ctx, first.ReplayResult.Cell); err != nil {
-		t.Fatalf("Replay.Restore: %v", err)
+	if err := h.Replay.Fork(ctx, first.ReplayResult.Cell); err != nil {
+		t.Fatalf("Replay.Fork: %v", err)
 	}
 
 	xPair := submitTopLevelAwaitPair(t, ctx, h, `x`)

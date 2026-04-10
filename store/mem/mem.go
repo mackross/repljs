@@ -179,6 +179,7 @@ func (s *Store) LoadReplayPlan(ctx context.Context, session model.SessionID, tar
 
 	return store.ReplayPlan{
 		Session:       session,
+		Branch:        branch,
 		TargetCell:    targetCell,
 		RuntimeHash:   runtime.RuntimeHash,
 		RuntimeConfig: config,
@@ -205,6 +206,58 @@ func (s *Store) LoadFailures(_ context.Context, session model.SessionID) ([]mode
 		failures = append(failures, f)
 	}
 	return failures, nil
+}
+
+// LoadSessionState returns the active branch/head cursor for a session.
+func (s *Store) LoadSessionState(_ context.Context, session model.SessionID) (store.SessionState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	started, err := s.loadSessionStarted(session)
+	if err != nil {
+		return store.SessionState{}, err
+	}
+	runtime, err := s.loadRuntimeAttached(session)
+	if err != nil {
+		return store.SessionState{}, err
+	}
+	config, err := s.loadRuntimeConfigLocked(runtime.RuntimeHash)
+	if err != nil {
+		return store.SessionState{}, err
+	}
+
+	state := store.SessionState{
+		Session:       session,
+		Branch:        started.RootBranch,
+		RuntimeHash:   runtime.RuntimeHash,
+		RuntimeConfig: config,
+	}
+	for _, e := range s.facts {
+		if e.session != session {
+			continue
+		}
+		switch f := e.fact.(type) {
+		case model.HeadMoved:
+			state.Branch = f.Branch
+			state.Head = f.Next
+		case model.RestoreCompleted:
+			if f.TargetCell == "" {
+				continue
+			}
+			if f.NewBranch != "" {
+				state.Branch = f.NewBranch
+				state.Head = f.TargetCell
+				continue
+			}
+			branch, err := s.branchForCell(session, f.TargetCell)
+			if err != nil {
+				return store.SessionState{}, err
+			}
+			state.Branch = branch
+			state.Head = f.TargetCell
+		}
+	}
+	return state, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +331,20 @@ func (s *Store) loadManifestAttached(session model.SessionID) (model.ManifestAtt
 	return model.ManifestAttached{}, fmt.Errorf("mem: loadManifestAttached: no manifest for session %q", session)
 }
 
+func (s *Store) loadSessionStarted(session model.SessionID) (model.SessionStarted, error) {
+	for _, e := range s.facts {
+		if e.session != session || e.factType != model.FactTypeSessionStarted {
+			continue
+		}
+		f, ok := e.fact.(model.SessionStarted)
+		if !ok {
+			continue
+		}
+		return f, nil
+	}
+	return model.SessionStarted{}, fmt.Errorf("mem: loadSessionStarted: no session %q", session)
+}
+
 // loadRuntimeAttached returns the first RuntimeAttached fact for the given
 // session. Must be called with s.mu held.
 func (s *Store) loadRuntimeAttached(session model.SessionID) (model.RuntimeAttached, error) {
@@ -292,6 +359,17 @@ func (s *Store) loadRuntimeAttached(session model.SessionID) (model.RuntimeAttac
 		return f, nil
 	}
 	return model.RuntimeAttached{}, nil
+}
+
+func (s *Store) loadRuntimeConfigLocked(hash string) (json.RawMessage, error) {
+	if hash == "" {
+		return nil, nil
+	}
+	config, ok := s.runtimeConfigs[hash]
+	if !ok {
+		return nil, fmt.Errorf("mem: LoadRuntimeConfig: runtime hash %q not found", hash)
+	}
+	return append(json.RawMessage(nil), config...), nil
 }
 
 // loadManifest returns the manifest from the first ManifestAttached fact for
