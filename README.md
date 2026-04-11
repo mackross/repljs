@@ -22,12 +22,17 @@ project.
 
 ### Submit semantics
 
-- `Submit(...)` blocks until the cell result and tracked async work created by that cell have settled.
+- `Submit(...)` is the JavaScript convenience path.
+- `SubmitCell(...)` is the structured API and lets callers choose `js` vs `ts` per cell.
+- `Submit(...)` / `SubmitCell(...)` block until the cell result and tracked async work created by that cell have settled.
 - Failed submit returns a typed `*engine.SubmitFailure` with linked effect summaries for the effects started by that cell.
 - Successful submit returns a `CompletionValue` handle, and callers can use `Inspect(...)` to obtain richer renderings.
 - Each committed cell also has a branch-local monotonic index in addition to its durable UUID.
   - UUID remains the durable identity.
   - The index is the low-token, branch-visible position used for REPL conveniences.
+- TypeScript is optional and lazy.
+  - If a TS frontend is configured, the first `ts` cell creates it on demand.
+  - Replay/open/restore execute stored emitted JS and do not require a live TS checker.
 
 ### REPL convenience bindings
 
@@ -50,13 +55,15 @@ project.
 ### Top-level REPL input
 
 - One-line REPL input treats a top-level object literal like an expression. For example, entering `{ a: "hello" }` is rewritten so it evaluates as an object literal instead of a block statement with a labeled expression.
-- Top-level `await` is also rewritten for REPL convenience.
-- Top-level-await support is not full JavaScript module semantics. The runtime uses a wrapper transform with some restrictions. See tests around top-level await for the current edge cases.
+- All cells run through the same internal async wrapper model. That is how top-level `await` works, and it also keeps completion behavior consistent across cells with and without `await`.
+- `cmd/repl` starts in `js` mode and supports `:ts` / `:js` to switch the default language for later submits.
+- Because every cell uses the wrapper model, some behavior now follows wrapped-function semantics rather than raw script semantics. See tests around top-level await and wrapped-cell behavior for the current edge cases.
 
 ### Inspection output
 
-- `Preview` is still the raw Goja string coercion of the completion value.
+- `Preview` is usually the raw Goja string coercion of the completion value.
   - Example: a plain object preview is usually `[object Object]`.
+  - Fulfilled promise completions are rendered from `jswire` as `Promise<...>` so they do not collapse into their settled value.
 - `Summary` is the low-token, shape-first rendering intended for embedders and LLMs.
 - `Full` is a richer but still bounded rendering.
 - `Summary` and `Full` are rendered from the durable `jswire` payload, not from a live VM walk.

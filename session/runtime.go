@@ -1172,12 +1172,12 @@ type evalResult struct {
 	// is nil.
 	structured []byte
 
-	// settledValue is the actual JS completion value and is used to rebuild
-	// REPL-managed bindings like `$last` and `$val(n)`.
-	settledValue goja.Value
+	// indexedValue is the actual JS value that should be rebound into REPL
+	// conveniences like `$last` and `$val(n)`.
+	indexedValue goja.Value
 
-	// hasSettledValue reports whether settledValue should be applied.
-	hasSettledValue bool
+	// hasIndexedValue reports whether indexedValue should be applied.
+	hasIndexedValue bool
 }
 
 // run evaluates src in the VM using a short default timeout suitable for
@@ -1204,21 +1204,11 @@ func (r *branchRuntime) runContext(ctx context.Context, src string) (evalResult,
 		}
 	}
 
-	if plan.Transformed {
-		r.topLevelAwait.beginCommit(plan.Declarations)
-		defer r.topLevelAwait.endCommit()
-	}
+	r.topLevelAwait.beginCommit(plan.Declarations)
+	defer r.topLevelAwait.endCommit()
 
 	r.loop.RunOnLoop(func(vm *goja.Runtime) {
-		var (
-			raw goja.Value
-			err error
-		)
-		if plan.Transformed {
-			raw, err = vm.RunProgram(plan.Program)
-		} else {
-			raw, err = vm.RunString(src)
-		}
+		raw, err := vm.RunProgram(plan.Program)
 		if err != nil {
 			deliver(outcome{err: fmt.Errorf("goja: %w", err)})
 			return
@@ -1229,7 +1219,7 @@ func (r *branchRuntime) runContext(ctx context.Context, src string) (evalResult,
 	select {
 	case out := <-resultCh:
 		if out.err == nil {
-			r.topLevelAwait.commitDeclarations(plan.Declarations, plan.Transformed)
+			r.topLevelAwait.commitDeclarations(plan.Declarations)
 		}
 		return out.res, out.err
 	case <-ctx.Done():
@@ -1244,8 +1234,8 @@ func (r *branchRuntime) setIndexedResult(index int, eval evalResult) error {
 	done := make(chan error, 1)
 	r.loop.RunOnLoop(func(vm *goja.Runtime) {
 		value := goja.Undefined()
-		if eval.hasSettledValue {
-			value = eval.settledValue
+		if eval.hasIndexedValue {
+			value = eval.indexedValue
 		}
 		if err := vm.Set("$last", value); err != nil {
 			done <- err
@@ -1271,14 +1261,12 @@ func (r *branchRuntime) settleValueAsync(v goja.Value, deliver func(outcome)) {
 	}
 	p, ok := v.Export().(*goja.Promise)
 	if !ok {
-		res, err := valueToEvalResult(v)
-		deliver(outcome{res: res, err: err})
+		r.finalizeCompletionValue(v, deliver)
 		return
 	}
 	switch p.State() {
 	case goja.PromiseStateFulfilled:
-		res, err := valueToEvalResult(p.Result())
-		deliver(outcome{res: res, err: err})
+		r.finalizeCompletionValue(p.Result(), deliver)
 	case goja.PromiseStateRejected:
 		reason := p.Result()
 		var preview string
@@ -1295,8 +1283,7 @@ func (r *branchRuntime) settleValueAsync(v goja.Value, deliver func(outcome)) {
 		}
 		_, err := then(obj,
 			r.vm.ToValue(func(call goja.FunctionCall) goja.Value {
-				res, err := valueToEvalResult(call.Argument(0))
-				deliver(outcome{res: res, err: err})
+				r.finalizeCompletionValue(call.Argument(0), deliver)
 				return goja.Undefined()
 			}),
 			r.vm.ToValue(func(call goja.FunctionCall) goja.Value {
@@ -1315,20 +1302,77 @@ func (r *branchRuntime) settleValueAsync(v goja.Value, deliver func(outcome)) {
 	}
 }
 
-func valueToEvalResult(val goja.Value) (evalResult, error) {
+func (r *branchRuntime) finalizeCompletionValue(v goja.Value, deliver func(outcome)) {
+	if committed, ok := unwrapInternalCompletionEnvelope(v); ok {
+		r.finalizeCommittedValue(committed, deliver)
+		return
+	}
+	res, err := valueToEvalResult(v, v)
+	deliver(outcome{res: res, err: err})
+}
+
+func (r *branchRuntime) finalizeCommittedValue(v goja.Value, deliver func(outcome)) {
+	if p, ok := exportedGojaPromise(v); ok {
+		switch p.State() {
+		case goja.PromiseStateFulfilled:
+			res, err := valueToEvalResult(v, v)
+			deliver(outcome{res: res, err: err})
+		case goja.PromiseStateRejected:
+			reason := p.Result()
+			var preview string
+			if reason != nil {
+				preview = reason.String()
+			}
+			deliver(outcome{err: fmt.Errorf("promise rejected: %s", preview)})
+		default:
+			obj := v.ToObject(r.vm)
+			then, ok := goja.AssertFunction(obj.Get("then"))
+			if !ok {
+				deliver(outcome{err: fmt.Errorf("promise still pending after evaluation")})
+				return
+			}
+			_, err := then(obj,
+				r.vm.ToValue(func(call goja.FunctionCall) goja.Value {
+					res, err := valueToEvalResult(v, v)
+					deliver(outcome{res: res, err: err})
+					return goja.Undefined()
+				}),
+				r.vm.ToValue(func(call goja.FunctionCall) goja.Value {
+					reason := call.Argument(0)
+					var preview string
+					if reason != nil {
+						preview = reason.String()
+					}
+					deliver(outcome{err: fmt.Errorf("promise rejected: %s", preview)})
+					return goja.Undefined()
+				}),
+			)
+			if err != nil {
+				deliver(outcome{err: fmt.Errorf("promise then: %w", err)})
+			}
+		}
+		return
+	}
+	res, err := valueToEvalResult(v, v)
+	deliver(outcome{res: res, err: err})
+}
+
+func valueToEvalResult(displayVal goja.Value, indexedVal goja.Value) (evalResult, error) {
 	out := evalResult{
-		settledValue:    val,
-		hasSettledValue: true,
+		indexedValue:    indexedVal,
+		hasIndexedValue: true,
 	}
 	var ref *model.ValueRef
 	var structured []byte
-	if val != nil && !goja.IsUndefined(val) && !goja.IsNull(val) {
+	if displayVal != nil && !goja.IsUndefined(displayVal) && !goja.IsNull(displayVal) {
+		typeHint := gojaTypeHint(displayVal)
+		preview := gojaValuePreview(displayVal)
 		ref = &model.ValueRef{
 			ID:       model.ValueID(uuid.NewString()),
-			Preview:  val.String(),
-			TypeHint: gojaTypeHint(val),
+			Preview:  preview,
+			TypeHint: typeHint,
 		}
-		if b, merr := jswire.EncodeGoja(val); merr == nil {
+		if b, merr := jswire.EncodeGoja(displayVal); merr == nil {
 			structured = b
 		}
 	}
@@ -1337,12 +1381,35 @@ func valueToEvalResult(val goja.Value) (evalResult, error) {
 	return out, nil
 }
 
+func gojaValuePreview(v goja.Value) string {
+	switch {
+	case v == nil:
+		return "undefined"
+	case goja.IsUndefined(v):
+		return "undefined"
+	case goja.IsNull(v):
+		return "null"
+	default:
+		return v.String()
+	}
+}
+
 // replayPlanIntoRuntime creates a fresh branchRuntime and replays every step in
 // plan into it, in order, using the same evaluation path as Submit. This
 // ensures a restored branch starts with exactly the bindings visible at the
 // restore target, and no bindings created after the fork point.
 func replayPlanIntoRuntime(ctx context.Context, plan store.ReplayPlan, rtCtx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate) (*branchRuntime, json.RawMessage, string, error) {
 	return replayPlanPrefixIntoRuntime(ctx, plan, len(plan.Steps), rtCtx, st, delegate)
+}
+
+func replaySourceForStep(step store.ReplayStep) string {
+	if step.Language == model.CellLanguageTypeScript {
+		return step.EmittedJS
+	}
+	if step.EmittedJS != "" {
+		return step.EmittedJS
+	}
+	return step.Source
 }
 
 func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, stepCount int, rtCtx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate) (*branchRuntime, json.RawMessage, string, error) {
@@ -1361,7 +1428,7 @@ func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, ste
 			rt.close()
 			return nil, nil, "", fmt.Errorf("prepare replay step %q: %w", step.Cell, err)
 		}
-		eval, err := rt.runContext(ctx, step.Source)
+		eval, err := rt.runContext(ctx, replaySourceForStep(step))
 		if err != nil {
 			_ = rt.finishReplayStep()
 			rt.close()
@@ -1384,6 +1451,13 @@ func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, ste
 
 // gojaTypeHint returns a simple TypeScript-style type name for a goja value.
 func gojaTypeHint(v goja.Value) string {
+	if promise, ok := exportedSettledGojaPromise(v); ok {
+		inner := gojaTypeHint(promise.Result())
+		if inner == "" {
+			inner = "unknown"
+		}
+		return "Promise<" + inner + ">"
+	}
 	switch v.ExportType() {
 	case nil:
 		return "undefined"
@@ -1399,6 +1473,45 @@ func gojaTypeHint(v goja.Value) string {
 			return "object"
 		}
 	}
+}
+
+func exportedGojaPromise(v goja.Value) (*goja.Promise, bool) {
+	if v == nil {
+		return nil, false
+	}
+	promise, ok := v.Export().(*goja.Promise)
+	if !ok || promise == nil {
+		return nil, false
+	}
+	return promise, true
+}
+
+func exportedSettledGojaPromise(v goja.Value) (*goja.Promise, bool) {
+	promise, ok := exportedGojaPromise(v)
+	if !ok {
+		return nil, false
+	}
+	if promise.State() != goja.PromiseStateFulfilled {
+		return nil, false
+	}
+	return promise, true
+}
+
+func isSettledGojaPromiseValue(v goja.Value) bool {
+	_, ok := exportedSettledGojaPromise(v)
+	return ok
+}
+
+func unwrapInternalCompletionEnvelope(v goja.Value) (goja.Value, bool) {
+	obj, ok := v.(*goja.Object)
+	if !ok || obj == nil {
+		return nil, false
+	}
+	brand := obj.Get(replInternalCompletionBrand)
+	if brand == nil || goja.IsUndefined(brand) || goja.IsNull(brand) || !brand.ToBoolean() {
+		return nil, false
+	}
+	return obj.Get("value"), true
 }
 
 type outcome struct {

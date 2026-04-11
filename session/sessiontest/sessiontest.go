@@ -28,23 +28,34 @@ type SubmitPair struct {
 }
 
 func StartComparableSessions(ctx context.Context, cfg model.SessionConfig, delegate engine.VMDelegate, runtimeConfig json.RawMessage) (*Harness, error) {
+	return StartComparableSessionsWithDeps(ctx, cfg, engine.SessionDeps{
+		VMDelegate:    delegate,
+		RuntimeConfig: runtimeConfig,
+	})
+}
+
+func StartComparableSessionsWithDeps(ctx context.Context, cfg model.SessionConfig, deps engine.SessionDeps) (*Harness, error) {
 	eng := session.New()
 
 	persistent, err := eng.StartSession(ctx, cfg, engine.SessionDeps{
-		Store:         memstore.New(),
-		VMDelegate:    delegate,
-		RuntimeConfig: runtimeConfig,
-		RuntimeMode:   engine.RuntimeModePersistent,
+		Store:                 memstore.New(),
+		VMDelegate:            deps.VMDelegate,
+		RuntimeConfig:         append(json.RawMessage(nil), deps.RuntimeConfig...),
+		RuntimeMode:           engine.RuntimeModePersistent,
+		TypeScriptFactory:     deps.TypeScriptFactory,
+		TypeScriptEnvProvider: deps.TypeScriptEnvProvider,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("start persistent session: %w", err)
 	}
 
 	replay, err := eng.StartSession(ctx, cfg, engine.SessionDeps{
-		Store:         memstore.New(),
-		VMDelegate:    delegate,
-		RuntimeConfig: runtimeConfig,
-		RuntimeMode:   engine.RuntimeModeReplayPerSubmit,
+		Store:                 memstore.New(),
+		VMDelegate:            deps.VMDelegate,
+		RuntimeConfig:         append(json.RawMessage(nil), deps.RuntimeConfig...),
+		RuntimeMode:           engine.RuntimeModeReplayPerSubmit,
+		TypeScriptFactory:     deps.TypeScriptFactory,
+		TypeScriptEnvProvider: deps.TypeScriptEnvProvider,
 	})
 	if err != nil {
 		_ = persistent.Close()
@@ -70,9 +81,13 @@ func (h *Harness) Close() error {
 }
 
 func (h *Harness) SubmitBoth(ctx context.Context, src string) (SubmitPair, error) {
+	return h.SubmitCellBoth(ctx, engine.SubmitInput{Source: src})
+}
+
+func (h *Harness) SubmitCellBoth(ctx context.Context, input engine.SubmitInput) (SubmitPair, error) {
 	var pair SubmitPair
 
-	pair.PersistentResult, pair.PersistentErr = h.Persistent.Submit(ctx, src)
+	pair.PersistentResult, pair.PersistentErr = h.Persistent.SubmitCell(ctx, input)
 	if pair.PersistentErr == nil && pair.PersistentResult.CompletionValue != nil {
 		view, err := h.Persistent.Inspect(ctx, pair.PersistentResult.CompletionValue.ID)
 		if err != nil {
@@ -81,7 +96,7 @@ func (h *Harness) SubmitBoth(ctx context.Context, src string) (SubmitPair, error
 		pair.PersistentView = &view
 	}
 
-	pair.ReplayResult, pair.ReplayErr = h.Replay.Submit(ctx, src)
+	pair.ReplayResult, pair.ReplayErr = h.Replay.SubmitCell(ctx, input)
 	if pair.ReplayErr == nil && pair.ReplayResult.CompletionValue != nil {
 		view, err := h.Replay.Inspect(ctx, pair.ReplayResult.CompletionValue.ID)
 		if err != nil {

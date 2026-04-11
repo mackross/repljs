@@ -56,6 +56,7 @@ const (
 	nodeRegexp
 	nodeArrayBuffer
 	nodeTypedArray
+	nodePromise
 	nodeError
 )
 
@@ -87,6 +88,7 @@ type wireNode struct {
 	Buffer     wireValue
 	ByteOffset uint32
 	ByteLength uint32
+	Promise    wireValue
 	Cause      wireValue
 }
 
@@ -339,6 +341,7 @@ func (e *quickEncoder) encodeValue(v *qjs.Value) (wireValue, error) {
 		}
 	default:
 		node.Kind = nodeObject
+		node.TextA = quickCustomObjectName(v)
 	}
 
 	if err := e.appendQuickEnumerableProps(v, &node); err != nil {
@@ -403,7 +406,19 @@ func (e *gojaEncoder) encodeValue(v goja.Value) (wireValue, error) {
 	case className == "Function":
 		return wireValue{}, fmt.Errorf("bridge: unsupported goja Function")
 	case gojaIsPromiseObject(obj, implName):
-		return wireValue{}, fmt.Errorf("bridge: unsupported goja Promise")
+		promise, ok := obj.Export().(*goja.Promise)
+		if !ok || promise == nil {
+			return wireValue{}, fmt.Errorf("bridge: unsupported goja Promise export %T", obj.Export())
+		}
+		if promise.State() != goja.PromiseStateFulfilled {
+			return wireValue{}, fmt.Errorf("bridge: unsupported goja Promise state %v", promise.State())
+		}
+		node.Kind = nodePromise
+		promiseValue, err := e.encodeValue(promise.Result())
+		if err != nil {
+			return wireValue{}, err
+		}
+		node.Promise = promiseValue
 	case className == "Array":
 		node.Kind = nodeArray
 		length := int(obj.Get("length").ToInteger())
@@ -495,6 +510,7 @@ func (e *gojaEncoder) encodeValue(v goja.Value) (wireValue, error) {
 		node.Cause = cause
 	default:
 		node.Kind = nodeObject
+		node.TextA = customObjectName(ctorName)
 	}
 
 	if err := e.appendGojaEnumerableProps(obj, &node); err != nil {
@@ -578,6 +594,8 @@ func (d *quickDecoder) allocate(nodes []wireNode) error {
 			}
 		case nodeArrayBuffer:
 			v = d.ctx.NewArrayBuffer(append([]byte(nil), node.Bytes...))
+		case nodePromise:
+			return fmt.Errorf("%w: quickjs promise decode not supported", ErrInvalidWire)
 		case nodeError:
 			if ctorName := quickBuiltinErrorConstructorName(node.TextA); ctorName != "" {
 				global := d.ctx.Global()
@@ -716,8 +734,9 @@ func (d *quickDecoder) decodeValue(v wireValue) (*qjs.Value, error) {
 }
 
 type gojaDecoder struct {
-	vm   *goja.Runtime
-	refs map[uint32]goja.Value
+	vm              *goja.Runtime
+	refs            map[uint32]goja.Value
+	promiseResolves map[uint32]func(interface{}) error
 }
 
 func (d *gojaDecoder) allocate(nodes []wireNode) error {
@@ -769,6 +788,13 @@ func (d *gojaDecoder) allocate(nodes []wireNode) error {
 			if err != nil {
 				return err
 			}
+		case nodePromise:
+			promise, resolve, _ := d.vm.NewPromise()
+			v = d.vm.ToValue(promise)
+			if d.promiseResolves == nil {
+				d.promiseResolves = make(map[uint32]func(interface{}) error)
+			}
+			d.promiseResolves[node.ID] = resolve
 		case nodeError:
 			ctorName := node.TextA
 			if ctorName == "" {
@@ -880,6 +906,18 @@ func (d *gojaDecoder) fill(nodes []wireNode) error {
 				if _, err := addFn(obj, val); err != nil {
 					return err
 				}
+			}
+		case nodePromise:
+			resolve := d.promiseResolves[node.ID]
+			if resolve == nil {
+				return fmt.Errorf("%w: missing promise resolver for ref %d", ErrInvalidWire, node.ID)
+			}
+			val, err := d.decodeValue(node.Promise)
+			if err != nil {
+				return err
+			}
+			if err := resolve(val); err != nil {
+				return err
 			}
 		case nodeError:
 			cause, err := d.decodeValue(node.Cause)
@@ -1029,6 +1067,24 @@ func gojaConstructorName(obj *goja.Object) string {
 	return name.String()
 }
 
+func quickCustomObjectName(v *qjs.Value) string {
+	ctor := v.GetPropertyStr("constructor")
+	defer ctor.Free()
+	if ctor.IsUndefined() || ctor.IsNull() || !ctor.IsFunction() {
+		return ""
+	}
+	name := ctor.GetPropertyStr("name")
+	defer name.Free()
+	return customObjectName(name.String())
+}
+
+func customObjectName(name string) string {
+	if name == "" || name == "Object" {
+		return ""
+	}
+	return name
+}
+
 func isGojaTypedArrayConstructor(name string) bool {
 	switch name {
 	case "Uint8Array", "Uint8ClampedArray", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array", "DataView":
@@ -1136,6 +1192,10 @@ func (e *quickEncoder) appendQuickEnumerableProps(v *qjs.Value, node *wireNode) 
 			return fmt.Errorf("bridge: unsupported quickjs accessor property %q", key)
 		}
 		prop := v.GetPropertyStr(key)
+		if prop.IsFunction() {
+			prop.Free()
+			continue
+		}
 		val, err := e.encodeValue(prop)
 		prop.Free()
 		if err != nil {
@@ -1162,7 +1222,11 @@ func (e *gojaEncoder) appendGojaEnumerableProps(obj *goja.Object, node *wireNode
 		if accessor {
 			return fmt.Errorf("bridge: unsupported goja accessor property %q", key)
 		}
-		val, err := e.encodeValue(obj.Get(key))
+		prop := obj.Get(key)
+		if gojaValueIsFunction(prop) {
+			continue
+		}
+		val, err := e.encodeValue(prop)
 		if err != nil {
 			return err
 		}
@@ -1215,6 +1279,11 @@ func gojaHasAccessorProperty(obj *goja.Object, key string) (bool, error) {
 		return false, nil
 	}
 	return gojaValuePropertyIsAccessor(prop), nil
+}
+
+func gojaValueIsFunction(v goja.Value) bool {
+	obj, ok := v.(*goja.Object)
+	return ok && obj.ClassName() == "Function"
 }
 
 func quickBuiltinErrorConstructorName(name string) string {
@@ -1488,6 +1557,10 @@ func validateWireNode(node wireNode, nodeByID map[uint32]wireNode) error {
 		if uint64(node.ByteOffset)+uint64(node.ByteLength) > uint64(len(bufferNode.Bytes)) {
 			return fmt.Errorf("%w: typed array window out of bounds", ErrInvalidWire)
 		}
+	case nodePromise:
+		if err := validateWireValue(node.Promise, nodeByID); err != nil {
+			return err
+		}
 	case nodeError:
 		if err := validateWireValue(node.Cause, nodeByID); err != nil {
 			return err
@@ -1615,6 +1688,7 @@ func sizeNode(n wireNode) int {
 	size := sizeU32(n.ID) + 1
 	switch n.Kind {
 	case nodeObject:
+		size += ord.String.Size(n.TextA)
 	case nodeArray:
 		size += sizeLen(len(n.Slots))
 		for _, slot := range n.Slots {
@@ -1644,6 +1718,8 @@ func sizeNode(n wireNode) int {
 		size += ord.ByteSlice.Size(n.Bytes)
 	case nodeTypedArray:
 		size += ord.String.Size(n.TextA) + sizeValue(n.Buffer) + sizeU32(n.ByteOffset) + sizeU32(n.ByteLength)
+	case nodePromise:
+		size += sizeValue(n.Promise)
 	case nodeError:
 		size += ord.String.Size(n.TextA) + ord.String.Size(n.TextB) + sizeValue(n.Cause)
 	}
@@ -1657,6 +1733,7 @@ func marshalNode(node wireNode, bs []byte) int {
 	n += varint.Byte.Marshal(byte(node.Kind), bs[n:])
 	switch node.Kind {
 	case nodeObject:
+		n += ord.String.Marshal(node.TextA, bs[n:])
 	case nodeArray:
 		n += marshalLen(len(node.Slots), bs[n:])
 		for _, slot := range node.Slots {
@@ -1699,6 +1776,8 @@ func marshalNode(node wireNode, bs []byte) int {
 		n += marshalValue(node.Buffer, bs[n:])
 		n += marshalU32(node.ByteOffset, bs[n:])
 		n += marshalU32(node.ByteLength, bs[n:])
+	case nodePromise:
+		n += marshalValue(node.Promise, bs[n:])
 	case nodeError:
 		n += ord.String.Marshal(node.TextA, bs[n:])
 		n += ord.String.Marshal(node.TextB, bs[n:])
@@ -1725,6 +1804,12 @@ func unmarshalNode(bs []byte) (wireNode, int, error) {
 	out.Kind = nodeKind(kind)
 	switch out.Kind {
 	case nodeObject:
+		name, m, err := ord.String.Unmarshal(bs[n:])
+		if err != nil {
+			return out, 0, err
+		}
+		n += m
+		out.TextA = name
 	case nodeArray:
 		count, m, err := unmarshalLen(bs[n:])
 		if err != nil {
@@ -1843,6 +1928,13 @@ func unmarshalNode(bs []byte) (wireNode, int, error) {
 		out.Buffer = buffer
 		out.ByteOffset = offset
 		out.ByteLength = length
+	case nodePromise:
+		promise, m, err := unmarshalValue(bs[n:])
+		if err != nil {
+			return out, 0, err
+		}
+		n += m
+		out.Promise = promise
 	case nodeError:
 		name, m, err := ord.String.Unmarshal(bs[n:])
 		if err != nil {

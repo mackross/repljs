@@ -126,10 +126,152 @@ func TestRun_TopLevelObjectLiteralIsTreatedAsExpression(t *testing.T) {
 
 	got := out.String()
 	if !strings.Contains(got, `completion.preview="[object Object]"`) {
-		t.Fatalf("run output should preserve object completion preview:\n%s", got)
+		t.Fatalf("run output should show raw object preview:\n%s", got)
 	}
 	if !strings.Contains(got, `completion.summary="{a: \"hello\"}"`) {
 		t.Fatalf("run output should summarize object literal, got:\n%s", got)
+	}
+}
+
+func TestRun_MultilineBlankSubmitDoesNotCreateCell(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":submit\n.end\n1\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if strings.Count(got, "ok cell=") != 1 {
+		t.Fatalf("blank multiline submit should not create a cell:\n%s", got)
+	}
+	if !strings.Contains(got, "cell.index=1") {
+		t.Fatalf("first real submit should still be index 1:\n%s", got)
+	}
+}
+
+func TestRun_ModeSwitchesBetweenJavaScriptAndTypeScript(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":ts\nconst typed: number = 1\n:js\ntyped + 1\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "mode=ts") || !strings.Contains(got, "mode=js") {
+		t.Fatalf("mode switch output missing:\n%s", got)
+	}
+	if !strings.Contains(got, "cell.language=ts") {
+		t.Fatalf("TS submit output missing language marker:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.preview="2"`) {
+		t.Fatalf("JS cell after TS mode should still see prior binding:\n%s", got)
+	}
+}
+
+func TestRun_TypeScriptModeSeesBuiltInRuntimeHelpers(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":ts\n1\nconsole.log($val(1), $last); const next = ($last as number) + ($val(1) as number); next\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if strings.Contains(got, "TS Err:") {
+		t.Fatalf("TS built-ins should be declared, output:\n%s", got)
+	}
+	if !strings.Contains(got, `log[0]=1 1`) {
+		t.Fatalf("console.log should accept TS-visible built-ins:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.preview="2"`) {
+		t.Fatalf("$last/$val should be usable in TS mode:\n%s", got)
+	}
+}
+
+func TestRun_TypeScriptModeBuiltInsAreAny(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":ts\n({ greet() { return 'hi' }, nested: { value: 2 } })\n$last.greet() + String($val(1).nested.value)\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if strings.Contains(got, "TS Err:") {
+		t.Fatalf("TS built-ins should allow direct property/method access:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.preview="hi2"`) {
+		t.Fatalf("expected raw string preview to work:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.summary="\"hi2\""`) {
+		t.Fatalf("expected direct any-style access to work:\n%s", got)
+	}
+}
+
+func TestRun_TypeScriptCheckFailurePrintsDiagnostics(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":ts\nconst typed: string = 1\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "submit error: TS Err:") {
+		t.Fatalf("missing TS submit error:\n%s", got)
+	}
+	if !strings.Contains(got, "cell.language=ts") {
+		t.Fatalf("missing TS cell language on error:\n%s", got)
+	}
+	if !strings.Contains(got, "diagnostics=1") {
+		t.Fatalf("missing diagnostic count:\n%s", got)
+	}
+	if !strings.Contains(got, `diagnostic[0].severity=error`) {
+		t.Fatalf("missing diagnostic severity:\n%s", got)
+	}
+	if !strings.Contains(got, `diagnostic[0].location=1:`) {
+		t.Fatalf("missing diagnostic location:\n%s", got)
+	}
+	if !strings.Contains(got, `Type 'number' is not assignable to type 'string'`) {
+		t.Fatalf("missing diagnostic message:\n%s", got)
+	}
+	if strings.Contains(got, "cell.index=") {
+		t.Fatalf("TS check failures should not claim a committed branch index:\n%s", got)
+	}
+}
+
+func TestRun_TypeScriptModeAllowsTopLevelAwaitOnBuiltIns(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":ts\nPromise.resolve(7)\nawait $last\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if strings.Contains(got, "TS Err:") {
+		t.Fatalf("top-level await should typecheck in TS mode:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.preview="7"`) {
+		t.Fatalf("await $last should resolve previous promise value:\n%s", got)
+	}
+}
+
+func TestRun_TypeScriptModeTypeAliasThenTypedValueThenReadField(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":ts\ntype User = { name: string, age: number }\nconst user: User = { name: \"Ada\", age: 36 }\nuser.age\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if strings.Contains(got, "TS Err:") {
+		t.Fatalf("type-only TS cell and subsequent typed cells should submit cleanly:\n%s", got)
+	}
+	if strings.Count(got, "ok cell=") != 3 {
+		t.Fatalf("expected three successful cells:\n%s", got)
+	}
+	if !strings.Contains(got, "cell.index=1") || !strings.Contains(got, "cell.index=2") || !strings.Contains(got, "cell.index=3") {
+		t.Fatalf("expected three committed indices:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.preview="36"`) {
+		t.Fatalf("third cell should evaluate user.age to 36:\n%s", got)
 	}
 }
 

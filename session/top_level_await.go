@@ -3,7 +3,6 @@ package session
 import (
 	"fmt"
 	"reflect"
-	"strings"
 	"sync"
 	"unsafe"
 
@@ -14,6 +13,7 @@ import (
 )
 
 const replInternalCommitName = "__repljs_internal_commit__"
+const replInternalCompletionBrand = "__repljs_internal_completion__"
 
 type topLevelDeclaration struct {
 	Name string
@@ -21,16 +21,13 @@ type topLevelDeclaration struct {
 }
 
 type committedTopLevelDeclaration struct {
-	LexicalKind        string
-	LexicalTransformed bool
-	VarLikeKind        string
-	VarLikeTransformed bool
+	LexicalKind string
+	VarLikeKind string
 }
 
 type topLevelAwaitPlan struct {
 	Declarations []topLevelDeclaration
 	Program      *goja.Program
-	Transformed  bool
 }
 
 type topLevelAwaitState struct {
@@ -66,11 +63,11 @@ func declarationIsVarLike(kind string) bool {
 func redeclarationUnsupportedMessage(name, kind string) string {
 	switch kind {
 	case "function":
-		return fmt.Sprintf("top-level name %q is already defined in this session; re-declaring it with `function` after a prior top-level-await declaration is not supported here. If you meant to replace it, assign a new function value instead, e.g. `%s = function () { ... }`.", name, name)
+		return fmt.Sprintf("top-level name %q is already defined in this session; re-declaring it with `function` is not supported here. If you meant to replace it, assign a new function value instead, e.g. `%s = function () { ... }`.", name, name)
 	case "var":
 		fallthrough
 	default:
-		return fmt.Sprintf("top-level name %q is already defined in this session; re-declaring it with `%s` after a prior top-level-await declaration is not supported here. If you meant to overwrite the value, use `%s = ...` instead.", name, kind, name)
+		return fmt.Sprintf("top-level name %q is already defined in this session; re-declaring it with `%s` is not supported here. If you meant to overwrite the value, use `%s = ...` instead.", name, kind, name)
 	}
 }
 
@@ -84,7 +81,7 @@ func (d committedTopLevelDeclaration) conflictKind() string {
 	return "declaration"
 }
 
-func (s *topLevelAwaitState) validateRedeclarations(decls []topLevelDeclaration, currentTransformed bool) error {
+func (s *topLevelAwaitState) validateRedeclarations(decls []topLevelDeclaration) error {
 	if len(decls) == 0 {
 		return nil
 	}
@@ -96,9 +93,6 @@ func (s *topLevelAwaitState) validateRedeclarations(decls []topLevelDeclaration,
 			continue
 		}
 		if declarationIsVarLike(decl.Kind) {
-			if !currentTransformed && prev.VarLikeTransformed {
-				return fmt.Errorf("%s", redeclarationUnsupportedMessage(decl.Name, decl.Kind))
-			}
 			if prev.LexicalKind != "" {
 				return fmt.Errorf("top-level declaration %q (%s) conflicts with prior committed %s", decl.Name, decl.Kind, prev.LexicalKind)
 			}
@@ -111,7 +105,7 @@ func (s *topLevelAwaitState) validateRedeclarations(decls []topLevelDeclaration,
 	return nil
 }
 
-func (s *topLevelAwaitState) commitDeclarations(decls []topLevelDeclaration, transformed bool) {
+func (s *topLevelAwaitState) commitDeclarations(decls []topLevelDeclaration) {
 	if len(decls) == 0 {
 		return
 	}
@@ -121,10 +115,8 @@ func (s *topLevelAwaitState) commitDeclarations(decls []topLevelDeclaration, tra
 		entry := s.committed[decl.Name]
 		if declarationIsVarLike(decl.Kind) {
 			entry.VarLikeKind = decl.Kind
-			entry.VarLikeTransformed = transformed
 		} else {
 			entry.LexicalKind = decl.Kind
-			entry.LexicalTransformed = transformed
 		}
 		s.committed[decl.Name] = entry
 	}
@@ -170,75 +162,53 @@ func (s *topLevelAwaitState) pendingCommit() *topLevelAwaitCommitState {
 func (s *topLevelAwaitState) commit(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 	pending := s.pendingCommit()
 	if pending == nil {
-		panicJSError(rt, "Error", "internal commit hook called without pending top-level await state")
+		panicJSError(rt, "Error", "internal wrapped-cell commit hook called without pending state")
 	}
 	if len(pending.allowed) > 0 {
 		if err := promoteCurrentWrapperStash(rt, pending.allowed, pending.varLike); err != nil {
 			panicJSError(rt, "Error", "%v", err)
 		}
 	}
-	if len(call.Arguments) == 0 {
-		return goja.Undefined()
+	envelope := rt.NewObject()
+	if err := envelope.Set(replInternalCompletionBrand, true); err != nil {
+		panicJSError(rt, "Error", "%v", err)
 	}
-	return call.Argument(0)
+	value := goja.Undefined()
+	if len(call.Arguments) > 0 {
+		value = call.Argument(0)
+	}
+	if err := envelope.Set("value", value); err != nil {
+		panicJSError(rt, "Error", "%v", err)
+	}
+	return envelope
 }
 
 func buildTopLevelAwaitPlan(src string, redecls *topLevelAwaitState) (topLevelAwaitPlan, error) {
-	rawPrg, rawErr := goja.Parse("cell.js", src)
-	if rawErr == nil {
-		decls := collectTopLevelDeclarations(rawPrg.Body)
-		if redecls != nil {
-			if err := redecls.validateRedeclarations(decls, false); err != nil {
-				return topLevelAwaitPlan{}, err
-			}
-		}
-		return topLevelAwaitPlan{Declarations: decls}, nil
-	}
-
-	if hintErr := unsupportedTopLevelAwaitSyntaxError(src); hintErr != nil {
-		return topLevelAwaitPlan{}, hintErr
-	}
-
-	transformed, decls, ok, err := compileTopLevelAwaitCell(src)
+	transformed, decls, err := compileWrappedCell(src)
 	if err != nil {
 		return topLevelAwaitPlan{}, err
 	}
-	if !ok {
-		return topLevelAwaitPlan{}, rawErr
-	}
 	if redecls != nil {
-		if err := redecls.validateRedeclarations(decls, true); err != nil {
+		if err := redecls.validateRedeclarations(decls); err != nil {
 			return topLevelAwaitPlan{}, err
 		}
 	}
-	return topLevelAwaitPlan{Declarations: decls, Program: transformed, Transformed: true}, nil
+	return topLevelAwaitPlan{Declarations: decls, Program: transformed}, nil
 }
 
-func compileTopLevelAwaitCell(src string) (*goja.Program, []topLevelDeclaration, bool, error) {
+func compileWrappedCell(src string) (*goja.Program, []topLevelDeclaration, error) {
 	wrapped := "(async function __repljs_cell__(){\n" + src + "\nreturn " + replInternalCommitName + "(void 0);\n})()"
 	prg, err := goja.Parse("cell.js", wrapped)
 	if err != nil {
-		return nil, nil, false, nil
+		return nil, nil, err
 	}
 
 	fn, err := locateWrappedAsyncCell(prg)
 	if err != nil {
-		return nil, nil, false, err
-	}
-	if len(fn.Body.List) == 0 {
-		return nil, nil, false, nil
+		return nil, nil, err
 	}
 
 	userStatements := append([]jsast.Statement(nil), fn.Body.List[:len(fn.Body.List)-1]...)
-	if containsTopLevelReturn(userStatements) {
-		return nil, nil, false, nil
-	}
-	if !containsTopLevelAwait(userStatements) {
-		return nil, nil, false, nil
-	}
-	if err := unsupportedTransformedCellSemantics(userStatements); err != nil {
-		return nil, nil, false, err
-	}
 
 	decls := collectTopLevelDeclarations(userStatements)
 	completionName := chooseInternalName(decls, "__repljs_completion__")
@@ -247,29 +217,9 @@ func compileTopLevelAwaitCell(src string) (*goja.Program, []topLevelDeclaration,
 
 	compiled, err := goja.CompileAST(prg, false)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, err
 	}
-	return compiled, decls, true, nil
-}
-
-func unsupportedTopLevelAwaitSyntaxError(src string) error {
-	if strings.Contains(src, "for await") {
-		return fmt.Errorf("top-level await does not support 'for await...of' in this REPL yet; for example: `for (const item of items) { const value = await item; /* body using value */ }`")
-	}
-	return nil
-}
-
-func unsupportedTransformedCellSemantics(stmts []jsast.Statement) error {
-	if hasTopLevelUseStrictDirective(stmts) {
-		return fmt.Errorf("top-level await cells do not support a top-level \"use strict\" directive in this REPL")
-	}
-	if containsEvalAnywhere(stmts) {
-		return fmt.Errorf("eval is not supported in top-level await cells because the REPL runs them inside an async wrapper, which changes eval scope semantics")
-	}
-	if containsTopLevelThis(stmts) {
-		return fmt.Errorf("top-level `this` is not supported in top-level await cells in this REPL; use globalThis instead")
-	}
-	return nil
+	return compiled, decls, nil
 }
 
 func hasTopLevelUseStrictDirective(stmts []jsast.Statement) bool {

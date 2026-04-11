@@ -480,7 +480,6 @@ func TestEncodeQuickJS_UnsupportedValues(t *testing.T) {
 		{name: "FunctionValue", expr: `(function nope() {})`},
 		{name: "SymbolValue", expr: `Symbol("sym")`},
 		{name: "PromiseValue", expr: `({ p: new Promise(() => {}) })`},
-		{name: "ObjectContainingFunction", expr: `({ fn() {} })`},
 	}
 
 	for _, tt := range tests {
@@ -505,8 +504,8 @@ func TestEncodeGoja_UnsupportedValues(t *testing.T) {
 	}{
 		{name: "FunctionValue", expr: `(function nope() {})`},
 		{name: "SymbolValue", expr: `Symbol("sym")`},
-		{name: "PromiseValue", expr: `Promise.resolve(1)`},
-		{name: "ObjectContainingFunction", expr: `({ fn() {} })`},
+		{name: "PendingPromiseValue", expr: `new Promise(() => {})`},
+		{name: "RejectedPromiseValue", expr: `Promise.reject(1)`},
 	}
 
 	for _, tt := range tests {
@@ -519,6 +518,144 @@ func TestEncodeGoja_UnsupportedValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEncodeGoja_FulfilledPromise(t *testing.T) {
+	vm := mustNewGoja(t)
+	loadGojaSnapshot(t, vm)
+	value := evalGoja(t, vm, `Promise.resolve({ answer: 42 })`)
+
+	wire, err := EncodeGoja(value)
+	if err != nil {
+		t.Fatalf("EncodeGoja() error = %v", err)
+	}
+
+	inspection, err := Describe(wire)
+	if err != nil {
+		t.Fatalf("Describe() error = %v", err)
+	}
+	if got, want := inspection.Summary, `Promise<{answer: 42}>`; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+
+	decoded, err := DecodeGoja(vm, wire)
+	if err != nil {
+		t.Fatalf("DecodeGoja() error = %v", err)
+	}
+	promise, ok := decoded.Export().(*goja.Promise)
+	if !ok || promise == nil {
+		t.Fatalf("decoded export = %T, want *goja.Promise", decoded.Export())
+	}
+	if promise.State() != goja.PromiseStateFulfilled {
+		t.Fatalf("promise state = %v, want fulfilled", promise.State())
+	}
+	got := snapshotGojaValue(t, vm, promise.Result())
+	want := snapshotGojaValue(t, vm, evalGoja(t, vm, `({ answer: 42 })`))
+	assertDeepEqual(t, "fulfilled promise result", want, got)
+}
+
+func TestEncodeQuickJS_SkipsEnumerableMethodProps(t *testing.T) {
+	quickRuntime := mustNewQuickJS(t)
+	defer quickRuntime.Close()
+
+	value := evalQuickJS(t, quickRuntime, `({
+		ok: true,
+		status: 200,
+		text() { return "body"; },
+		json() { return { ok: true }; }
+	})`)
+	defer value.Free()
+
+	wire, err := EncodeQuickJS(value)
+	if err != nil {
+		t.Fatalf("EncodeQuickJS() error = %v", err)
+	}
+
+	inspection, err := Describe(wire)
+	if err != nil {
+		t.Fatalf("Describe() error = %v", err)
+	}
+	if got, want := inspection.Summary, `{ok: true, status: 200}`; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	if got, want := inspection.Full, `{ok: true, status: 200}`; got != want {
+		t.Fatalf("full = %q, want %q", got, want)
+	}
+}
+
+func TestEncodeQuickJS_ShowsCustomClassName(t *testing.T) {
+	quickRuntime := mustNewQuickJS(t)
+	defer quickRuntime.Close()
+
+	value := evalQuickJS(t, quickRuntime, `(() => {
+		class FetchResult {
+			constructor() {
+				this.ok = true;
+				this.status = 200;
+			}
+			text() { return "body"; }
+		}
+		return new FetchResult();
+	})()`)
+	defer value.Free()
+
+	wire, err := EncodeQuickJS(value)
+	if err != nil {
+		t.Fatalf("EncodeQuickJS() error = %v", err)
+	}
+
+	inspection, err := Describe(wire)
+	if err != nil {
+		t.Fatalf("Describe() error = %v", err)
+	}
+	if got, want := inspection.Summary, `FetchResult {ok: true, status: 200}`; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	if got, want := inspection.Full, `FetchResult {ok: true, status: 200}`; got != want {
+		t.Fatalf("full = %q, want %q", got, want)
+	}
+}
+
+func TestEncodeGoja_FulfilledPromiseSkipsEnumerableMethodProps(t *testing.T) {
+	vm := mustNewGoja(t)
+	loadGojaSnapshot(t, vm)
+	value := evalGoja(t, vm, `Promise.resolve({
+		ok: true,
+		status: 200,
+		text() { return "body"; },
+		json() { return { ok: true }; }
+	})`)
+
+	wire, err := EncodeGoja(value)
+	if err != nil {
+		t.Fatalf("EncodeGoja() error = %v", err)
+	}
+
+	inspection, err := Describe(wire)
+	if err != nil {
+		t.Fatalf("Describe() error = %v", err)
+	}
+	if got, want := inspection.Summary, `Promise<{ok: true, status: 200}>`; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	if got, want := inspection.Full, `Promise<{ok: true, status: 200}>`; got != want {
+		t.Fatalf("full = %q, want %q", got, want)
+	}
+
+	decoded, err := DecodeGoja(vm, wire)
+	if err != nil {
+		t.Fatalf("DecodeGoja() error = %v", err)
+	}
+	promise, ok := decoded.Export().(*goja.Promise)
+	if !ok || promise == nil {
+		t.Fatalf("decoded export = %T, want *goja.Promise", decoded.Export())
+	}
+	if promise.State() != goja.PromiseStateFulfilled {
+		t.Fatalf("promise state = %v, want fulfilled", promise.State())
+	}
+	got := snapshotGojaValue(t, vm, promise.Result())
+	want := snapshotGojaValue(t, vm, evalGoja(t, vm, `({ ok: true, status: 200 })`))
+	assertDeepEqual(t, "fulfilled promise result without methods", want, got)
 }
 
 func TestWireGraphTypedArrayRoundTrip(t *testing.T) {

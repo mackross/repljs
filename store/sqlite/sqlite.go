@@ -786,12 +786,13 @@ func (s *Store) buildReplaySteps(ctx context.Context, session model.SessionID, b
 
 	var steps []store.ReplayStep
 	for i, cell := range cellIDs {
-		src, emitted, effects, err := s.loadCellDetails(ctx, session, branchIDs[i], cell)
+		language, src, emitted, effects, err := s.loadCellDetails(ctx, session, branchIDs[i], cell)
 		if err != nil {
 			return nil, err
 		}
 		steps = append(steps, store.ReplayStep{
 			Cell:      cell,
+			Language:  language,
 			Source:    src,
 			EmittedJS: emitted,
 			Effects:   effects,
@@ -800,9 +801,9 @@ func (s *Store) buildReplaySteps(ctx context.Context, session model.SessionID, b
 	return steps, nil
 }
 
-// loadCellDetails fetches the source, emitted JS, and linked effects for one
+// loadCellDetails fetches the language, source, emitted JS, and linked effects for one
 // committed cell.
-func (s *Store) loadCellDetails(ctx context.Context, session model.SessionID, branch model.BranchID, cell model.CellID) (src, emittedJS string, effects []model.EffectID, err error) {
+func (s *Store) loadCellDetails(ctx context.Context, session model.SessionID, branch model.BranchID, cell model.CellID) (language model.CellLanguage, src, emittedJS string, effects []model.EffectID, err error) {
 	// Source and emittedJS from the most recent CellChecked fact.
 	const checkedQ = `
 SELECT payload FROM facts
@@ -812,13 +813,14 @@ ORDER BY id DESC LIMIT 1`
 	row := s.db.QueryRowContext(ctx, checkedQ, string(session), string(branch), string(cell), model.FactTypeCellChecked)
 	var payload string
 	if err = row.Scan(&payload); err != nil && err != sql.ErrNoRows {
-		return "", "", nil, fmt.Errorf("sqlite: loadCellDetails CellChecked scan: %w", err)
+		return "", "", "", nil, fmt.Errorf("sqlite: loadCellDetails CellChecked scan: %w", err)
 	}
 	if err == nil {
 		var f model.CellChecked
 		if err = json.Unmarshal([]byte(payload), &f); err != nil {
-			return "", "", nil, fmt.Errorf("sqlite: loadCellDetails CellChecked decode: %w", err)
+			return "", "", "", nil, fmt.Errorf("sqlite: loadCellDetails CellChecked decode: %w", err)
 		}
+		language = f.Language
 		src = f.Source
 		emittedJS = f.EmittedJS
 	}
@@ -832,18 +834,18 @@ ORDER BY id DESC LIMIT 1`
 	row2 := s.db.QueryRowContext(ctx, evalQ, string(session), string(branch), string(cell), model.FactTypeCellEvaluated)
 	var payload2 string
 	if err = row2.Scan(&payload2); err != nil && err != sql.ErrNoRows {
-		return "", "", nil, fmt.Errorf("sqlite: loadCellDetails CellEvaluated scan: %w", err)
+		return "", "", "", nil, fmt.Errorf("sqlite: loadCellDetails CellEvaluated scan: %w", err)
 	}
 	if err == nil {
 		var f model.CellEvaluated
 		if err = json.Unmarshal([]byte(payload2), &f); err != nil {
-			return "", "", nil, fmt.Errorf("sqlite: loadCellDetails CellEvaluated decode: %w", err)
+			return "", "", "", nil, fmt.Errorf("sqlite: loadCellDetails CellEvaluated decode: %w", err)
 		}
 		effects = f.LinkedEffects
 	}
 
 	err = nil // reset ErrNoRows
-	return src, emittedJS, effects, nil
+	return language, src, emittedJS, effects, nil
 }
 
 // buildReplayDecisions collects ReplayDecision entries for all effects

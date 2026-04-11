@@ -34,19 +34,25 @@ func requireGojaException(t *testing.T, vm *goja.Runtime, err error) *goja.Excep
 
 func requireErrorNameMessage(t *testing.T, vm *goja.Runtime, err error, wantName string, wantMessage string) {
 	t.Helper()
-	ex := requireGojaException(t, vm, err)
-	obj := ex.Value().ToObject(vm)
-	if got := obj.Get("name").String(); got != wantName {
-		t.Fatalf("error name = %q, want %q", got, wantName)
+	var ex *goja.Exception
+	if errors.As(err, &ex) {
+		obj := ex.Value().ToObject(vm)
+		if got := obj.Get("name").String(); got != wantName {
+			t.Fatalf("error name = %q, want %q", got, wantName)
+		}
+		if got := obj.Get("message").String(); got != wantMessage {
+			t.Fatalf("error message = %q, want %q", got, wantMessage)
+		}
+		return
 	}
-	if got := obj.Get("message").String(); got != wantMessage {
-		t.Fatalf("error message = %q, want %q", got, wantMessage)
+	want := "promise rejected: " + wantName + ": " + wantMessage
+	if got := err.Error(); got != want {
+		t.Fatalf("error = %q, want %q", got, want)
 	}
 }
 
 // TestBranchRuntime_FulfilledAsyncIIFE verifies that a simple async IIFE that
-// returns a primitive is settled by run() and its preview reflects the settled
-// value, not "[object Promise]".
+// returns a primitive is settled by run() while keeping the raw promise preview.
 func TestBranchRuntime_FulfilledAsyncIIFE(t *testing.T) {
 	rt := mustNewBranchRuntime(t)
 	res, err := rt.run(`(async () => 42)()`)
@@ -56,11 +62,11 @@ func TestBranchRuntime_FulfilledAsyncIIFE(t *testing.T) {
 	if res.completionValue == nil {
 		t.Fatal("expected a completionValue, got nil")
 	}
-	if res.completionValue.Preview != "42" {
-		t.Errorf("expected preview %q, got %q", "42", res.completionValue.Preview)
+	if res.completionValue.Preview != "[object Promise]" {
+		t.Errorf("expected preview %q, got %q", "[object Promise]", res.completionValue.Preview)
 	}
-	if res.completionValue.TypeHint != "number" {
-		t.Errorf("expected type hint %q, got %q", "number", res.completionValue.TypeHint)
+	if res.completionValue.TypeHint != "Promise<number>" {
+		t.Errorf("expected type hint %q, got %q", "Promise<number>", res.completionValue.TypeHint)
 	}
 	if res.structured == nil {
 		t.Fatal("expected structured bytes, got nil")
@@ -69,8 +75,12 @@ func TestBranchRuntime_FulfilledAsyncIIFE(t *testing.T) {
 	if err != nil {
 		t.Fatalf("structured bytes are not valid bridge payload: %v", err)
 	}
-	if exported := got.Export(); exported != int64(42) {
-		t.Fatalf("structured decoded value = %#v, want 42", exported)
+	promise, ok := got.Export().(*goja.Promise)
+	if !ok || promise == nil {
+		t.Fatalf("structured decoded value = %#v, want fulfilled promise", got.Export())
+	}
+	if promise.State() != goja.PromiseStateFulfilled || promise.Result().Export() != int64(42) {
+		t.Fatalf("structured decoded promise = %#v, want fulfilled 42", promise)
 	}
 }
 
@@ -85,11 +95,11 @@ func TestBranchRuntime_AwaitedPromiseChain(t *testing.T) {
 	if res.completionValue == nil {
 		t.Fatal("expected completionValue, got nil")
 	}
-	if res.completionValue.Preview != "hello" {
-		t.Errorf("expected preview %q, got %q", "hello", res.completionValue.Preview)
+	if res.completionValue.Preview != `[object Promise]` {
+		t.Errorf("expected preview %q, got %q", `[object Promise]`, res.completionValue.Preview)
 	}
-	if res.completionValue.TypeHint != "string" {
-		t.Errorf("expected type hint %q, got %q", "string", res.completionValue.TypeHint)
+	if res.completionValue.TypeHint != "Promise<string>" {
+		t.Errorf("expected type hint %q, got %q", "Promise<string>", res.completionValue.TypeHint)
 	}
 	if res.structured == nil {
 		t.Fatal("expected structured bytes, got nil")
@@ -242,7 +252,11 @@ func TestBranchRuntime_AsyncReturnsObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("structured bytes are not valid bridge object: %v", err)
 	}
-	got, _ := gotVal.Export().(map[string]interface{})
+	promise, ok := gotVal.Export().(*goja.Promise)
+	if !ok || promise == nil || promise.State() != goja.PromiseStateFulfilled {
+		t.Fatalf("structured decoded value = %#v, want fulfilled promise", gotVal.Export())
+	}
+	got, _ := promise.Result().Export().(map[string]interface{})
 	if got["x"] == nil || got["y"] == nil {
 		t.Errorf("expected x and y fields in structured output, got %v", got)
 	}

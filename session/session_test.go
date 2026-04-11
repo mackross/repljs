@@ -24,6 +24,7 @@ import (
 	"github.com/solidarity-ai/repl/session/sessiontest"
 	"github.com/solidarity-ai/repl/store"
 	memstore "github.com/solidarity-ai/repl/store/mem"
+	"github.com/solidarity-ai/repl/typescript"
 )
 
 // ---------------------------------------------------------------------------
@@ -140,6 +141,26 @@ func (d *runtimeHashDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext,
 		return nil, err
 	}
 	return d.returnedState, nil
+}
+
+type countingTSFactory struct {
+	count int32
+}
+
+func (f *countingTSFactory) NewSession(ctx context.Context) (typescript.Session, error) {
+	atomic.AddInt32(&f.count, 1)
+	return typescript.NewFactory().NewSession(ctx)
+}
+
+func (f *countingTSFactory) Count() int {
+	return int(atomic.LoadInt32(&f.count))
+}
+
+func submitTS(ctx context.Context, sess engine.Session, src string) (engine.SubmitResult, error) {
+	return sess.SubmitCell(ctx, engine.SubmitInput{
+		Source:   src,
+		Language: model.CellLanguageTypeScript,
+	})
 }
 
 // mustLoadHead calls LoadHead and fails the test on any error.
@@ -654,6 +675,22 @@ func decodeBridgeStructured(t *testing.T, raw []byte) any {
 		t.Fatalf("DecodeGoja: %v", err)
 	}
 	return decoded.Export()
+}
+
+func decodeBridgeStructuredFulfilledPromiseResult(t *testing.T, raw []byte) any {
+	t.Helper()
+	decoded, err := jswire.DecodeGoja(goja.New(), raw)
+	if err != nil {
+		t.Fatalf("DecodeGoja: %v", err)
+	}
+	promise, ok := decoded.Export().(*goja.Promise)
+	if !ok || promise == nil {
+		t.Fatalf("DecodeGoja export = %T, want *goja.Promise", decoded.Export())
+	}
+	if promise.State() != goja.PromiseStateFulfilled {
+		t.Fatalf("promise state = %v, want fulfilled", promise.State())
+	}
+	return promise.Result().Export()
 }
 
 func mustEncodeBridgeExpr(t *testing.T, expr string) []byte {
@@ -2534,7 +2571,7 @@ func TestSession_Submit_HostEffectsRoundTripBridgeTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	got, _ := decodeBridgeStructured(t, view.Structured).([]any)
+	got, _ := decodeBridgeStructuredFulfilledPromiseResult(t, view.Structured).([]any)
 	if len(got) != 2 || got[0] != true || got[1] != "2022-05-06T07:08:09.123Z" {
 		t.Fatalf("completion structured = %#v, want [true 2022-05-06T07:08:09.123Z]", got)
 	}
@@ -2579,16 +2616,72 @@ func TestSession_Submit_Async(t *testing.T) {
 	if r.CompletionValue == nil {
 		t.Fatal("expected CompletionValue for settled async IIFE")
 	}
-	if r.CompletionValue.Preview != "7" {
-		t.Errorf("async preview: want %q, got %q", "7", r.CompletionValue.Preview)
+	if r.CompletionValue.Preview != "[object Promise]" {
+		t.Errorf("async preview: want %q, got %q", "[object Promise]", r.CompletionValue.Preview)
+	}
+	if r.CompletionValue.TypeHint != "Promise<number>" {
+		t.Errorf("async type hint: want %q, got %q", "Promise<number>", r.CompletionValue.TypeHint)
 	}
 
 	view, err := sess.Inspect(ctx, r.CompletionValue.ID)
 	if err != nil {
 		t.Fatalf("Inspect after async: %v", err)
 	}
-	if view.Preview != "7" {
-		t.Errorf("view.Preview: want %q, got %q", "7", view.Preview)
+	if view.Preview != "[object Promise]" {
+		t.Errorf("view.Preview: want %q, got %q", "[object Promise]", view.Preview)
+	}
+	if view.Summary != "Promise<7>" {
+		t.Errorf("view.Summary: want %q, got %q", "Promise<7>", view.Summary)
+	}
+}
+
+func TestSession_Submit_AsyncLastValueIsFulfilledPromise(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, "(async () => 7)()"); err != nil {
+		t.Fatalf("Submit async: %v", err)
+	}
+
+	res, err := sess.Submit(ctx, "(async () => (await $last) + 1)()")
+	if err != nil {
+		t.Fatalf("Submit using $last promise: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "[object Promise]" {
+		t.Fatalf("completion = %+v, want raw promise preview", res.CompletionValue)
+	}
+}
+
+func TestSession_Submit_TopLevelAwaitDoesNotExposePromiseCompletion(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `await Promise.resolve(7)`)
+	if err != nil {
+		t.Fatalf("Submit top-level await: %v", err)
+	}
+	if res.CompletionValue == nil {
+		t.Fatal("expected completion value")
+	}
+	if got, want := res.CompletionValue.Preview, "7"; got != want {
+		t.Fatalf("preview = %q, want %q", got, want)
+	}
+	if got, want := res.CompletionValue.TypeHint, "number"; got != want {
+		t.Fatalf("type hint = %q, want %q", got, want)
 	}
 }
 
@@ -3521,7 +3614,7 @@ func TestSession_Submit_SingleAwaitChainedHostPromise(t *testing.T) {
 	if len(view.Structured) == 0 {
 		t.Fatal("expected structured value, got nil")
 	}
-	got, _ := decodeBridgeStructured(t, view.Structured).(map[string]any)
+	got, _ := decodeBridgeStructuredFulfilledPromiseResult(t, view.Structured).(map[string]any)
 	if got["value"] != "alpha" {
 		t.Fatalf("structured value = %v, want alpha", got["value"])
 	}
@@ -3566,6 +3659,17 @@ func TestSession_Submit_TimesOutOnPendingHostPromise(t *testing.T) {
 	}
 	if len(plan.Steps) != 1 || plan.Steps[0].Cell != r1.Cell {
 		t.Fatalf("expected only committed stable cell after timeout, got %v", plan.Steps)
+	}
+
+	r2, err := sess.Submit(context.Background(), `stable + 1`)
+	if err != nil {
+		t.Fatalf("Submit after timeout: %v", err)
+	}
+	if got, want := r2.Index, 2; got != want {
+		t.Fatalf("post-timeout committed index = %d, want %d", got, want)
+	}
+	if r2.CompletionValue == nil || r2.CompletionValue.Preview != "2" {
+		t.Fatalf("post-timeout completion = %+v, want preview 2", r2.CompletionValue)
 	}
 }
 
@@ -4015,7 +4119,7 @@ func TestSession_Submit_PromiseAllHostFnsRunConcurrently(t *testing.T) {
 	if len(view.Structured) == 0 {
 		t.Fatal("expected structured array result, got nil")
 	}
-	got, _ := decodeBridgeStructured(t, view.Structured).([]any)
+	got, _ := decodeBridgeStructuredFulfilledPromiseResult(t, view.Structured).([]any)
 	if len(got) != 2 || got[0] != "left" || got[1] != "right" {
 		t.Fatalf("Promise.all result = %v, want [left right]", got)
 	}
@@ -4886,21 +4990,22 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 			},
 		},
 		{
-			name: "top level strict mode is rejected in transformed cells",
+			name: "top level strict mode is allowed in wrapped cells",
 			steps: []topLevelAwaitAction{
-				expectTopLevelAwaitErrorContains(`"use strict"; await Promise.resolve(1)`, `top-level "use strict" directive`),
+				expectTopLevelAwaitPreview(`"use strict"; await Promise.resolve(1)`, "1"),
 			},
 		},
 		{
-			name: "eval anywhere in transformed cells is rejected",
+			name: "eval anywhere is allowed in wrapped cells",
 			steps: []topLevelAwaitAction{
-				expectTopLevelAwaitErrorContains(`await Promise.resolve(0); function later(){ return eval("1") }`, `eval is not supported`),
+				expectTopLevelAwaitNoCompletion(`await Promise.resolve(0); function later(){ return eval("1") }`),
+				expectTopLevelAwaitPreview(`later()`, "1"),
 			},
 		},
 		{
-			name: "top level this is rejected in transformed cells",
+			name: "top level this follows wrapped function semantics",
 			steps: []topLevelAwaitAction{
-				expectTopLevelAwaitErrorContains(`await Promise.resolve(0); this`, "top-level `this` is not supported"),
+				expectTopLevelAwaitPreview(`await Promise.resolve(0); typeof this`, "object"),
 			},
 		},
 		{
@@ -4911,17 +5016,17 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 			},
 		},
 		{
-			name: "for await of reports a rewrite hint",
+			name: "for await of still reports parser error",
 			steps: []topLevelAwaitAction{
-				expectTopLevelAwaitErrorContains(`let sum = 0; for await (const n of [1, 2, 3]) { sum += n }; sum`, "for example: `for (const item of items) { const value = await item; /* body using value */ }`"),
+				expectTopLevelAwaitErrorContains(`let sum = 0; for await (const n of [1, 2, 3]) { sum += n }; sum`, "Unexpected token await"),
 			},
 		},
 		{
-			name: "raw var redeclaration after transformed var declaration reports already defined",
+			name: "var redeclaration remains allowed in wrapped cells",
 			steps: []topLevelAwaitAction{
 				expectTopLevelAwaitNoCompletion(`var shared = await Promise.resolve(1)`),
-				expectTopLevelAwaitErrorContains(`var shared = 2`, `already defined in this session`),
-				expectTopLevelAwaitPreview(`shared`, "1"),
+				expectTopLevelAwaitNoCompletion(`var shared = 2`),
+				expectTopLevelAwaitPreview(`shared`, "2"),
 			},
 		},
 		{
@@ -4941,11 +5046,11 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 			},
 		},
 		{
-			name: "raw function redeclaration after transformed function declaration reports already defined",
+			name: "function redeclaration remains allowed in wrapped cells",
 			steps: []topLevelAwaitAction{
 				expectTopLevelAwaitPreview(`function shared(){ return 1 }; await Promise.resolve(0)`, "0"),
-				expectTopLevelAwaitErrorContains(`function shared(){ return 2 }`, `already defined in this session`),
-				expectTopLevelAwaitPreview(`typeof shared + ":" + String(shared())`, "function:1"),
+				expectTopLevelAwaitNoCompletion(`function shared(){ return 2 }`),
+				expectTopLevelAwaitPreview(`typeof shared + ":" + String(shared())`, "function:2"),
 			},
 		},
 		{
@@ -5205,5 +5310,286 @@ func TestSession_TopLevelAwaitRestoreForkParity(t *testing.T) {
 	yPair := submitTopLevelAwaitPair(t, ctx, h, `typeof y`)
 	if yPair.PersistentView == nil || yPair.PersistentView.Preview != "undefined" {
 		t.Fatalf("typeof y after restore: want %q, got %+v", "undefined", yPair.PersistentView)
+	}
+}
+
+func TestSession_SubmitCell_TypeScriptIsLazyAndPersistsEmittedJS(t *testing.T) {
+	ctx := context.Background()
+	fix := newRecordingFixture(t)
+	tsFactory := &countingTSFactory{}
+	fix.deps.TypeScriptFactory = tsFactory
+
+	eng := session.New()
+	sess, err := eng.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, "const jsOnly = 1"); err != nil {
+		t.Fatalf("Submit JS cell: %v", err)
+	}
+	if got := tsFactory.Count(); got != 0 {
+		t.Fatalf("TS factory count after JS cell = %d, want 0", got)
+	}
+
+	res, err := submitTS(ctx, sess, "const typed: number = jsOnly + 1; typed")
+	if err != nil {
+		t.Fatalf("Submit TS cell: %v", err)
+	}
+	if got := tsFactory.Count(); got != 1 {
+		t.Fatalf("TS factory count after TS cell = %d, want 1", got)
+	}
+	if res.Language != model.CellLanguageTypeScript {
+		t.Fatalf("SubmitResult language = %q, want %q", res.Language, model.CellLanguageTypeScript)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "2" {
+		t.Fatalf("completion = %+v, want preview 2", res.CompletionValue)
+	}
+
+	var checked model.CellChecked
+	found := false
+	for _, fact := range fix.st.Facts() {
+		cellChecked, ok := fact.(model.CellChecked)
+		if !ok || cellChecked.Cell != res.Cell {
+			continue
+		}
+		checked = cellChecked
+		found = true
+		break
+	}
+	if !found {
+		t.Fatalf("missing CellChecked fact for %q", res.Cell)
+	}
+	if checked.Language != model.CellLanguageTypeScript {
+		t.Fatalf("CellChecked language = %q, want %q", checked.Language, model.CellLanguageTypeScript)
+	}
+	if checked.EmittedJS == "" {
+		t.Fatal("CellChecked emitted JS should not be empty for TS cell")
+	}
+	if strings.Contains(checked.EmittedJS, ": number") {
+		t.Fatalf("EmittedJS still contains TS annotation: %q", checked.EmittedJS)
+	}
+}
+
+func TestSession_OpenSession_ReplaysStoredEmittedJSWithoutTypeScript(t *testing.T) {
+	ctx := context.Background()
+	fix := newFixture(t)
+
+	eng := session.New()
+	withTS, err := eng.StartSession(ctx, defaultConfig(), engine.SessionDeps{
+		Store:             fix.st,
+		TypeScriptFactory: typescript.NewFactory(),
+	})
+	if err != nil {
+		t.Fatalf("StartSession with TS: %v", err)
+	}
+
+	tsRes, err := submitTS(ctx, withTS, "const typed: number = 1; typed")
+	if err != nil {
+		t.Fatalf("Submit TS cell: %v", err)
+	}
+	if err := withTS.Close(); err != nil {
+		t.Fatalf("Close TS session: %v", err)
+	}
+
+	reopened, err := eng.OpenSession(ctx, withTS.ID(), engine.SessionDeps{Store: fix.st})
+	if err != nil {
+		t.Fatalf("OpenSession without TS: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := reopened.Submit(ctx, "typed + 1")
+	if err != nil {
+		t.Fatalf("Submit after reopen: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "2" {
+		t.Fatalf("completion after reopen = %+v, want preview 2", res.CompletionValue)
+	}
+
+	plan, err := fix.st.LoadReplayPlan(ctx, withTS.ID(), tsRes.Cell)
+	if err != nil {
+		t.Fatalf("LoadReplayPlan: %v", err)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].EmittedJS == "" {
+		t.Fatalf("replay plan step = %+v, want emitted JS", plan.Steps)
+	}
+}
+
+func TestSession_Submit_TypeOnlyTypeScriptCellExecutesAsNoOp(t *testing.T) {
+	ctx := context.Background()
+	fix := newFixture(t)
+
+	eng := session.New()
+	sess, err := eng.StartSession(ctx, defaultConfig(), engine.SessionDeps{
+		Store:             fix.st,
+		TypeScriptFactory: typescript.NewFactory(),
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	typeOnly, err := submitTS(ctx, sess, `type User = { name: string, age: number }`)
+	if err != nil {
+		t.Fatalf("Submit type-only TS cell: %v", err)
+	}
+	if typeOnly.CompletionValue != nil {
+		t.Fatalf("completion = %+v, want nil for type-only TS cell", typeOnly.CompletionValue)
+	}
+
+	next, err := submitTS(ctx, sess, `const user: User = { name: "Ada", age: 36 }; user.age`)
+	if err != nil {
+		t.Fatalf("Submit TS cell using prior type alias: %v", err)
+	}
+	if next.CompletionValue == nil || next.CompletionValue.Preview != "36" {
+		t.Fatalf("completion = %+v, want preview 36", next.CompletionValue)
+	}
+
+	plan, err := fix.st.LoadReplayPlan(ctx, sess.ID(), typeOnly.Cell)
+	if err != nil {
+		t.Fatalf("LoadReplayPlan: %v", err)
+	}
+	if len(plan.Steps) != 1 {
+		t.Fatalf("replay steps = %d, want 1", len(plan.Steps))
+	}
+	if got := plan.Steps[0].Language; got != model.CellLanguageTypeScript {
+		t.Fatalf("replay step language = %q, want %q", got, model.CellLanguageTypeScript)
+	}
+	if got := plan.Steps[0].EmittedJS; got != "" {
+		t.Fatalf("type-only TS emitted JS = %q, want empty", got)
+	}
+}
+
+func TestSession_OpenSession_ReplaysTypeOnlyTypeScriptCellWithoutTypeScript(t *testing.T) {
+	ctx := context.Background()
+	fix := newFixture(t)
+
+	eng := session.New()
+	withTS, err := eng.StartSession(ctx, defaultConfig(), engine.SessionDeps{
+		Store:             fix.st,
+		TypeScriptFactory: typescript.NewFactory(),
+	})
+	if err != nil {
+		t.Fatalf("StartSession with TS: %v", err)
+	}
+
+	typeOnly, err := submitTS(ctx, withTS, `type User = { name: string, age: number }`)
+	if err != nil {
+		t.Fatalf("Submit type-only TS cell: %v", err)
+	}
+	valueCell, err := submitTS(ctx, withTS, `const age: number = 7; age`)
+	if err != nil {
+		t.Fatalf("Submit TS value cell: %v", err)
+	}
+	if err := withTS.Close(); err != nil {
+		t.Fatalf("Close TS session: %v", err)
+	}
+
+	reopened, err := eng.OpenSession(ctx, withTS.ID(), engine.SessionDeps{Store: fix.st})
+	if err != nil {
+		t.Fatalf("OpenSession without TS: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := reopened.Submit(ctx, "age + 1")
+	if err != nil {
+		t.Fatalf("Submit after reopen: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "8" {
+		t.Fatalf("completion after reopen = %+v, want preview 8", res.CompletionValue)
+	}
+
+	plan, err := fix.st.LoadReplayPlan(ctx, withTS.ID(), valueCell.Cell)
+	if err != nil {
+		t.Fatalf("LoadReplayPlan: %v", err)
+	}
+	if len(plan.Steps) != 2 {
+		t.Fatalf("replay steps = %d, want 2", len(plan.Steps))
+	}
+	if plan.Steps[0].Cell != typeOnly.Cell || plan.Steps[0].Language != model.CellLanguageTypeScript || plan.Steps[0].EmittedJS != "" {
+		t.Fatalf("type-only replay step = %+v, want TS step with empty emit", plan.Steps[0])
+	}
+}
+
+func TestSession_TypeScriptRuntimeEmittingConstructs_MatchPersistentAndReplayModes(t *testing.T) {
+	ctx := context.Background()
+	h, err := sessiontest.StartComparableSessionsWithDeps(ctx, defaultConfig(), engine.SessionDeps{
+		TypeScriptFactory: typescript.NewFactory(),
+	})
+	if err != nil {
+		t.Fatalf("StartComparableSessionsWithDeps: %v", err)
+	}
+	defer h.Close()
+
+	steps := []struct {
+		name             string
+		src              string
+		wantPreview      string
+		wantNoCompletion bool
+	}{
+		{
+			name:             "enum declaration commits without completion",
+			src:              `enum Status { Ready = 7, Done = 9 }`,
+			wantNoCompletion: true,
+		},
+		{
+			name:             "enum value can be captured in later declaration cell",
+			src:              `const current = Status.Ready`,
+			wantNoCompletion: true,
+		},
+		{
+			name:        "enum value changes later runtime output",
+			src:         `current + Status.Done`,
+			wantPreview: `16`,
+		},
+		{
+			name:             "class with parameter properties declares without completion",
+			src:              `class User { constructor(public name: string, public age: number) {} }`,
+			wantNoCompletion: true,
+		},
+		{
+			name:             "constructor call separated from later field access",
+			src:              `const user = new User("Ada", 36)`,
+			wantNoCompletion: true,
+		},
+		{
+			name:        "parameter properties become runtime fields",
+			src:         `user.age`,
+			wantPreview: `36`,
+		},
+	}
+
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			pair, err := h.SubmitCellBoth(ctx, engine.SubmitInput{
+				Source:   step.src,
+				Language: model.CellLanguageTypeScript,
+			})
+			if err != nil {
+				t.Fatalf("SubmitCellBoth(%q): %v", step.src, err)
+			}
+			if cmpErr := sessiontest.CompareSubmitPair(pair); cmpErr != nil {
+				t.Fatalf("SubmitCellBoth(%q) parity mismatch: %v", step.src, cmpErr)
+			}
+			if step.wantNoCompletion {
+				if pair.PersistentResult.CompletionValue != nil {
+					t.Fatalf("persistent completion = %+v, want nil", pair.PersistentResult.CompletionValue)
+				}
+				if pair.ReplayResult.CompletionValue != nil {
+					t.Fatalf("replay completion = %+v, want nil", pair.ReplayResult.CompletionValue)
+				}
+				return
+			}
+			if pair.PersistentResult.CompletionValue == nil {
+				t.Fatalf("persistent completion = nil, want preview %q", step.wantPreview)
+			}
+			if got := pair.PersistentResult.CompletionValue.Preview; got != step.wantPreview {
+				t.Fatalf("persistent preview = %q, want %q", got, step.wantPreview)
+			}
+			if pair.ReplayResult.CompletionValue == nil || pair.ReplayResult.CompletionValue.Preview != step.wantPreview {
+				t.Fatalf("replay completion = %+v, want preview %q", pair.ReplayResult.CompletionValue, step.wantPreview)
+			}
+		})
 	}
 }

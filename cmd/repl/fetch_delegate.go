@@ -16,6 +16,34 @@ import (
 type fetchDelegate struct{}
 
 func (fetchDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	fetchResultCtor, err := rt.RunString(`(() => {
+		class FetchResult {
+			constructor(status, ok, body) {
+				this.status = status;
+				this.ok = ok;
+				Object.defineProperty(this, "__body", {
+					value: body,
+					writable: false,
+					enumerable: false,
+					configurable: false,
+				});
+			}
+
+			async text() {
+				return this.__body;
+			}
+
+			async json() {
+				return JSON.parse(this.__body);
+			}
+		}
+
+		return FetchResult;
+	})()`)
+	if err != nil {
+		return nil, fmt.Errorf("install FetchResult: %w", err)
+	}
+
 	rawFetch := host.WrapAsync("fetch", model.ReplayReadonly, func(_ context.Context, params []byte) ([]byte, error) {
 		decoded, err := jswire.DecodeGoja(goja.New(), params)
 		if err != nil {
@@ -57,25 +85,17 @@ func (fetchDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.R
 					_ = reject(rt.ToValue("fetch: invalid response payload"))
 					return goja.Undefined()
 				}
-				resObj := rt.NewObject()
-				_ = resObj.Set("status", payload["status"])
-				_ = resObj.Set("ok", payload["ok"])
 				body, _ := payload["body"].(string)
-				_ = resObj.Set("text", func(goja.FunctionCall) goja.Value {
-					p, r, _ := rt.NewPromise()
-					_ = r(rt.ToValue(body))
-					return rt.ToValue(p)
-				})
-				_ = resObj.Set("json", func(goja.FunctionCall) goja.Value {
-					p, r, jReject := rt.NewPromise()
-					var v any
-					if err := json.Unmarshal([]byte(body), &v); err != nil {
-						_ = jReject(rt.ToValue(fmt.Sprintf("fetch json parse failed: %v", err)))
-						return rt.ToValue(p)
-					}
-					_ = r(rt.ToValue(v))
-					return rt.ToValue(p)
-				})
+				resObj, err := rt.New(
+					fetchResultCtor,
+					rt.ToValue(payload["status"]),
+					rt.ToValue(payload["ok"]),
+					rt.ToValue(body),
+				)
+				if err != nil {
+					_ = reject(rt.ToValue(fmt.Sprintf("fetch: construct FetchResult: %v", err)))
+					return goja.Undefined()
+				}
 				_ = resolve(resObj)
 				return goja.Undefined()
 			}),

@@ -20,11 +20,15 @@ type ReplayStep struct {
 	// Cell is the identifier of the committed cell.
 	Cell model.CellID
 
+	// Language is the source language originally submitted for this cell.
+	Language model.CellLanguage
+
 	// Source is the original TypeScript source for the cell.
 	Source string
 
 	// EmittedJS is the JavaScript that was emitted by the type checker for
-	// this cell, if available. The restore path may re-emit if absent.
+	// this cell. For TypeScript cells this may be intentionally empty when the
+	// source was type-only and emits no runtime JavaScript.
 	EmittedJS string
 
 	// Effects lists the effect IDs that were started during this cell's

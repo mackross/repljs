@@ -76,6 +76,69 @@ func TestDescribe_PreservesBuiltinEnumerableProps(t *testing.T) {
 	}
 }
 
+func TestDescribe_FulfilledPromise(t *testing.T) {
+	inspection := mustDescribeGojaExpr(t, `Promise.resolve({ answer: 42, label: "ok" })`)
+
+	if got, want := inspection.Summary, `Promise<{answer: 42, label: "ok"}>`; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	if got, want := inspection.Full, `Promise<{answer: 42, label: "ok"}>`; got != want {
+		t.Fatalf("full = %q, want %q", got, want)
+	}
+}
+
+func TestDescribe_SkipsEnumerableMethods(t *testing.T) {
+	inspection := mustDescribeGojaExpr(t, `({
+		ok: true,
+		status: 200,
+		text() { return "body"; },
+		json() { return { ok: true }; }
+	})`)
+
+	if got, want := inspection.Summary, `{ok: true, status: 200}`; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	if got, want := inspection.Full, `{ok: true, status: 200}`; got != want {
+		t.Fatalf("full = %q, want %q", got, want)
+	}
+}
+
+func TestDescribe_FulfilledPromiseSkipsEnumerableMethods(t *testing.T) {
+	inspection := mustDescribeGojaExpr(t, `Promise.resolve({
+		ok: true,
+		status: 200,
+		text() { return "body"; },
+		json() { return { ok: true }; }
+	})`)
+
+	if got, want := inspection.Summary, `Promise<{ok: true, status: 200}>`; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	if got, want := inspection.Full, `Promise<{ok: true, status: 200}>`; got != want {
+		t.Fatalf("full = %q, want %q", got, want)
+	}
+}
+
+func TestDescribe_ShowsCustomClassName(t *testing.T) {
+	inspection := mustDescribeGojaExpr(t, `(() => {
+		class FetchResult {
+			constructor() {
+				this.ok = true;
+				this.status = 200;
+			}
+			text() { return "body"; }
+		}
+		return new FetchResult();
+	})()`)
+
+	if got, want := inspection.Summary, `FetchResult {ok: true, status: 200}`; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	if got, want := inspection.Full, `FetchResult {ok: true, status: 200}`; got != want {
+		t.Fatalf("full = %q, want %q", got, want)
+	}
+}
+
 func TestDescribe_ReviewedShape_MixedSharedObject(t *testing.T) {
 	inspection := mustDescribeGojaExpr(t, `(() => {
 		const shared = { id: "shared", score: 7 };

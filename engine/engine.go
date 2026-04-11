@@ -10,12 +10,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/dop251/goja"
 	"github.com/solidarity-ai/repl/model"
 	"github.com/solidarity-ai/repl/store"
+	"github.com/solidarity-ai/repl/typescript"
 )
 
 var runtimeLoopRegistry sync.Map
@@ -51,6 +53,11 @@ func RunOnRuntimeLoop(rt *goja.Runtime, fn func(*goja.Runtime)) bool {
 	return true
 }
 
+type SubmitInput struct {
+	Source   string
+	Language model.CellLanguage
+}
+
 // SubmitResult is returned by Session.Submit after a cell has been checked,
 // evaluated, and committed.
 type SubmitResult struct {
@@ -59,6 +66,9 @@ type SubmitResult struct {
 
 	// Index is the branch-local monotonic cell number for this committed cell.
 	Index int
+
+	// Language is the source language used for this cell.
+	Language model.CellLanguage
 
 	// Diagnostics lists any TypeScript diagnostics produced during checking.
 	Diagnostics []model.Diagnostic
@@ -162,6 +172,41 @@ func (e *SubmitFailure) Unwrap() error {
 	return e.Cause
 }
 
+// SubmitCheckFailure is returned as the error value from Submit/SubmitCell
+// when a cell fails during pre-execution checking, such as TypeScript
+// diagnostics with severity error.
+type SubmitCheckFailure struct {
+	Cell        model.CellID
+	Index       int
+	Language    model.CellLanguage
+	Diagnostics []model.Diagnostic
+}
+
+func (e *SubmitCheckFailure) Error() string {
+	if e == nil {
+		return ""
+	}
+	if len(e.Diagnostics) == 0 {
+		return "TS Err:"
+	}
+	parts := make([]string, 0, len(e.Diagnostics))
+	for _, diagnostic := range e.Diagnostics {
+		prefix := ""
+		if diagnostic.Line > 0 {
+			if diagnostic.Column > 0 {
+				prefix = fmt.Sprintf("%d:%d: ", diagnostic.Line, diagnostic.Column)
+			} else {
+				prefix = fmt.Sprintf("%d: ", diagnostic.Line)
+			}
+		}
+		if diagnostic.Severity != "" {
+			prefix += diagnostic.Severity + ": "
+		}
+		parts = append(parts, prefix+diagnostic.Message)
+	}
+	return "TS Err:\n" + strings.Join(parts, "\n")
+}
+
 // SessionDeps bundles the external collaborators needed to start or restore a
 // session. Keeping them in a struct avoids a fragile positional argument list
 // and makes future additions non-breaking.
@@ -179,6 +224,14 @@ type SessionRuntimeContext struct {
 	BranchID    model.BranchID
 	RuntimeHash string
 }
+
+type TypeScriptEnvContext struct {
+	SessionID model.SessionID
+	BranchID  model.BranchID
+	Head      model.CellID
+}
+
+type TypeScriptEnvProvider func(ctx context.Context, tsCtx TypeScriptEnvContext) (typescript.Env, error)
 
 // HostFuncInvoke is the Go implementation behind one journaled host call.
 // params is the bridge-encoded first argument passed from JS. The returned
@@ -222,6 +275,12 @@ type SessionDeps struct {
 	// rebuilds from durable history before each submit. Zero value defaults to
 	// RuntimeModePersistent.
 	RuntimeMode RuntimeMode
+	// TypeScriptFactory lazily creates a TypeScript check+emit session for TS
+	// cells. Optional; nil disables TS mode.
+	TypeScriptFactory typescript.Factory
+	// TypeScriptEnvProvider returns the declarations/prelude environment for
+	// the next TS cell. Optional; nil means an empty environment.
+	TypeScriptEnvProvider TypeScriptEnvProvider
 }
 
 // Engine is the long-lived entry point for the repl package. Implementations
@@ -262,10 +321,14 @@ type Session interface {
 	// ID returns the stable session identifier.
 	ID() model.SessionID
 
-	// Submit type-checks src, evaluates it in the live runtime, and commits
-	// the resulting cell to durable history. The call blocks until the cell
-	// and any tracked async work it started have settled.
+	// Submit evaluates a JavaScript cell in the live runtime and commits the
+	// resulting cell to durable history. The call blocks until the cell and any
+	// tracked async work it started have settled.
 	Submit(ctx context.Context, src string) (SubmitResult, error)
+
+	// SubmitCell is the structured submit API. It allows callers to choose the
+	// per-cell source language instead of defaulting to JavaScript.
+	SubmitCell(ctx context.Context, input SubmitInput) (SubmitResult, error)
 
 	// Inspect returns a view of the runtime value identified by handle.
 	// The handle must have been obtained from a prior SubmitResult or

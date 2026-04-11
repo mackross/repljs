@@ -112,6 +112,7 @@ func countWireNodeRefs(node wireNode, refs map[uint32]int) {
 		countWireValueRefs(value, refs)
 	}
 	countWireValueRefs(node.Buffer, refs)
+	countWireValueRefs(node.Promise, refs)
 	countWireValueRefs(node.Cause, refs)
 }
 
@@ -186,7 +187,7 @@ func (i *wireInspector) renderNode(node wireNode, depth int) string {
 	}
 	switch node.Kind {
 	case nodeObject:
-		return i.renderObject(node.Props, depth+1)
+		return i.renderObject(node, depth+1)
 	case nodeArray:
 		return i.renderArray(node, depth+1)
 	case nodeMap:
@@ -206,6 +207,9 @@ func (i *wireInspector) renderNode(node wireNode, depth int) string {
 		return i.appendProps(base, node.Props, depth+1)
 	case nodeTypedArray:
 		return i.renderTypedArray(node, depth+1)
+	case nodePromise:
+		base := "Promise<" + i.renderValue(node.Promise, depth+1) + ">"
+		return i.appendProps(base, node.Props, depth+1)
 	case nodeError:
 		base := renderErrorBase(i, node, depth+1)
 		return i.appendProps(base, node.Props, depth+1)
@@ -218,9 +222,9 @@ func (i *wireInspector) renderCollapsedNode(node wireNode) string {
 	switch node.Kind {
 	case nodeObject:
 		if len(node.Props) == 0 {
-			return "{}"
+			return renderObjectBase(node.TextA) + "{}"
 		}
-		return "{…}"
+		return renderObjectBase(node.TextA) + "{…}"
 	case nodeArray:
 		return fmt.Sprintf("Array(%d)[…]", len(node.Slots))
 	case nodeMap:
@@ -241,6 +245,8 @@ func (i *wireInspector) renderCollapsedNode(node wireNode) string {
 			return fmt.Sprintf("DataView(%d bytes)", node.ByteLength)
 		}
 		return fmt.Sprintf("%s(%d)", node.TextA, typedArrayLength(node))
+	case nodePromise:
+		return "Promise<…>"
 	case nodeError:
 		return renderErrorBase(i, node, i.opts.maxDepth)
 	default:
@@ -260,11 +266,19 @@ func renderErrorBase(i *wireInspector, node wireNode, depth int) string {
 	return base
 }
 
-func (i *wireInspector) renderObject(props []wireProp, depth int) string {
-	if len(props) == 0 {
-		return "{}"
+func (i *wireInspector) renderObject(node wireNode, depth int) string {
+	base := renderObjectBase(node.TextA)
+	if len(node.Props) == 0 {
+		return base + "{}"
 	}
-	return i.renderPropsBlock(props, depth)
+	return base + i.renderPropsBlock(node.Props, depth)
+}
+
+func renderObjectBase(name string) string {
+	if name == "" {
+		return ""
+	}
+	return name + " "
 }
 
 func (i *wireInspector) renderArray(node wireNode, depth int) string {

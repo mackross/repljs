@@ -22,6 +22,7 @@ import (
 	"github.com/solidarity-ai/repl/jswire"
 	"github.com/solidarity-ai/repl/model"
 	"github.com/solidarity-ai/repl/store"
+	"github.com/solidarity-ai/repl/typescript"
 )
 
 // Engine is the concrete implementation of engine.Engine. It is stateless
@@ -35,6 +36,13 @@ func runtimeModeOrDefault(mode engine.RuntimeMode) engine.RuntimeMode {
 		return engine.RuntimeModePersistent
 	}
 	return mode
+}
+
+func languageOrDefault(language model.CellLanguage) model.CellLanguage {
+	if language == "" {
+		return model.CellLanguageJavaScript
+	}
+	return language
 }
 
 // New returns a ready Engine. The engine itself holds no per-session state;
@@ -109,6 +117,8 @@ func (e *Engine) StartSession(ctx context.Context, cfg model.SessionConfig, deps
 		runtime:       rt,
 		currentIndex:  0,
 		values:        make(map[model.ValueID]engine.ValueView),
+		tsFactory:     deps.TypeScriptFactory,
+		tsEnvProvider: deps.TypeScriptEnvProvider,
 	}, nil
 }
 
@@ -164,6 +174,8 @@ func (e *Engine) bootstrapExistingSession(ctx context.Context, sessionID model.S
 		runtimeMode:   runtimeModeOrDefault(deps.RuntimeMode),
 		currentIndex:  0,
 		values:        make(map[model.ValueID]engine.ValueView),
+		tsFactory:     deps.TypeScriptFactory,
+		tsEnvProvider: deps.TypeScriptEnvProvider,
 	}, nil
 }
 
@@ -179,6 +191,8 @@ func (e *Engine) openSessionState(ctx context.Context, state store.SessionState,
 		runtimeMode:   runtimeModeOrDefault(deps.RuntimeMode),
 		currentIndex:  0,
 		values:        make(map[model.ValueID]engine.ValueView),
+		tsFactory:     deps.TypeScriptFactory,
+		tsEnvProvider: deps.TypeScriptEnvProvider,
 	}
 
 	var (
@@ -210,6 +224,7 @@ func (e *Engine) openSessionState(ctx context.Context, state store.SessionState,
 			return nil, fmt.Errorf("session: OpenSession: replay history: %w", err)
 		}
 		s.currentIndex = len(plan.Steps)
+		s.committedSources = replayStepSources(plan.Steps)
 	}
 
 	s.runtime = rt
@@ -229,19 +244,23 @@ func cloneRawMessage(in json.RawMessage) json.RawMessage {
 // a single session ID and active branch. All mutable fields are protected by
 // mu to guard against accidental concurrent access.
 type session struct {
-	mu            sync.Mutex
-	id            model.SessionID
-	store         store.Store
-	branch        model.BranchID                     // active branch
-	head          model.CellID                       // most recently committed cell on the active branch
-	runtimeHash   string                             // stable identity derived from runtimeConfig
-	runtimeConfig []byte                             // serialised runtime descriptor for fresh VM creation
-	delegate      engine.VMDelegate                  // optional VM configuration hook
-	runtimeMode   engine.RuntimeMode                 // persistent vs replay-per-submit
-	runtime       *branchRuntime                     // branch-local goja VM; replaced on each Restore
-	runtimeDirty  bool                               // live runtime diverged from durable head after a failed submit; rebuild before reuse
-	currentIndex  int                                // branch-local monotonic index of the current committed head
-	values        map[model.ValueID]engine.ValueView // inspectable value handles for the current branch
+	mu               sync.Mutex
+	id               model.SessionID
+	store            store.Store
+	branch           model.BranchID                     // active branch
+	head             model.CellID                       // most recently committed cell on the active branch
+	runtimeHash      string                             // stable identity derived from runtimeConfig
+	runtimeConfig    []byte                             // serialised runtime descriptor for fresh VM creation
+	delegate         engine.VMDelegate                  // optional VM configuration hook
+	runtimeMode      engine.RuntimeMode                 // persistent vs replay-per-submit
+	runtime          *branchRuntime                     // branch-local goja VM; replaced on each Restore
+	runtimeDirty     bool                               // live runtime diverged from durable head after a failed submit; rebuild before reuse
+	currentIndex     int                                // branch-local monotonic index of the current committed head
+	values           map[model.ValueID]engine.ValueView // inspectable value handles for the current branch
+	tsFactory        typescript.Factory
+	tsEnvProvider    engine.TypeScriptEnvProvider
+	tsSession        typescript.Session
+	committedSources []string
 }
 
 // ID returns the stable session identifier.
@@ -271,6 +290,50 @@ func cloneEffectSummaries(in []engine.EffectSummary) []engine.EffectSummary {
 		out = append(out, summary)
 	}
 	return out
+}
+
+func replayStepSources(steps []store.ReplayStep) []string {
+	if len(steps) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(steps))
+	for _, step := range steps {
+		out = append(out, step.Source)
+	}
+	return out
+}
+
+func (s *session) resetTypeScriptSession() {
+	if s.tsSession != nil {
+		_ = s.tsSession.Close()
+		s.tsSession = nil
+	}
+}
+
+func (s *session) ensureTypeScriptSession(ctx context.Context) (typescript.Session, error) {
+	if s.tsFactory == nil {
+		return nil, fmt.Errorf("typescript mode is not configured for this session")
+	}
+	if s.tsSession == nil {
+		tsSession, err := s.tsFactory.NewSession(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("create typescript session: %w", err)
+		}
+		tsSession.SetCommittedSources(s.committedSources)
+		s.tsSession = tsSession
+	}
+	return s.tsSession, nil
+}
+
+func (s *session) currentTypeScriptEnv(ctx context.Context) (typescript.Env, error) {
+	if s.tsEnvProvider == nil {
+		return typescript.Env{}, nil
+	}
+	return s.tsEnvProvider(ctx, engine.TypeScriptEnvContext{
+		SessionID: s.id,
+		BranchID:  s.branch,
+		Head:      s.head,
+	})
 }
 
 func newSubmitFailure(failureID model.FailureID, parent model.CellID, phase string, cause error, linkedEffects []engine.EffectSummary, logs []string) *engine.SubmitFailure {
@@ -402,21 +465,24 @@ func (s *session) recordFailure(failureID model.FailureID, source string, parent
 	})
 }
 
-// Submit evaluates src in the branch-local goja runtime, then commits the
-// resulting cell to durable history. Evaluation happens before any fact is
-// appended so that a parse or runtime failure leaves both the VM state and
-// committed history unchanged.
+// Submit optionally type-checks src, evaluates it in the branch-local goja
+// runtime, then commits the resulting cell to durable history.
 //
 // Fact sequence appended on success:
-//  1. CellChecked   (records source and empty diagnostics)
+//  1. CellChecked   (records source, language, diagnostics, emitted JS)
 //  2. CellEvaluated (records completion value from the runtime)
 //  3. CellCommitted (marks the cell as part of durable history)
 //  4. HeadMoved     (advances the branch head)
 //
-// s.head is only updated after all four facts succeed durably. On any error
-// before or during fact-appending, the in-memory head and runtime state are
-// left unchanged.
+// s.head is only updated after all four facts succeed durably.
 func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, error) {
+	return s.SubmitCell(ctx, engine.SubmitInput{
+		Source:   src,
+		Language: model.CellLanguageJavaScript,
+	})
+}
+
+func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (engine.SubmitResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -424,23 +490,84 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: %w", err)
 	}
 
-	// --- Step 1: evaluate in the live goja VM before touching durable state ---
+	source := input.Source
+	language := languageOrDefault(input.Language)
+	previousHead := s.head
+	nextIndex := s.currentIndex + 1
+	cellID := model.CellID(uuid.NewString())
+	now := time.Now().UTC()
+
+	var (
+		diagnostics []model.Diagnostic
+		emittedJS   string
+		hasErrors   bool
+	)
+	if language == model.CellLanguageTypeScript {
+		tsSession, err := s.ensureTypeScriptSession(ctx)
+		if err != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: %w", err)
+		}
+		env, err := s.currentTypeScriptEnv(ctx)
+		if err != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: load typescript env: %w", err)
+		}
+		tsResult, err := tsSession.CheckEmitCell(ctx, env, source)
+		if err != nil {
+			return engine.SubmitResult{}, fmt.Errorf("session: Submit: typescript check: %w", err)
+		}
+		diagnostics = tsResult.Diagnostics
+		emittedJS = tsResult.EmittedJS
+		hasErrors = tsResult.HasErrors
+	}
+
+	if err := s.store.AppendFact(ctx, model.CellChecked{
+		Session:     s.id,
+		Branch:      s.branch,
+		Cell:        cellID,
+		Parent:      previousHead,
+		Language:    language,
+		Source:      source,
+		Diagnostics: diagnostics,
+		EmittedJS:   emittedJS,
+		HasErrors:   hasErrors,
+		At:          now,
+	}); err != nil {
+		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellChecked: %w", err)
+	}
+	if hasErrors {
+		return engine.SubmitResult{
+				Cell:        cellID,
+				Language:    language,
+				Diagnostics: append([]model.Diagnostic(nil), diagnostics...),
+				HasErrors:   true,
+			}, &engine.SubmitCheckFailure{
+				Cell:        cellID,
+				Language:    language,
+				Diagnostics: append([]model.Diagnostic(nil), diagnostics...),
+			}
+	}
+
+	execSource := source
+	if language == model.CellLanguageTypeScript {
+		execSource = emittedJS
+	} else if emittedJS != "" {
+		execSource = emittedJS
+	}
+
+	// --- Step 1: evaluate in the live goja VM after CellChecked is durable ---
 	evalRuntime, evalRuntimeConfig, evalRuntimeHash, err := s.prepareSubmitRuntime(ctx)
 	if err != nil {
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: prepare runtime: %w", err)
 	}
 	freshRuntime := evalRuntime != s.runtime
 	failureID := model.FailureID(uuid.NewString())
-	previousHead := s.head
-	nextIndex := s.currentIndex + 1
-	cellID := model.CellID(uuid.NewString())
 	evalCtx, cancel := withCellSettleTimeout(ctx)
 	defer cancel()
 	acc := &effectAccumulator{}
 	evalRuntime.beginCell(evalCtx, cellID, acc)
 	defer evalRuntime.endCell()
 
-	eval, err := evalRuntime.runContext(evalCtx, src)
+	eval, err := evalRuntime.runContext(evalCtx, execSource)
 	settleErr := evalRuntime.awaitCellSettled(evalCtx, acc)
 	terminalErr := combineSubmitErrors(err, settleErr)
 	if terminalErr != nil {
@@ -458,7 +585,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		} else if err != nil && settleErr != nil {
 			phase = "eval_and_await_cell_settlement"
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, phase, effectIDs, terminalErr); recordErr != nil {
+		if recordErr := s.recordFailure(failureID, source, previousHead, evalRuntimeHash, phase, effectIDs, terminalErr); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: %s: %w; record failure: %v", phase, terminalErr, recordErr)
 		}
 		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, phase, terminalErr, effects, logs)
@@ -467,28 +594,6 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	effects := acc.drain()
 	logs := acc.drainLogs()
 	effectIDs := effectIDsFromSummaries(effects)
-	now := time.Now().UTC()
-
-	if err := s.store.AppendFact(ctx, model.CellChecked{
-		Session:     s.id,
-		Branch:      s.branch,
-		Cell:        cellID,
-		Parent:      previousHead,
-		Source:      src,
-		Diagnostics: nil,
-		HasErrors:   false,
-		At:          now,
-	}); err != nil {
-		if freshRuntime {
-			evalRuntime.close()
-		} else {
-			s.runtimeDirty = true
-		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_checked", effectIDs, err); recordErr != nil {
-			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellChecked: %w; record failure: %v", err, recordErr)
-		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_checked", err, effects, logs)
-	}
 
 	if err := s.store.AppendFact(ctx, model.CellEvaluated{
 		Session:         s.id,
@@ -503,7 +608,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		} else {
 			s.runtimeDirty = true
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_evaluated", effectIDs, err); recordErr != nil {
+		if recordErr := s.recordFailure(failureID, source, previousHead, evalRuntimeHash, "append_cell_evaluated", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellEvaluated: %w; record failure: %v", err, recordErr)
 		}
 		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_evaluated", err, effects, logs)
@@ -520,7 +625,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		} else {
 			s.runtimeDirty = true
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_cell_committed", effectIDs, err); recordErr != nil {
+		if recordErr := s.recordFailure(failureID, source, previousHead, evalRuntimeHash, "append_cell_committed", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellCommitted: %w; record failure: %v", err, recordErr)
 		}
 		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_committed", err, effects, logs)
@@ -538,7 +643,7 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		} else {
 			s.runtimeDirty = true
 		}
-		if recordErr := s.recordFailure(failureID, src, previousHead, evalRuntimeHash, "append_head_moved", effectIDs, err); recordErr != nil {
+		if recordErr := s.recordFailure(failureID, source, previousHead, evalRuntimeHash, "append_head_moved", effectIDs, err); recordErr != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append HeadMoved: %w; record failure: %v", err, recordErr)
 		}
 		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_head_moved", err, effects, logs)
@@ -561,6 +666,10 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: set $last/$val(%d): %w", nextIndex, err)
 	}
 	s.currentIndex = nextIndex
+	s.committedSources = append(s.committedSources, source)
+	if s.tsSession != nil {
+		s.tsSession.AppendCommittedSource(source)
+	}
 
 	// Register an inspectable value handle when the eval produced a completion value.
 	// This must happen after all durable facts succeed so rejected/pending cells never
@@ -580,6 +689,9 @@ func (s *session) Submit(ctx context.Context, src string) (engine.SubmitResult, 
 	return engine.SubmitResult{
 		Cell:            cellID,
 		Index:           nextIndex,
+		Language:        language,
+		Diagnostics:     append([]model.Diagnostic(nil), diagnostics...),
+		HasErrors:       false,
 		CompletionValue: eval.completionValue,
 		Log:             cloneStrings(logs),
 	}, nil
@@ -638,7 +750,7 @@ func (s *session) Logs(ctx context.Context, targetCell model.CellID) ([]string, 
 	if err := rt.beginReplayStep(target.Effects, plan.Decisions); err != nil {
 		return nil, fmt.Errorf("session: Logs: begin replay step: %w", err)
 	}
-	_, runErr := rt.runContext(ctx, target.Source)
+	_, runErr := rt.runContext(ctx, replaySourceForStep(target))
 	settleErr := rt.awaitCellSettled(ctx, acc)
 	finishErr := rt.finishReplayStep()
 	logs := acc.drainLogs()
@@ -754,9 +866,11 @@ func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) er
 	}
 
 	oldRuntime := s.runtime
+	s.resetTypeScriptSession()
 	s.branch = plan.Branch
 	s.head = targetCell
 	s.currentIndex = len(plan.Steps)
+	s.committedSources = replayStepSources(plan.Steps)
 	s.runtimeHash = runtimeHash
 	s.runtimeConfig = cloneRawMessage(runtimeConfig)
 	s.runtime = rt
@@ -808,9 +922,11 @@ func (s *session) forkLocked(ctx context.Context, targetCell model.CellID) error
 	}
 
 	oldRuntime := s.runtime
+	s.resetTypeScriptSession()
 	s.branch = newBranchID
 	s.head = targetCell
 	s.currentIndex = len(plan.Steps)
+	s.committedSources = replayStepSources(plan.Steps)
 	s.runtimeHash = runtimeHash
 	s.runtimeConfig = cloneRawMessage(runtimeConfig)
 	s.runtime = rt
@@ -830,5 +946,6 @@ func (s *session) Close() error {
 		s.runtime.close()
 		s.runtime = nil
 	}
+	s.resetTypeScriptSession()
 	return nil
 }

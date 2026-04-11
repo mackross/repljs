@@ -33,3 +33,11 @@ const (
 	// PromiseRejected means the promise was rejected with an error.
 	PromiseRejected PromiseState = "rejected"
 )
+
+// CellLanguage describes the source language used for one submitted cell.
+type CellLanguage string
+
+const (
+	CellLanguageJavaScript CellLanguage = "js"
+	CellLanguageTypeScript CellLanguage = "ts"
+)

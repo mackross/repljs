@@ -19,6 +19,7 @@ import (
 	"github.com/solidarity-ai/repl/store"
 	storemem "github.com/solidarity-ai/repl/store/mem"
 	storesqlite "github.com/solidarity-ai/repl/store/sqlite"
+	"github.com/solidarity-ai/repl/typescript"
 )
 
 func main() {
@@ -53,9 +54,10 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 
 	eng := session.New()
 	deps := engine.SessionDeps{
-		Store:       st,
-		VMDelegate:  fetchDelegate{},
-		RuntimeMode: mode,
+		Store:             st,
+		VMDelegate:        fetchDelegate{},
+		RuntimeMode:       mode,
+		TypeScriptFactory: typescript.NewFactory(),
 	}
 	sess, resumed, err := openOrStartSession(ctx, eng, st, *backend, deps)
 	if err != nil {
@@ -68,8 +70,9 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 	printHelp(out)
 
 	scanner := bufio.NewScanner(in)
+	currentLanguage := model.CellLanguageJavaScript
 	for {
-		fmt.Fprint(out, "repl> ")
+		fmt.Fprintf(out, "repl[%s]> ", currentLanguage)
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				return err
@@ -89,6 +92,12 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 			return nil
 		case line == ":help":
 			printHelp(out)
+		case line == ":ts":
+			currentLanguage = model.CellLanguageTypeScript
+			fmt.Fprintln(out, "mode=ts")
+		case line == ":js":
+			currentLanguage = model.CellLanguageJavaScript
+			fmt.Fprintln(out, "mode=js")
 		case line == ":head":
 			fmt.Fprintln(out, "head is store-backed; use submit/restore flow to observe branch history")
 		case strings.HasPrefix(line, ":inspect "):
@@ -133,11 +142,11 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) error {
 				fmt.Fprintln(out, "submit cancelled")
 				continue
 			}
-			if err := cmdSubmit(ctx, out, sess, src); err != nil {
+			if err := cmdSubmit(ctx, out, sess, src, currentLanguage); err != nil {
 				printSubmitError(out, err)
 			}
 		default:
-			if err := cmdSubmit(ctx, out, sess, line); err != nil {
+			if err := cmdSubmit(ctx, out, sess, line, currentLanguage); err != nil {
 				printSubmitError(out, err)
 			}
 		}
@@ -196,17 +205,6 @@ func defaultManifest() model.Manifest {
 	return model.Manifest{ID: "cli-manifest", Functions: nil}
 }
 
-func rewriteTopLevelAwait(src string) string {
-	trimmed := strings.TrimSpace(src)
-	if strings.HasPrefix(trimmed, "await ") || strings.HasPrefix(trimmed, "await(") {
-		return "(async () => { return " + trimmed + "; })()"
-	}
-	if rewritten, ok := rewriteTopLevelObjectLiteral(trimmed); ok {
-		return rewritten
-	}
-	return src
-}
-
 func rewriteTopLevelObjectLiteral(trimmed string) (string, bool) {
 	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
 		return "", false
@@ -218,25 +216,36 @@ func rewriteTopLevelObjectLiteral(trimmed string) (string, bool) {
 	return wrapped, true
 }
 
-func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src string) error {
-	submission := rewriteTopLevelAwait(src)
-	res, err := sess.Submit(ctx, submission)
+func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src string, language model.CellLanguage) error {
+	if strings.TrimSpace(src) == "" {
+		return nil
+	}
+	submission := src
+	if rewritten, ok := rewriteTopLevelObjectLiteral(strings.TrimSpace(src)); ok {
+		submission = rewritten
+	}
+	res, err := sess.SubmitCell(ctx, engine.SubmitInput{Source: submission, Language: language})
 	if err != nil {
 		return err
 	}
 	printLogLines(out, res.Log)
 	fmt.Fprintf(out, "ok cell=%s\n", res.Cell)
 	fmt.Fprintf(out, "cell.index=%d\n", res.Index)
+	fmt.Fprintf(out, "cell.language=%s\n", res.Language)
 	if res.CompletionValue == nil {
 		fmt.Fprintln(out, "completion: <nil>")
 		return nil
 	}
 	fmt.Fprintf(out, "completion.id=%s\n", res.CompletionValue.ID)
-	fmt.Fprintf(out, "completion.preview=%q\n", res.CompletionValue.Preview)
-	fmt.Fprintf(out, "completion.type=%s\n", res.CompletionValue.TypeHint)
+	preview := res.CompletionValue.Preview
 	if view, err := sess.Inspect(ctx, res.CompletionValue.ID); err == nil {
+		fmt.Fprintf(out, "completion.preview=%q\n", preview)
+		fmt.Fprintf(out, "completion.type=%s\n", res.CompletionValue.TypeHint)
 		fmt.Fprintf(out, "completion.summary=%q\n", view.Summary)
+		return nil
 	}
+	fmt.Fprintf(out, "completion.preview=%q\n", preview)
+	fmt.Fprintf(out, "completion.type=%s\n", res.CompletionValue.TypeHint)
 	return nil
 }
 
@@ -246,6 +255,21 @@ func printSubmitError(out io.Writer, err error) {
 		printLogLines(out, submitErr.Log)
 	}
 	fmt.Fprintf(out, "submit error: %v\n", err)
+
+	var checkErr *engine.SubmitCheckFailure
+	if errors.As(err, &checkErr) {
+		if checkErr.Cell != "" {
+			fmt.Fprintf(out, "cell=%s\n", checkErr.Cell)
+		}
+		if checkErr.Index != 0 {
+			fmt.Fprintf(out, "cell.index=%d\n", checkErr.Index)
+		}
+		if checkErr.Language != "" {
+			fmt.Fprintf(out, "cell.language=%s\n", checkErr.Language)
+		}
+		printDiagnostics(out, checkErr.Diagnostics)
+		return
+	}
 
 	if !errors.As(err, &submitErr) {
 		return
@@ -276,6 +300,25 @@ func printSubmitError(out io.Writer, err error) {
 		if effect.ErrorMessage != "" {
 			fmt.Fprintf(out, "effect[%d].error=%q\n", i, effect.ErrorMessage)
 		}
+	}
+}
+
+func printDiagnostics(out io.Writer, diagnostics []model.Diagnostic) {
+	if len(diagnostics) == 0 {
+		fmt.Fprintln(out, "diagnostics=<none>")
+		return
+	}
+	fmt.Fprintf(out, "diagnostics=%d\n", len(diagnostics))
+	for i, diagnostic := range diagnostics {
+		fmt.Fprintf(out, "diagnostic[%d].severity=%s\n", i, diagnostic.Severity)
+		if diagnostic.Line > 0 {
+			if diagnostic.Column > 0 {
+				fmt.Fprintf(out, "diagnostic[%d].location=%d:%d\n", i, diagnostic.Line, diagnostic.Column)
+			} else {
+				fmt.Fprintf(out, "diagnostic[%d].location=%d\n", i, diagnostic.Line)
+			}
+		}
+		fmt.Fprintf(out, "diagnostic[%d].message=%q\n", i, diagnostic.Message)
 	}
 }
 
@@ -366,8 +409,10 @@ func readMultiline(scanner *bufio.Scanner, out io.Writer) (string, bool) {
 
 func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "commands:")
-	fmt.Fprintln(out, "  <js>                 submit one-line JS cell")
-	fmt.Fprintln(out, "  :submit              submit multi-line JS cell (end with .end)")
+	fmt.Fprintln(out, "  <code>               submit one-line cell in the current mode")
+	fmt.Fprintln(out, "  :submit              submit multi-line cell in the current mode (end with .end)")
+	fmt.Fprintln(out, "  :js                  switch default submit mode to JavaScript")
+	fmt.Fprintln(out, "  :ts                  switch default submit mode to TypeScript")
 	fmt.Fprintln(out, "  :inspect <value-id>  inspect completion handle")
 	fmt.Fprintln(out, "  :logs <cell-id>      replay one committed cell and print its console.log lines")
 	fmt.Fprintln(out, "  :restore <cell-id>   move active session to a committed cell")

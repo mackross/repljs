@@ -83,6 +83,7 @@ type CellChecked struct {
 	Branch      BranchID     `json:"branch"`
 	Cell        CellID       `json:"cell"`
 	Parent      CellID       `json:"parent,omitempty"`
+	Language    CellLanguage `json:"language,omitempty"`
 	Source      string       `json:"source"`
 	Diagnostics []Diagnostic `json:"diagnostics"`
 	EmittedJS   string       `json:"emitted_js,omitempty"`

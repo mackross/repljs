@@ -546,12 +546,13 @@ func (s *Store) buildReplaySteps(session model.SessionID, branch model.BranchID,
 
 	steps := make([]store.ReplayStep, 0, len(cellIDs))
 	for i, cell := range cellIDs {
-		src, emitted, effects, err := s.loadCellDetails(session, branchIDs[i], cell)
+		language, src, emitted, effects, err := s.loadCellDetails(session, branchIDs[i], cell)
 		if err != nil {
 			return nil, err
 		}
 		steps = append(steps, store.ReplayStep{
 			Cell:      cell,
+			Language:  language,
 			Source:    src,
 			EmittedJS: emitted,
 			Effects:   effects,
@@ -560,10 +561,10 @@ func (s *Store) buildReplaySteps(session model.SessionID, branch model.BranchID,
 	return steps, nil
 }
 
-// loadCellDetails returns the source, emitted JS, and linked effects for one
+// loadCellDetails returns the language, source, emitted JS, and linked effects for one
 // committed cell by scanning CellChecked and CellEvaluated facts.
 // Must be called with s.mu held.
-func (s *Store) loadCellDetails(session model.SessionID, branch model.BranchID, cell model.CellID) (src, emittedJS string, effects []model.EffectID, err error) {
+func (s *Store) loadCellDetails(session model.SessionID, branch model.BranchID, cell model.CellID) (language model.CellLanguage, src, emittedJS string, effects []model.EffectID, err error) {
 	// Latest CellChecked for source + emittedJS.
 	for _, e := range s.facts {
 		if e.session != session || e.branch != branch || e.cell != cell || e.factType != model.FactTypeCellChecked {
@@ -573,6 +574,7 @@ func (s *Store) loadCellDetails(session model.SessionID, branch model.BranchID, 
 		if !ok {
 			continue
 		}
+		language = f.Language
 		src = f.Source
 		emittedJS = f.EmittedJS
 	}
@@ -589,7 +591,7 @@ func (s *Store) loadCellDetails(session model.SessionID, branch model.BranchID, 
 		effects = f.LinkedEffects
 	}
 
-	return src, emittedJS, effects, nil
+	return language, src, emittedJS, effects, nil
 }
 
 // buildReplayDecisions collects ReplayDecision entries for all effects
