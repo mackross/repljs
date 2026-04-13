@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/solidarity-ai/repl/typescript"
+	"github.com/mackross/repljs/typescript"
 )
 
 func TestSession_CheckEmitCell_UsesCommittedHistory(t *testing.T) {
@@ -55,6 +55,28 @@ func TestSession_CheckEmitCell_MapsDiagnosticsToCurrentCell(t *testing.T) {
 	}
 	if result.Diagnostics[0].Column < 1 {
 		t.Fatalf("diagnostic column = %d, want >= 1", result.Diagnostics[0].Column)
+	}
+}
+
+func TestSession_CheckEmitCell_SeparatesCommittedExpressionCells(t *testing.T) {
+	ctx := context.Background()
+	factory := typescript.NewFactory()
+	sess, err := factory.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	sess.SetCommittedSources([]string{"({ value: 1 })"})
+	result, err := sess.CheckEmitCell(ctx, typescript.Env{}, "([1, 2] as any[]).map(String).join(',')")
+	if err != nil {
+		t.Fatalf("CheckEmitCell: %v", err)
+	}
+	if result.HasErrors {
+		t.Fatalf("committed expression cell should not merge with current cell, diagnostics = %#v", result.Diagnostics)
+	}
+	if !strings.Contains(result.EmittedJS, "[1, 2].map(String).join(\",\")") {
+		t.Fatalf("EmittedJS = %q, want array map expression preserved", result.EmittedJS)
 	}
 }
 

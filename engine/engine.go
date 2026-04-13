@@ -15,12 +15,13 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
-	"github.com/solidarity-ai/repl/model"
-	"github.com/solidarity-ai/repl/store"
-	"github.com/solidarity-ai/repl/typescript"
+	"github.com/mackross/repljs/model"
+	"github.com/mackross/repljs/store"
+	"github.com/mackross/repljs/typescript"
 )
 
 var runtimeLoopRegistry sync.Map
+var indexedValueMetadataRegistry sync.Map
 
 // BindRuntimeLoop associates a runtime with a loop scheduler so VM delegates
 // can resume host promises on the owning loop.
@@ -53,9 +54,46 @@ func RunOnRuntimeLoop(rt *goja.Runtime, fn func(*goja.Runtime)) bool {
 	return true
 }
 
+type IndexedValueMetadata struct {
+	StaleMessage string
+}
+
+func SetIndexedValueMetadata(value goja.Value, meta IndexedValueMetadata) {
+	obj, ok := value.(*goja.Object)
+	if !ok || obj == nil {
+		return
+	}
+	if meta == (IndexedValueMetadata{}) {
+		indexedValueMetadataRegistry.Delete(obj)
+		return
+	}
+	indexedValueMetadataRegistry.Store(obj, meta)
+}
+
+func IndexedValueMetadataFor(value goja.Value) (IndexedValueMetadata, bool) {
+	obj, ok := value.(*goja.Object)
+	if !ok || obj == nil {
+		return IndexedValueMetadata{}, false
+	}
+	meta, ok := indexedValueMetadataRegistry.Load(obj)
+	if !ok {
+		return IndexedValueMetadata{}, false
+	}
+	typed, ok := meta.(IndexedValueMetadata)
+	if !ok {
+		return IndexedValueMetadata{}, false
+	}
+	return typed, true
+}
+
 type SubmitInput struct {
 	Source   string
 	Language model.CellLanguage
+}
+
+type ReplWarning struct {
+	Code    string
+	Message string
 }
 
 // SubmitResult is returned by Session.Submit after a cell has been checked,
@@ -81,6 +119,11 @@ type SubmitResult struct {
 
 	// Log captures console.log lines produced during this submit.
 	Log []string
+
+	// Warnings reports non-fatal session-level events that affected how the
+	// submit was handled, such as a TypeScript static-context reset caused by an
+	// env epoch change.
+	Warnings []ReplWarning
 }
 
 // ValueView is the result of inspecting a runtime value.
@@ -220,9 +263,28 @@ const (
 )
 
 type SessionRuntimeContext struct {
-	SessionID   model.SessionID
-	BranchID    model.BranchID
+	SessionID model.SessionID
+	BranchID  model.BranchID
+	// RuntimeHash is the descriptor hash for the runtime being configured.
 	RuntimeHash string
+	// IsCurrentRuntime reports whether this lifecycle event's runtime is still
+	// the live runtime for the VM. Wrappers must capture and call it later:
+	//   isCurrent := ctx.IsCurrentRuntime
+	//   wrapper := func(...) { if !isCurrent() { /* stale */ } }
+	IsCurrentRuntime func() bool
+}
+
+type RuntimeTransitionContext struct {
+	SessionID       model.SessionID
+	BranchID        model.BranchID
+	FromRuntimeHash string
+	// ToRuntimeHash is the descriptor hash being applied by this transition.
+	ToRuntimeHash string
+	// IsCurrentRuntime reports whether this transition's target runtime is still
+	// the live runtime for the VM. Wrappers must capture and call it later:
+	//   isCurrent := ctx.IsCurrentRuntime
+	//   wrapper := func(...) { if !isCurrent() { /* stale */ } }
+	IsCurrentRuntime func() bool
 }
 
 type TypeScriptEnvContext struct {
@@ -260,6 +322,13 @@ type VMDelegate interface {
 	// this session. The returned state is what should be persisted for future
 	// VM recreation.
 	ConfigureRuntime(ctx SessionRuntimeContext, rt *goja.Runtime, host HostFuncBuilder, state json.RawMessage) (json.RawMessage, error)
+}
+
+type VMTransitionDelegate interface {
+	// TransitionRuntime mutates an already-live VM from fromState to toState.
+	// Unlike ConfigureRuntime, the runtime is not fresh; implementers must add,
+	// update, and remove bindings as needed without assuming a clean VM.
+	TransitionRuntime(ctx RuntimeTransitionContext, rt *goja.Runtime, host HostFuncBuilder, fromState, toState json.RawMessage) error
 }
 
 type SessionDeps struct {
@@ -351,6 +420,11 @@ type Session interface {
 	// Fork creates a new branch rooted at targetCell, replays history into a
 	// fresh runtime, and makes the new branch active.
 	Fork(ctx context.Context, targetCell model.CellID) error
+
+	// TransitionToState mutates the current runtime to the requested
+	// embedder-defined state and records the transition durably at the current
+	// branch/head boundary.
+	TransitionToState(ctx context.Context, toState json.RawMessage) error
 
 	// Close releases all resources associated with the session. Callers must
 	// not use the Session after Close returns.

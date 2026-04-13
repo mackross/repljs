@@ -1,4 +1,4 @@
-module github.com/solidarity-ai/repl
+module github.com/mackross/repljs
 
 go 1.26.1
 

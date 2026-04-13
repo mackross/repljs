@@ -14,15 +14,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/solidarity-ai/repl/engine"
-	"github.com/solidarity-ai/repl/jswire"
-	"github.com/solidarity-ai/repl/model"
-	"github.com/solidarity-ai/repl/store"
-	"github.com/solidarity-ai/repl/typescript"
+	"github.com/mackross/repljs/engine"
+	"github.com/mackross/repljs/jswire"
+	"github.com/mackross/repljs/model"
+	"github.com/mackross/repljs/store"
+	"github.com/mackross/repljs/typescript"
 )
 
 // Engine is the concrete implementation of engine.Engine. It is stateless
@@ -30,6 +32,30 @@ import (
 type Engine struct{}
 
 const defaultCellSettleTimeout = 5 * time.Second
+
+var (
+	gojaParserLineColumnPattern = regexp.MustCompile(`Line (\d+):(\d+)`)
+	gojaStackLineColumnPattern  = regexp.MustCompile(`cell\.js:(\d+):(\d+)\(`)
+)
+
+type translatedEvalError struct {
+	cause   error
+	message string
+}
+
+func (e *translatedEvalError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func (e *translatedEvalError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
 
 func runtimeModeOrDefault(mode engine.RuntimeMode) engine.RuntimeMode {
 	if mode == "" {
@@ -43,6 +69,52 @@ func languageOrDefault(language model.CellLanguage) model.CellLanguage {
 		return model.CellLanguageJavaScript
 	}
 	return language
+}
+
+func translateEvalError(err error) error {
+	if err == nil {
+		return nil
+	}
+	rendered := translateWrappedCellLocations(err.Error())
+	if rendered == err.Error() {
+		return err
+	}
+	return &translatedEvalError{cause: err, message: rendered}
+}
+
+func translateWrappedCellLocations(msg string) string {
+	if msg == "" {
+		return msg
+	}
+	msg = gojaParserLineColumnPattern.ReplaceAllStringFunc(msg, func(match string) string {
+		parts := gojaParserLineColumnPattern.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+		line, _ := strconv.Atoi(parts[1])
+		column, _ := strconv.Atoi(parts[2])
+		if line > 1 {
+			line--
+		} else {
+			line = 1
+		}
+		return fmt.Sprintf("Line %d:%d", line, column)
+	})
+	msg = gojaStackLineColumnPattern.ReplaceAllStringFunc(msg, func(match string) string {
+		parts := gojaStackLineColumnPattern.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+		line, _ := strconv.Atoi(parts[1])
+		column, _ := strconv.Atoi(parts[2])
+		if line > 1 {
+			line--
+		} else {
+			line = 1
+		}
+		return fmt.Sprintf("cell.js:%d:%d(", line, column)
+	})
+	return msg
 }
 
 // New returns a ready Engine. The engine itself holds no per-session state;
@@ -223,13 +295,30 @@ func (e *Engine) openSessionState(ctx context.Context, state store.SessionState,
 		if err != nil {
 			return nil, fmt.Errorf("session: OpenSession: replay history: %w", err)
 		}
-		s.currentIndex = len(plan.Steps)
-		s.committedSources = replayStepSources(plan.Steps)
+		staticEnv, err := deps.Store.LoadStaticEnv(ctx, state.Session, state.Branch, state.Head)
+		if err != nil {
+			rt.close()
+			return nil, fmt.Errorf("session: OpenSession: load static env: %w", err)
+		}
+		s.installLoadedBranchState(loadedBranchState{
+			branch:        state.Branch,
+			head:          state.Head,
+			runtime:       rt,
+			runtimeConfig: runtimeConfig,
+			runtimeHash:   runtimeHash,
+			currentIndex:  len(plan.Steps),
+			staticEnv:     staticEnv,
+		})
+		return s, nil
 	}
 
-	s.runtime = rt
-	s.runtimeHash = runtimeHash
-	s.runtimeConfig = cloneRawMessage(runtimeConfig)
+	s.installLoadedBranchState(loadedBranchState{
+		branch:        state.Branch,
+		head:          state.Head,
+		runtime:       rt,
+		runtimeConfig: runtimeConfig,
+		runtimeHash:   runtimeHash,
+	})
 	return s, nil
 }
 
@@ -261,6 +350,18 @@ type session struct {
 	tsEnvProvider    engine.TypeScriptEnvProvider
 	tsSession        typescript.Session
 	committedSources []string
+	tsEnvHash        string
+	tsEpochTS        string
+}
+
+type loadedBranchState struct {
+	branch        model.BranchID
+	head          model.CellID
+	runtime       *branchRuntime
+	runtimeConfig json.RawMessage
+	runtimeHash   string
+	currentIndex  int
+	staticEnv     store.StaticEnvSnapshot
 }
 
 // ID returns the stable session identifier.
@@ -292,17 +393,6 @@ func cloneEffectSummaries(in []engine.EffectSummary) []engine.EffectSummary {
 	return out
 }
 
-func replayStepSources(steps []store.ReplayStep) []string {
-	if len(steps) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(steps))
-	for _, step := range steps {
-		out = append(out, step.Source)
-	}
-	return out
-}
-
 func (s *session) resetTypeScriptSession() {
 	if s.tsSession != nil {
 		_ = s.tsSession.Close()
@@ -325,6 +415,29 @@ func (s *session) ensureTypeScriptSession(ctx context.Context) (typescript.Sessi
 	return s.tsSession, nil
 }
 
+func (s *session) setStaticEnvSnapshot(snapshot store.StaticEnvSnapshot) {
+	s.committedSources = append([]string(nil), snapshot.CommittedSources...)
+	s.tsEnvHash = snapshot.TypeScriptEnvHash
+	s.tsEpochTS = snapshot.TypeScriptEpochTS
+}
+
+func (s *session) installLoadedBranchState(state loadedBranchState) {
+	oldRuntime := s.runtime
+	s.resetTypeScriptSession()
+	s.branch = state.branch
+	s.head = state.head
+	s.currentIndex = state.currentIndex
+	s.setStaticEnvSnapshot(state.staticEnv)
+	s.runtimeHash = state.runtimeHash
+	s.runtimeConfig = cloneRawMessage(state.runtimeConfig)
+	s.runtime = state.runtime
+	s.runtimeDirty = false
+	s.values = make(map[model.ValueID]engine.ValueView)
+	if oldRuntime != nil {
+		oldRuntime.close()
+	}
+}
+
 func (s *session) currentTypeScriptEnv(ctx context.Context) (typescript.Env, error) {
 	if s.tsEnvProvider == nil {
 		return typescript.Env{}, nil
@@ -334,6 +447,34 @@ func (s *session) currentTypeScriptEnv(ctx context.Context) (typescript.Env, err
 		BranchID:  s.branch,
 		Head:      s.head,
 	})
+}
+
+func (s *session) applyTypeScriptEnv(env typescript.Env) []engine.ReplWarning {
+	if s.tsEnvHash != "" && env.Hash != s.tsEnvHash {
+		s.resetTypeScriptSession()
+		s.committedSources = nil
+		s.tsEpochTS = ""
+		s.tsEnvHash = env.Hash
+		s.tsEpochTS = env.EpochTS
+		return []engine.ReplWarning{{
+			Code:    "typescript_env_reset",
+			Message: "TypeScript static context was reset because the TypeScript env changed.",
+		}}
+	}
+	s.tsEnvHash = env.Hash
+	s.tsEpochTS = env.EpochTS
+	return nil
+}
+
+func (s *session) syncTypeScriptEnv(ctx context.Context) (typescript.Env, []engine.ReplWarning, error) {
+	if s.tsEnvProvider == nil {
+		return typescript.Env{}, nil, nil
+	}
+	env, err := s.currentTypeScriptEnv(ctx)
+	if err != nil {
+		return typescript.Env{}, nil, err
+	}
+	return env, s.applyTypeScriptEnv(env), nil
 }
 
 func newSubmitFailure(failureID model.FailureID, parent model.CellID, phase string, cause error, linkedEffects []engine.EffectSummary, logs []string) *engine.SubmitFailure {
@@ -369,12 +510,38 @@ func withCellSettleTimeout(ctx context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(ctx, defaultCellSettleTimeout)
 }
 
+func (s *session) abandonSubmitRuntime(freshRuntime bool, discardFreshRuntime *bool) {
+	if freshRuntime {
+		if discardFreshRuntime != nil {
+			*discardFreshRuntime = true
+		}
+		return
+	}
+	s.runtimeDirty = true
+}
+
+func (s *session) submitFailureResult(freshRuntime bool, discardFreshRuntime *bool, failureID model.FailureID, source string, previousHead model.CellID, runtimeHash, phase string, effectIDs []model.EffectID, cause error, effects []engine.EffectSummary, logs []string) (engine.SubmitResult, error) {
+	s.abandonSubmitRuntime(freshRuntime, discardFreshRuntime)
+	if recordErr := s.recordFailure(failureID, source, previousHead, runtimeHash, phase, effectIDs, cause); recordErr != nil {
+		return engine.SubmitResult{}, fmt.Errorf("session: Submit: %s: %w; record failure: %v", phase, cause, recordErr)
+	}
+	return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, phase, cause, effects, logs)
+}
+
+func (s *session) ensureCleanRuntime(ctx context.Context) error {
+	if s.runtime != nil && !s.runtimeDirty {
+		return nil
+	}
+	if err := s.rebuildRuntimeFromCommitted(ctx); err != nil {
+		return fmt.Errorf("recover dirty runtime: %w", err)
+	}
+	return nil
+}
+
 func (s *session) prepareSubmitRuntime(ctx context.Context) (*branchRuntime, []byte, string, error) {
 	if s.runtimeMode != engine.RuntimeModeReplayPerSubmit {
-		if s.runtimeDirty {
-			if err := s.rebuildRuntimeFromCommitted(ctx); err != nil {
-				return nil, nil, "", fmt.Errorf("recover dirty runtime: %w", err)
-			}
+		if err := s.ensureCleanRuntime(ctx); err != nil {
+			return nil, nil, "", err
 		}
 		return s.runtime, append([]byte(nil), s.runtimeConfig...), s.runtimeHash, nil
 	}
@@ -486,7 +653,7 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.ensureSubmitCursorWritable(ctx); err != nil {
+	if err := s.ensureBranchHeadWritable(ctx, "submitting"); err != nil {
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: %w", err)
 	}
 
@@ -501,15 +668,17 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 		diagnostics []model.Diagnostic
 		emittedJS   string
 		hasErrors   bool
+		warnings    []engine.ReplWarning
 	)
+	env, envWarnings, err := s.syncTypeScriptEnv(ctx)
+	if err != nil {
+		return engine.SubmitResult{}, fmt.Errorf("session: Submit: load typescript env: %w", err)
+	}
+	warnings = append(warnings, envWarnings...)
 	if language == model.CellLanguageTypeScript {
 		tsSession, err := s.ensureTypeScriptSession(ctx)
 		if err != nil {
 			return engine.SubmitResult{}, fmt.Errorf("session: Submit: %w", err)
-		}
-		env, err := s.currentTypeScriptEnv(ctx)
-		if err != nil {
-			return engine.SubmitResult{}, fmt.Errorf("session: Submit: load typescript env: %w", err)
 		}
 		tsResult, err := tsSession.CheckEmitCell(ctx, env, source)
 		if err != nil {
@@ -521,16 +690,18 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 	}
 
 	if err := s.store.AppendFact(ctx, model.CellChecked{
-		Session:     s.id,
-		Branch:      s.branch,
-		Cell:        cellID,
-		Parent:      previousHead,
-		Language:    language,
-		Source:      source,
-		Diagnostics: diagnostics,
-		EmittedJS:   emittedJS,
-		HasErrors:   hasErrors,
-		At:          now,
+		Session:           s.id,
+		Branch:            s.branch,
+		Cell:              cellID,
+		Parent:            previousHead,
+		Language:          language,
+		Source:            source,
+		Diagnostics:       diagnostics,
+		EmittedJS:         emittedJS,
+		TypeScriptEnvHash: s.tsEnvHash,
+		TypeScriptEpochTS: s.tsEpochTS,
+		HasErrors:         hasErrors,
+		At:                now,
 	}); err != nil {
 		return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellChecked: %w", err)
 	}
@@ -540,6 +711,7 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 				Language:    language,
 				Diagnostics: append([]model.Diagnostic(nil), diagnostics...),
 				HasErrors:   true,
+				Warnings:    append([]engine.ReplWarning(nil), warnings...),
 			}, &engine.SubmitCheckFailure{
 				Cell:        cellID,
 				Language:    language,
@@ -563,6 +735,12 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 	failureID := model.FailureID(uuid.NewString())
 	evalCtx, cancel := withCellSettleTimeout(ctx)
 	defer cancel()
+	discardFreshRuntime := false
+	defer func() {
+		if discardFreshRuntime && evalRuntime != nil {
+			evalRuntime.close()
+		}
+	}()
 	acc := &effectAccumulator{}
 	evalRuntime.beginCell(evalCtx, cellID, acc)
 	defer evalRuntime.endCell()
@@ -570,6 +748,7 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 	eval, err := evalRuntime.runContext(evalCtx, execSource)
 	settleErr := evalRuntime.awaitCellSettled(evalCtx, acc)
 	terminalErr := combineSubmitErrors(err, settleErr)
+	terminalErr = translateEvalError(terminalErr)
 	if terminalErr != nil {
 		effects := acc.drain()
 		logs := acc.drainLogs()
@@ -585,10 +764,7 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 		} else if err != nil && settleErr != nil {
 			phase = "eval_and_await_cell_settlement"
 		}
-		if recordErr := s.recordFailure(failureID, source, previousHead, evalRuntimeHash, phase, effectIDs, terminalErr); recordErr != nil {
-			return engine.SubmitResult{}, fmt.Errorf("session: Submit: %s: %w; record failure: %v", phase, terminalErr, recordErr)
-		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, phase, terminalErr, effects, logs)
+		return s.submitFailureResult(freshRuntime, &discardFreshRuntime, failureID, source, previousHead, evalRuntimeHash, phase, effectIDs, terminalErr, effects, logs)
 	}
 
 	effects := acc.drain()
@@ -603,15 +779,7 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 		CompletionValue: eval.completionValue,
 		At:              now,
 	}); err != nil {
-		if freshRuntime {
-			evalRuntime.close()
-		} else {
-			s.runtimeDirty = true
-		}
-		if recordErr := s.recordFailure(failureID, source, previousHead, evalRuntimeHash, "append_cell_evaluated", effectIDs, err); recordErr != nil {
-			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellEvaluated: %w; record failure: %v", err, recordErr)
-		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_evaluated", err, effects, logs)
+		return s.submitFailureResult(freshRuntime, &discardFreshRuntime, failureID, source, previousHead, evalRuntimeHash, "append_cell_evaluated", effectIDs, err, effects, logs)
 	}
 
 	if err := s.store.AppendFact(ctx, model.CellCommitted{
@@ -620,15 +788,7 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 		Cell:    cellID,
 		At:      now,
 	}); err != nil {
-		if freshRuntime {
-			evalRuntime.close()
-		} else {
-			s.runtimeDirty = true
-		}
-		if recordErr := s.recordFailure(failureID, source, previousHead, evalRuntimeHash, "append_cell_committed", effectIDs, err); recordErr != nil {
-			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append CellCommitted: %w; record failure: %v", err, recordErr)
-		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_cell_committed", err, effects, logs)
+		return s.submitFailureResult(freshRuntime, &discardFreshRuntime, failureID, source, previousHead, evalRuntimeHash, "append_cell_committed", effectIDs, err, effects, logs)
 	}
 
 	if err := s.store.AppendFact(ctx, model.HeadMoved{
@@ -638,15 +798,7 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 		Next:     cellID,
 		At:       now,
 	}); err != nil {
-		if freshRuntime {
-			evalRuntime.close()
-		} else {
-			s.runtimeDirty = true
-		}
-		if recordErr := s.recordFailure(failureID, source, previousHead, evalRuntimeHash, "append_head_moved", effectIDs, err); recordErr != nil {
-			return engine.SubmitResult{}, fmt.Errorf("session: Submit: append HeadMoved: %w; record failure: %v", err, recordErr)
-		}
-		return engine.SubmitResult{}, newSubmitFailure(failureID, previousHead, "append_head_moved", err, effects, logs)
+		return s.submitFailureResult(freshRuntime, &discardFreshRuntime, failureID, source, previousHead, evalRuntimeHash, "append_head_moved", effectIDs, err, effects, logs)
 	}
 
 	// Only advance in-memory head after all durable facts succeed.
@@ -694,10 +846,11 @@ func (s *session) SubmitCell(ctx context.Context, input engine.SubmitInput) (eng
 		HasErrors:       false,
 		CompletionValue: eval.completionValue,
 		Log:             cloneStrings(logs),
+		Warnings:        append([]engine.ReplWarning(nil), warnings...),
 	}, nil
 }
 
-func (s *session) ensureSubmitCursorWritable(ctx context.Context) error {
+func (s *session) ensureBranchHeadWritable(ctx context.Context, action string) error {
 	head, err := s.store.LoadHead(ctx, s.id, s.branch)
 	if err != nil {
 		return fmt.Errorf("load branch head: %w", err)
@@ -705,7 +858,7 @@ func (s *session) ensureSubmitCursorWritable(ctx context.Context) error {
 	if head.Head == "" || head.Head == s.head {
 		return nil
 	}
-	return fmt.Errorf("active cursor is at cell %q while branch %q head is %q; fork before submitting", s.head, s.branch, head.Head)
+	return fmt.Errorf("active cursor is at cell %q while branch %q head is %q; fork before %s", s.head, s.branch, head.Head, action)
 }
 
 // Inspect returns a view of the runtime value identified by handle. It looks up
@@ -854,6 +1007,11 @@ func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) er
 	if err != nil {
 		return fmt.Errorf("session: Restore: replay history: %w", err)
 	}
+	staticEnv, err := s.store.LoadStaticEnv(ctx, s.id, plan.Branch, targetCell)
+	if err != nil {
+		rt.close()
+		return fmt.Errorf("session: Restore: load static env: %w", err)
+	}
 
 	now := time.Now().UTC()
 	if err := s.store.AppendFact(ctx, model.RestoreCompleted{
@@ -865,20 +1023,15 @@ func (s *session) restoreLocked(ctx context.Context, targetCell model.CellID) er
 		return fmt.Errorf("session: Restore: append RestoreCompleted: %w", err)
 	}
 
-	oldRuntime := s.runtime
-	s.resetTypeScriptSession()
-	s.branch = plan.Branch
-	s.head = targetCell
-	s.currentIndex = len(plan.Steps)
-	s.committedSources = replayStepSources(plan.Steps)
-	s.runtimeHash = runtimeHash
-	s.runtimeConfig = cloneRawMessage(runtimeConfig)
-	s.runtime = rt
-	s.runtimeDirty = false
-	s.values = make(map[model.ValueID]engine.ValueView)
-	if oldRuntime != nil {
-		oldRuntime.close()
-	}
+	s.installLoadedBranchState(loadedBranchState{
+		branch:        plan.Branch,
+		head:          targetCell,
+		runtime:       rt,
+		runtimeConfig: runtimeConfig,
+		runtimeHash:   runtimeHash,
+		currentIndex:  len(plan.Steps),
+		staticEnv:     staticEnv,
+	})
 
 	return nil
 }
@@ -899,6 +1052,11 @@ func (s *session) forkLocked(ctx context.Context, targetCell model.CellID) error
 	}, s.store, s.delegate)
 	if err != nil {
 		return fmt.Errorf("session: Fork: replay history: %w", err)
+	}
+	staticEnv, err := s.store.LoadStaticEnv(ctx, s.id, plan.Branch, targetCell)
+	if err != nil {
+		rt.close()
+		return fmt.Errorf("session: Fork: load static env: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -921,20 +1079,75 @@ func (s *session) forkLocked(ctx context.Context, targetCell model.CellID) error
 		return fmt.Errorf("session: Fork: append RestoreCompleted: %w", err)
 	}
 
-	oldRuntime := s.runtime
-	s.resetTypeScriptSession()
-	s.branch = newBranchID
-	s.head = targetCell
-	s.currentIndex = len(plan.Steps)
-	s.committedSources = replayStepSources(plan.Steps)
-	s.runtimeHash = runtimeHash
-	s.runtimeConfig = cloneRawMessage(runtimeConfig)
-	s.runtime = rt
-	s.runtimeDirty = false
-	s.values = make(map[model.ValueID]engine.ValueView)
-	if oldRuntime != nil {
-		oldRuntime.close()
+	s.installLoadedBranchState(loadedBranchState{
+		branch:        newBranchID,
+		head:          targetCell,
+		runtime:       rt,
+		runtimeConfig: runtimeConfig,
+		runtimeHash:   runtimeHash,
+		currentIndex:  len(plan.Steps),
+		staticEnv:     staticEnv,
+	})
+	return nil
+}
+
+func (s *session) TransitionToState(ctx context.Context, toState json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.ensureBranchHeadWritable(ctx, "transitioning runtime"); err != nil {
+		return fmt.Errorf("session: TransitionToState: %w", err)
 	}
+	if err := s.ensureCleanRuntime(ctx); err != nil {
+		return fmt.Errorf("session: TransitionToState: %w", err)
+	}
+
+	resolvedState, resolvedHash, err := resolveRuntimeDescriptor(ctx, engine.SessionRuntimeContext{
+		SessionID:   s.id,
+		BranchID:    s.branch,
+		RuntimeHash: s.runtimeHash,
+	}, s.store, s.delegate, toState, nil)
+	if err != nil {
+		return fmt.Errorf("session: TransitionToState: resolve runtime descriptor: %w", err)
+	}
+	if resolvedHash == s.runtimeHash {
+		s.runtimeConfig = cloneRawMessage(resolvedState)
+		return nil
+	}
+
+	if err := s.store.PutRuntimeConfig(ctx, resolvedHash, resolvedState); err != nil {
+		return fmt.Errorf("session: TransitionToState: store runtime config: %w", err)
+	}
+	if s.delegate != nil {
+		if _, ok := s.delegate.(engine.VMTransitionDelegate); !ok {
+			s.runtimeDirty = true
+			return fmt.Errorf("session: TransitionToState: delegate does not implement engine.VMTransitionDelegate")
+		}
+	}
+	if err := applyRuntimeTransitionAndInvalidateIndexedResults(ctx, s.runtime, engine.RuntimeTransitionContext{
+		SessionID:       s.id,
+		BranchID:        s.branch,
+		FromRuntimeHash: s.runtimeHash,
+		ToRuntimeHash:   resolvedHash,
+	}, s.delegate, s.runtimeConfig, resolvedState, s.currentIndex); err != nil {
+		s.runtimeDirty = true
+		return fmt.Errorf("session: TransitionToState: %w", err)
+	}
+
+	if err := s.store.AppendFact(ctx, model.RuntimeTransitioned{
+		Session:     s.id,
+		Branch:      s.branch,
+		AfterCell:   s.head,
+		RuntimeHash: resolvedHash,
+		At:          time.Now().UTC(),
+	}); err != nil {
+		s.runtimeDirty = true
+		return fmt.Errorf("session: TransitionToState: append RuntimeTransitioned: %w", err)
+	}
+
+	s.runtimeHash = resolvedHash
+	s.runtimeConfig = cloneRawMessage(resolvedState)
+	s.runtimeDirty = false
 	return nil
 }
 

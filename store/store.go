@@ -11,7 +11,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/solidarity-ai/repl/model"
+	"github.com/mackross/repljs/model"
 )
 
 // ReplayStep describes one committed cell that must be replayed in order when
@@ -59,6 +59,12 @@ type ReplayDecision struct {
 	Rerun bool
 }
 
+type RuntimeTransition struct {
+	AfterCell     model.CellID
+	RuntimeHash   string
+	RuntimeConfig json.RawMessage
+}
+
 // ReplayPlan is the ordered sequence of steps needed to rebuild a session up
 // to a target cell, together with per-effect replay decisions.
 type ReplayPlan struct {
@@ -77,6 +83,11 @@ type ReplayPlan struct {
 	// RuntimeConfig is the serialised runtime descriptor recorded for the
 	// session when it was started.
 	RuntimeConfig json.RawMessage
+
+	// RuntimeTransitions are the ordered runtime descriptor changes visible on
+	// the replay path. Each transition applies after AfterCell, or before the
+	// first step when AfterCell is empty.
+	RuntimeTransitions []RuntimeTransition
 
 	// Steps is the ordered list of committed cells to replay.
 	Steps []ReplayStep
@@ -134,9 +145,17 @@ type StaticEnvSnapshot struct {
 	// Manifest is the host capability manifest in effect for this session.
 	Manifest model.Manifest
 
+	// TypeScriptEnvHash identifies the static epoch active at Head. Empty means
+	// no epoch has been durably recorded on the visible ancestry.
+	TypeScriptEnvHash string
+
+	// TypeScriptEpochTS is the epoch source associated with TypeScriptEnvHash.
+	TypeScriptEpochTS string
+
 	// CommittedSources is the ordered list of TypeScript sources for all
-	// committed cells up to and including Head. The type service feeds these
-	// into its incremental program to recreate binding state.
+	// committed cells visible within the current static epoch up to and
+	// including Head. The type service feeds these into its incremental program
+	// to recreate binding state.
 	CommittedSources []string
 }
 

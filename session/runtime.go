@@ -15,10 +15,10 @@ import (
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/google/uuid"
-	"github.com/solidarity-ai/repl/engine"
-	"github.com/solidarity-ai/repl/jswire"
-	"github.com/solidarity-ai/repl/model"
-	"github.com/solidarity-ai/repl/store"
+	"github.com/mackross/repljs/engine"
+	"github.com/mackross/repljs/jswire"
+	"github.com/mackross/repljs/model"
+	"github.com/mackross/repljs/store"
 )
 
 const directRunTimeout = 100 * time.Millisecond
@@ -165,10 +165,7 @@ func (a *effectAccumulator) recordPromiseRejection(p *goja.Promise, operation go
 		if a.unhandledRejection == nil {
 			a.unhandledRejection = make(map[*goja.Promise]string)
 		}
-		reason := ""
-		if result := p.Result(); result != nil {
-			reason = result.String()
-		}
+		reason := formatPromiseRejectionReason(p.Result())
 		a.unhandledRejection[p] = reason
 	case goja.PromiseRejectionHandle:
 		delete(a.unhandledRejection, p)
@@ -176,6 +173,21 @@ func (a *effectAccumulator) recordPromiseRejection(p *goja.Promise, operation go
 			a.unhandledRejection = nil
 		}
 	}
+}
+
+func formatPromiseRejectionReason(result goja.Value) string {
+	if result == nil {
+		return ""
+	}
+	if obj, ok := result.(*goja.Object); ok {
+		stack := obj.Get("stack")
+		if stack != nil && stack != goja.Undefined() && stack != goja.Null() {
+			if text := stack.String(); text != "" {
+				return text
+			}
+		}
+	}
+	return result.String()
 }
 
 func (a *effectAccumulator) unhandledPromiseError() error {
@@ -604,13 +616,30 @@ type branchRuntime struct {
 	loop          *eventloop.EventLoop
 	router        *hostFunctionRouter
 	topLevelAwait *topLevelAwaitState
-	valueByIndex  map[int]goja.Value
+	valueByIndex  map[int]indexedValue
+	epoch         *runtimeEpochState
+	closeOnce     sync.Once
 }
 
 type runtimeBootstrap struct {
 	router        *hostFunctionRouter
 	topLevelAwait *topLevelAwaitState
 }
+
+type indexedValue struct {
+	value        goja.Value
+	runtimeHash  string
+	staleMessage string
+}
+
+type runtimeEpochState struct {
+	mu          sync.RWMutex
+	currentHash string
+}
+
+const (
+	defaultStaleIndexedValueMessage = "indexed value from a previous runtime is no longer callable"
+)
 
 func normalizeRuntimeConfig(state json.RawMessage) (json.RawMessage, error) {
 	if len(state) == 0 {
@@ -655,7 +684,47 @@ func bootstrapRuntimeVM(vm *goja.Runtime, loop *eventloop.EventLoop, st store.St
 	}, nil
 }
 
-func installRuntimeValueLookups(vm *goja.Runtime, valueByIndex map[int]goja.Value) error {
+func (s *runtimeEpochState) setCurrent(runtimeHash string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.currentHash = runtimeHash
+}
+
+func (s *runtimeEpochState) isCurrentFunc(runtimeHash string) func() bool {
+	return func() bool {
+		if s == nil {
+			return false
+		}
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.currentHash == runtimeHash
+	}
+}
+
+func (s *runtimeEpochState) current() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentHash
+}
+
+func bindSessionRuntimeContext(ctx engine.SessionRuntimeContext, epoch *runtimeEpochState, runtimeHash string) engine.SessionRuntimeContext {
+	ctx.RuntimeHash = runtimeHash
+	ctx.IsCurrentRuntime = epoch.isCurrentFunc(runtimeHash)
+	return ctx
+}
+
+func bindRuntimeTransitionContext(ctx engine.RuntimeTransitionContext, epoch *runtimeEpochState) engine.RuntimeTransitionContext {
+	ctx.IsCurrentRuntime = epoch.isCurrentFunc(ctx.ToRuntimeHash)
+	return ctx
+}
+
+func installRuntimeValueLookups(vm *goja.Runtime, valueByIndex map[int]indexedValue) error {
 	if err := vm.Set("$last", goja.Undefined()); err != nil {
 		return fmt.Errorf("install $last: %w", err)
 	}
@@ -667,11 +736,11 @@ func installRuntimeValueLookups(vm *goja.Runtime, valueByIndex map[int]goja.Valu
 		if index <= 0 {
 			panicJSError(vm, "RangeError", "$val(%d): index must be positive", index)
 		}
-		value, ok := valueByIndex[index]
+		entry, ok := valueByIndex[index]
 		if !ok {
 			panicJSError(vm, "Error", "$val(%d): no such visible cell value on this branch", index)
 		}
-		return value
+		return entry.value
 	}); err != nil {
 		return fmt.Errorf("install $val: %w", err)
 	}
@@ -682,6 +751,9 @@ func previewConfiguredRuntimeState(bgCtx context.Context, ctx engine.SessionRunt
 	if delegate == nil {
 		return state, nil
 	}
+	epoch := &runtimeEpochState{}
+	epoch.setCurrent(ctx.RuntimeHash)
+	ctx = bindSessionRuntimeContext(ctx, epoch, ctx.RuntimeHash)
 
 	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
 	loop.Start()
@@ -761,6 +833,8 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 	if err != nil {
 		return nil, nil, "", err
 	}
+	epoch := &runtimeEpochState{}
+	epoch.setCurrent(resolvedHash)
 
 	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
 	loop.Start()
@@ -773,16 +847,15 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 	}
 	initCh := make(chan initResult, 1)
 	loop.RunOnLoop(func(vm *goja.Runtime) {
-		bootstrap, err := bootstrapRuntimeVM(vm, loop, st, engine.SessionRuntimeContext{
-			SessionID:   ctx.SessionID,
-			BranchID:    ctx.BranchID,
-			RuntimeHash: resolvedHash,
-		}, replayPlan)
+		bootstrap, err := bootstrapRuntimeVM(vm, loop, st, bindSessionRuntimeContext(engine.SessionRuntimeContext{
+			SessionID: ctx.SessionID,
+			BranchID:  ctx.BranchID,
+		}, epoch, resolvedHash), replayPlan)
 		if err != nil {
 			initCh <- initResult{err: err}
 			return
 		}
-		rt := &branchRuntime{vm: vm, loop: loop, router: bootstrap.router, topLevelAwait: bootstrap.topLevelAwait, valueByIndex: make(map[int]goja.Value)}
+		rt := &branchRuntime{vm: vm, loop: loop, router: bootstrap.router, topLevelAwait: bootstrap.topLevelAwait, valueByIndex: make(map[int]indexedValue), epoch: epoch}
 		if err := installRuntimeValueLookups(vm, rt.valueByIndex); err != nil {
 			initCh <- initResult{err: err}
 			return
@@ -795,11 +868,10 @@ func newBranchRuntime(bgCtx context.Context, ctx engine.SessionRuntimeContext, s
 		}
 		configuredState := normalizedState
 		if delegate != nil {
-			configuredState, err = delegate.ConfigureRuntime(engine.SessionRuntimeContext{
-				SessionID:   ctx.SessionID,
-				BranchID:    ctx.BranchID,
-				RuntimeHash: resolvedHash,
-			}, vm, hostFuncBuilder{router: bootstrap.router}, normalizedState)
+			configuredState, err = delegate.ConfigureRuntime(bindSessionRuntimeContext(engine.SessionRuntimeContext{
+				SessionID: ctx.SessionID,
+				BranchID:  ctx.BranchID,
+			}, epoch, resolvedHash), vm, hostFuncBuilder{router: bootstrap.router}, normalizedState)
 			if err != nil {
 				initCh <- initResult{err: fmt.Errorf("configure runtime: %w", err)}
 				return
@@ -911,10 +983,12 @@ func (r *branchRuntime) close() {
 	if r == nil || r.loop == nil {
 		return
 	}
-	if r.vm != nil {
-		engine.UnbindRuntimeLoop(r.vm)
-	}
-	r.loop.Stop()
+	r.closeOnce.Do(func() {
+		if r.vm != nil {
+			engine.UnbindRuntimeLoop(r.vm)
+		}
+		r.loop.Stop()
+	})
 }
 
 func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
@@ -1007,7 +1081,7 @@ func (r *hostFunctionRouter) consoleLog(call goja.FunctionCall) goja.Value {
 	if err != nil || live == nil || live.acc == nil {
 		return goja.Undefined()
 	}
-	live.acc.recordLog(renderSummaryArgs(call.Arguments))
+	live.acc.recordLog(renderObservationalPreviewArgs(call.Arguments))
 	return goja.Undefined()
 }
 
@@ -1025,6 +1099,28 @@ func renderSummaryArgs(args []goja.Value) string {
 	parts := make([]string, 0, len(args))
 	for _, arg := range args {
 		parts = append(parts, renderSummaryValue(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func renderPreviewArgs(args []goja.Value) string {
+	if len(args) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, gojaValuePreview(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func renderObservationalPreviewArgs(args []goja.Value) string {
+	if len(args) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, gojaValueObservationalPreview(arg))
 	}
 	return strings.Join(parts, " ")
 }
@@ -1231,11 +1327,19 @@ func (r *branchRuntime) setIndexedResult(index int, eval evalResult) error {
 	if r == nil || r.loop == nil {
 		return nil
 	}
+	runtimeHash := ""
+	if r.epoch != nil {
+		runtimeHash = r.epoch.current()
+	}
 	done := make(chan error, 1)
 	r.loop.RunOnLoop(func(vm *goja.Runtime) {
 		value := goja.Undefined()
+		staleMessage := defaultStaleIndexedValueMessage
 		if eval.hasIndexedValue {
 			value = eval.indexedValue
+			if meta, ok := engine.IndexedValueMetadataFor(value); ok && strings.TrimSpace(meta.StaleMessage) != "" {
+				staleMessage = meta.StaleMessage
+			}
 		}
 		if err := vm.Set("$last", value); err != nil {
 			done <- err
@@ -1243,15 +1347,70 @@ func (r *branchRuntime) setIndexedResult(index int, eval evalResult) error {
 		}
 		if index > 0 {
 			if r.valueByIndex == nil {
-				r.valueByIndex = make(map[int]goja.Value)
+				r.valueByIndex = make(map[int]indexedValue)
 			}
-			r.valueByIndex[index] = value
+			r.valueByIndex[index] = indexedValue{value: value, runtimeHash: runtimeHash, staleMessage: staleMessage}
 			done <- nil
 			return
 		}
 		done <- nil
 	})
 	return <-done
+}
+
+func (r *branchRuntime) replaceStaleIndexedResults(runtimeHash string, currentIndex int) error {
+	if r == nil || r.loop == nil || runtimeHash == "" || currentIndex <= 0 {
+		return nil
+	}
+	done := make(chan error, 1)
+	r.loop.RunOnLoop(func(vm *goja.Runtime) {
+		for index, entry := range r.valueByIndex {
+			if index > currentIndex {
+				continue
+			}
+			if _, ok := goja.AssertFunction(entry.value); !ok {
+				continue
+			}
+			if entry.runtimeHash != "" && entry.runtimeHash != runtimeHash {
+				replaced, err := newStaleIndexedCallable(vm, indexedValueStaleMessage(entry))
+				if err != nil {
+					done <- err
+					return
+				}
+				entry.value = replaced
+				entry.runtimeHash = ""
+				r.valueByIndex[index] = entry
+			}
+		}
+		last := goja.Undefined()
+		for index := currentIndex; index >= 1; index-- {
+			if entry, ok := r.valueByIndex[index]; ok {
+				last = entry.value
+				break
+			}
+		}
+		if err := vm.Set("$last", last); err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+	})
+	return <-done
+}
+
+func indexedValueStaleMessage(entry indexedValue) string {
+	if strings.TrimSpace(entry.staleMessage) == "" {
+		return defaultStaleIndexedValueMessage
+	}
+	return entry.staleMessage
+}
+
+func newStaleIndexedCallable(vm *goja.Runtime, message string) (goja.Value, error) {
+	fn := vm.ToValue(func(goja.FunctionCall) goja.Value {
+		panicJSError(vm, "Error", "%s", message)
+		return goja.Undefined()
+	})
+	return fn, nil
 }
 
 func (r *branchRuntime) settleValueAsync(v goja.Value, deliver func(outcome)) {
@@ -1394,6 +1553,21 @@ func gojaValuePreview(v goja.Value) string {
 	}
 }
 
+func gojaValueObservationalPreview(v goja.Value) string {
+	switch {
+	case v == nil:
+		return "undefined"
+	case goja.IsUndefined(v):
+		return "undefined"
+	case goja.IsNull(v):
+		return "null"
+	}
+	if obj, ok := v.(*goja.Object); ok {
+		return "[object " + obj.ClassName() + "]"
+	}
+	return v.String()
+}
+
 // replayPlanIntoRuntime creates a fresh branchRuntime and replays every step in
 // plan into it, in order, using the same evaluation path as Submit. This
 // ensures a restored branch starts with exactly the bindings visible at the
@@ -1412,6 +1586,54 @@ func replaySourceForStep(step store.ReplayStep) string {
 	return step.Source
 }
 
+func applyRuntimeTransition(ctx context.Context, rt *branchRuntime, transitionCtx engine.RuntimeTransitionContext, delegate engine.VMDelegate, fromState, toState json.RawMessage) error {
+	if rt == nil {
+		return fmt.Errorf("apply runtime transition: nil runtime")
+	}
+	if transitionCtx.FromRuntimeHash == transitionCtx.ToRuntimeHash {
+		return nil
+	}
+	if delegate == nil {
+		return nil
+	}
+	transitionDelegate, ok := delegate.(engine.VMTransitionDelegate)
+	if !ok {
+		return fmt.Errorf("apply runtime transition: delegate does not implement engine.VMTransitionDelegate")
+	}
+	if rt.epoch != nil {
+		rt.epoch.setCurrent(transitionCtx.ToRuntimeHash)
+	}
+	transitionCtx = bindRuntimeTransitionContext(transitionCtx, rt.epoch)
+
+	resultCh := make(chan error, 1)
+	rt.loop.RunOnLoop(func(vm *goja.Runtime) {
+		resultCh <- transitionDelegate.TransitionRuntime(transitionCtx, vm, hostFuncBuilder{router: rt.router}, fromState, toState)
+	})
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			return fmt.Errorf("apply runtime transition: %w", err)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return rt.flushLoop(ctx)
+}
+
+func applyRuntimeTransitionAndInvalidateIndexedResults(ctx context.Context, rt *branchRuntime, transitionCtx engine.RuntimeTransitionContext, delegate engine.VMDelegate, fromState, toState json.RawMessage, currentIndex int) error {
+	if transitionCtx.FromRuntimeHash == transitionCtx.ToRuntimeHash {
+		return nil
+	}
+	if err := applyRuntimeTransition(ctx, rt, transitionCtx, delegate, fromState, toState); err != nil {
+		return err
+	}
+	if err := rt.replaceStaleIndexedResults(transitionCtx.ToRuntimeHash, currentIndex); err != nil {
+		return fmt.Errorf("apply runtime transition: replace stale indexed results: %w", err)
+	}
+	return nil
+}
+
 func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, stepCount int, rtCtx engine.SessionRuntimeContext, st store.Store, delegate engine.VMDelegate) (*branchRuntime, json.RawMessage, string, error) {
 	rt, configuredState, runtimeHash, err := newBranchRuntime(ctx, rtCtx, st, delegate, plan.RuntimeConfig, &plan)
 	if err != nil {
@@ -1422,6 +1644,29 @@ func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, ste
 	}
 	if stepCount > len(plan.Steps) {
 		stepCount = len(plan.Steps)
+	}
+	transitionsByAfterCell := make(map[model.CellID][]store.RuntimeTransition)
+	for _, transition := range plan.RuntimeTransitions {
+		transitionsByAfterCell[transition.AfterCell] = append(transitionsByAfterCell[transition.AfterCell], transition)
+	}
+	applyTransitions := func(afterCell model.CellID, currentIndex int) error {
+		for _, transition := range transitionsByAfterCell[afterCell] {
+			if err := applyRuntimeTransitionAndInvalidateIndexedResults(ctx, rt, engine.RuntimeTransitionContext{
+				SessionID:       rtCtx.SessionID,
+				BranchID:        rtCtx.BranchID,
+				FromRuntimeHash: runtimeHash,
+				ToRuntimeHash:   transition.RuntimeHash,
+			}, delegate, configuredState, transition.RuntimeConfig, currentIndex); err != nil {
+				return err
+			}
+			configuredState = append(json.RawMessage(nil), transition.RuntimeConfig...)
+			runtimeHash = transition.RuntimeHash
+		}
+		return nil
+	}
+	if err := applyTransitions("", 0); err != nil {
+		rt.close()
+		return nil, nil, "", err
 	}
 	for stepIndex, step := range plan.Steps[:stepCount] {
 		if err := rt.beginReplayStep(step.Effects, plan.Decisions); err != nil {
@@ -1441,6 +1686,10 @@ func replayPlanPrefixIntoRuntime(ctx context.Context, plan store.ReplayPlan, ste
 		if err := rt.setIndexedResult(stepIndex+1, eval); err != nil {
 			rt.close()
 			return nil, nil, "", fmt.Errorf("replay cell %q set $last/$val(%d): %w", step.Cell, stepIndex+1, err)
+		}
+		if err := applyTransitions(step.Cell, stepIndex+1); err != nil {
+			rt.close()
+			return nil, nil, "", fmt.Errorf("replay cell %q transition runtime: %w", step.Cell, err)
 		}
 	}
 	if stepCount == len(plan.Steps) {

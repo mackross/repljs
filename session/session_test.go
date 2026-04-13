@@ -17,14 +17,14 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
-	"github.com/solidarity-ai/repl/engine"
-	"github.com/solidarity-ai/repl/jswire"
-	"github.com/solidarity-ai/repl/model"
-	"github.com/solidarity-ai/repl/session"
-	"github.com/solidarity-ai/repl/session/sessiontest"
-	"github.com/solidarity-ai/repl/store"
-	memstore "github.com/solidarity-ai/repl/store/mem"
-	"github.com/solidarity-ai/repl/typescript"
+	"github.com/mackross/repljs/engine"
+	"github.com/mackross/repljs/jswire"
+	"github.com/mackross/repljs/model"
+	"github.com/mackross/repljs/session"
+	"github.com/mackross/repljs/session/sessiontest"
+	"github.com/mackross/repljs/store"
+	memstore "github.com/mackross/repljs/store/mem"
+	"github.com/mackross/repljs/typescript"
 )
 
 // ---------------------------------------------------------------------------
@@ -141,6 +141,125 @@ func (d *runtimeHashDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext,
 		return nil, err
 	}
 	return d.returnedState, nil
+}
+
+type packageStateDelegate struct{}
+
+type packageState struct {
+	Label string `json:"label"`
+}
+
+type staleIndexedValueDelegate struct{}
+type currentRuntimeDelegate struct{}
+
+func (d *packageStateDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, _ engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	cfg, raw, err := normalizePackageState(state)
+	if err != nil {
+		return nil, err
+	}
+	if err := rt.Set("__pkgLabel", cfg.Label); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func (d *packageStateDelegate) TransitionRuntime(_ engine.RuntimeTransitionContext, rt *goja.Runtime, _ engine.HostFuncBuilder, fromState, toState json.RawMessage) error {
+	fromCfg, _, err := normalizePackageState(fromState)
+	if err != nil {
+		return err
+	}
+	toCfg, _, err := normalizePackageState(toState)
+	if err != nil {
+		return err
+	}
+	if fromCfg.Label == toCfg.Label {
+		return nil
+	}
+	return rt.Set("__pkgLabel", toCfg.Label)
+}
+
+func (d *staleIndexedValueDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, _ engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	cfg, raw, err := normalizePackageState(state)
+	if err != nil {
+		return nil, err
+	}
+	if err := rt.Set("__pkgLabel", cfg.Label); err != nil {
+		return nil, err
+	}
+	if err := installTaggedRuntimeFn(rt, "__pkgFn", cfg.Label); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func (d *staleIndexedValueDelegate) TransitionRuntime(ctx engine.RuntimeTransitionContext, rt *goja.Runtime, _ engine.HostFuncBuilder, fromState, toState json.RawMessage) error {
+	toCfg, _, err := normalizePackageState(toState)
+	if err != nil {
+		return err
+	}
+	if err := rt.Set("__pkgLabel", toCfg.Label); err != nil {
+		return err
+	}
+	return installTaggedRuntimeFn(rt, "__pkgFn", toCfg.Label)
+}
+
+func installTaggedRuntimeFn(rt *goja.Runtime, name, label string) error {
+	fn := rt.ToValue(func(goja.FunctionCall) goja.Value {
+		return rt.ToValue(label)
+	})
+	return rt.Set(name, fn)
+}
+
+func (d *currentRuntimeDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, _ engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
+	cfg, raw, err := normalizePackageState(state)
+	if err != nil {
+		return nil, err
+	}
+	if err := rt.Set("__pkgLabel", cfg.Label); err != nil {
+		return nil, err
+	}
+	return raw, rt.Set("__pkgFn", func(goja.FunctionCall) goja.Value {
+		if ctx.IsCurrentRuntime == nil {
+			return rt.ToValue("missing")
+		}
+		if ctx.IsCurrentRuntime() {
+			return rt.ToValue("current")
+		}
+		return rt.ToValue("stale")
+	})
+}
+
+func (d *currentRuntimeDelegate) TransitionRuntime(ctx engine.RuntimeTransitionContext, rt *goja.Runtime, _ engine.HostFuncBuilder, fromState, toState json.RawMessage) error {
+	toCfg, _, err := normalizePackageState(toState)
+	if err != nil {
+		return err
+	}
+	if err := rt.Set("__pkgLabel", toCfg.Label); err != nil {
+		return err
+	}
+	return rt.Set("__pkgFn", func(goja.FunctionCall) goja.Value {
+		if ctx.IsCurrentRuntime == nil {
+			return rt.ToValue("missing")
+		}
+		if ctx.IsCurrentRuntime() {
+			return rt.ToValue("current")
+		}
+		return rt.ToValue("stale")
+	})
+}
+
+func normalizePackageState(state json.RawMessage) (packageState, json.RawMessage, error) {
+	cfg := packageState{}
+	if len(state) != 0 {
+		if err := json.Unmarshal(state, &cfg); err != nil {
+			return packageState{}, nil, err
+		}
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return packageState{}, nil, err
+	}
+	return cfg, raw, nil
 }
 
 type countingTSFactory struct {
@@ -2013,6 +2132,62 @@ func (s *selectiveFailingStore) LoadSessionState(ctx context.Context, sess model
 	return s.wrapped.LoadSessionState(ctx, sess)
 }
 
+type loadStaticEnvFailingStore struct {
+	wrapped *memstore.Store
+
+	mu       sync.Mutex
+	failNext bool
+}
+
+func newLoadStaticEnvFailingStore() *loadStaticEnvFailingStore {
+	return &loadStaticEnvFailingStore{wrapped: memstore.New()}
+}
+
+func (s *loadStaticEnvFailingStore) FailNextLoadStaticEnv() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failNext = true
+}
+
+func (s *loadStaticEnvFailingStore) AppendFact(ctx context.Context, fact model.Fact) error {
+	return s.wrapped.AppendFact(ctx, fact)
+}
+
+func (s *loadStaticEnvFailingStore) PutRuntimeConfig(ctx context.Context, hash string, config json.RawMessage) error {
+	return s.wrapped.PutRuntimeConfig(ctx, hash, config)
+}
+
+func (s *loadStaticEnvFailingStore) LoadRuntimeConfig(ctx context.Context, hash string) (json.RawMessage, error) {
+	return s.wrapped.LoadRuntimeConfig(ctx, hash)
+}
+
+func (s *loadStaticEnvFailingStore) LoadHead(ctx context.Context, sess model.SessionID, branch model.BranchID) (store.HeadRecord, error) {
+	return s.wrapped.LoadHead(ctx, sess, branch)
+}
+
+func (s *loadStaticEnvFailingStore) LoadStaticEnv(ctx context.Context, sess model.SessionID, branch model.BranchID, head model.CellID) (store.StaticEnvSnapshot, error) {
+	s.mu.Lock()
+	fail := s.failNext
+	s.failNext = false
+	s.mu.Unlock()
+	if fail {
+		return store.StaticEnvSnapshot{}, fmt.Errorf("store: %w", errForcedFailure)
+	}
+	return s.wrapped.LoadStaticEnv(ctx, sess, branch, head)
+}
+
+func (s *loadStaticEnvFailingStore) LoadReplayPlan(ctx context.Context, sess model.SessionID, targetCell model.CellID) (store.ReplayPlan, error) {
+	return s.wrapped.LoadReplayPlan(ctx, sess, targetCell)
+}
+
+func (s *loadStaticEnvFailingStore) LoadFailures(ctx context.Context, sess model.SessionID) ([]model.CellFailed, error) {
+	return s.wrapped.LoadFailures(ctx, sess)
+}
+
+func (s *loadStaticEnvFailingStore) LoadSessionState(ctx context.Context, sess model.SessionID) (store.SessionState, error) {
+	return s.wrapped.LoadSessionState(ctx, sess)
+}
+
 // TestSession_Submit_AppendErrorDoesNotAdvanceHead verifies that a store
 // failure during Submit does not silently advance the in-memory head.
 // (Negative test: error path from Failure Modes section.)
@@ -2104,6 +2279,519 @@ func TestSession_StartSession_RuntimeHashMatchesReopen(t *testing.T) {
 	}
 	if got, want := afterReopen.CompletionValue.Preview, initial.CompletionValue.Preview; got != want {
 		t.Fatalf("runtime hash changed across reopen: got %q want %q", got, want)
+	}
+}
+
+func TestSession_TransitionToState_PreservesRuntimeAndReopensWithNewState(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &packageStateDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `const committed = 41; const seenBeforeTransition = __pkgLabel`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState: %v", err)
+	}
+
+	live, err := sess.Submit(ctx, `seenBeforeTransition + ":" + committed + ":" + __pkgLabel`)
+	if err != nil {
+		t.Fatalf("submit after transition: %v", err)
+	}
+	if live.CompletionValue == nil || live.CompletionValue.Preview != `alpha:41:beta` {
+		t.Fatalf("submit after transition preview: got %+v, want %q", live.CompletionValue, `alpha:41:beta`)
+	}
+
+	reopened, err := e.OpenSession(ctx, sess.ID(), fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	afterReopen, err := reopened.Submit(ctx, `seenBeforeTransition + ":" + committed + ":" + __pkgLabel`)
+	if err != nil {
+		t.Fatalf("submit after reopen: %v", err)
+	}
+	if afterReopen.CompletionValue == nil || afterReopen.CompletionValue.Preview != `alpha:41:beta` {
+		t.Fatalf("submit after reopen preview: got %+v, want %q", afterReopen.CompletionValue, `alpha:41:beta`)
+	}
+}
+
+func TestSession_TransitionToState_RestoreCursorRequiresFork(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newRecordingFixture(t)
+	fix.deps.VMDelegate = &packageStateDelegate{}
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	first, err := sess.Submit(ctx, `1`)
+	if err != nil {
+		t.Fatalf("Submit first: %v", err)
+	}
+	second, err := sess.Submit(ctx, `2`)
+	if err != nil {
+		t.Fatalf("Submit second: %v", err)
+	}
+
+	if err := sess.Restore(ctx, first.Cell); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	err = sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`))
+	if err == nil {
+		t.Fatal("expected TransitionToState after restore to require explicit fork")
+	}
+	if !strings.Contains(err.Error(), "fork before") {
+		t.Fatalf("TransitionToState after restore: want fork guidance, got %v", err)
+	}
+
+	runtimeTransitions := 0
+	for _, fact := range fix.st.Facts() {
+		if _, ok := fact.(model.RuntimeTransitioned); ok {
+			runtimeTransitions++
+		}
+	}
+	if runtimeTransitions != 0 {
+		t.Fatalf("runtime transitions after rejected restore transition = %d, want 0", runtimeTransitions)
+	}
+
+	state, err := fix.st.LoadSessionState(ctx, sess.ID())
+	if err != nil {
+		t.Fatalf("LoadSessionState: %v", err)
+	}
+	head, err := fix.st.LoadHead(ctx, sess.ID(), state.Branch)
+	if err != nil {
+		t.Fatalf("LoadHead: %v", err)
+	}
+	if head.Head != second.Cell {
+		t.Fatalf("branch head after rejected transition = %q, want %q", head.Head, second.Cell)
+	}
+}
+
+func TestSession_TransitionToState_RebuildsDirtyRuntimeBeforeTransition(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &packageStateDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `const committed = 41`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+
+	_, err = sess.Submit(ctx, `globalThis.leaked = "boom"; throw new Error("boom")`)
+	if err == nil {
+		t.Fatal("expected failing submit to dirty the runtime")
+	}
+
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState after dirty runtime: %v", err)
+	}
+
+	res, err := sess.Submit(ctx, `typeof leaked + ":" + committed + ":" + __pkgLabel`)
+	if err != nil {
+		t.Fatalf("submit after dirty transition: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != `undefined:41:beta` {
+		t.Fatalf("submit after dirty transition preview: got %+v, want %q", res.CompletionValue, `undefined:41:beta`)
+	}
+}
+
+func TestSession_TransitionToState_ExposesIsCurrentRuntimeForOldAndNewWrappers(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &currentRuntimeDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `const saved = __pkgFn; saved()`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState: %v", err)
+	}
+
+	live, err := sess.Submit(ctx, `saved() + ":" + __pkgFn()`)
+	if err != nil {
+		t.Fatalf("submit after transition: %v", err)
+	}
+	if live.CompletionValue == nil || live.CompletionValue.Preview != `stale:current` {
+		t.Fatalf("submit after transition preview: got %+v, want %q", live.CompletionValue, `stale:current`)
+	}
+
+	reopened, err := e.OpenSession(ctx, sess.ID(), fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	afterReopen, err := reopened.Submit(ctx, `saved() + ":" + __pkgFn()`)
+	if err != nil {
+		t.Fatalf("submit after reopen: %v", err)
+	}
+	if afterReopen.CompletionValue == nil || afterReopen.CompletionValue.Preview != `stale:current` {
+		t.Fatalf("submit after reopen preview: got %+v, want %q", afterReopen.CompletionValue, `stale:current`)
+	}
+}
+
+func TestSession_Submit_IndexedValuesDoNotExposeRuntimeHashProperty(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &staleIndexedValueDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `__pkgFn`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+
+	res, err := sess.Submit(ctx, `Object.prototype.hasOwnProperty.call($val(1), "__replRuntimeHash")`)
+	if err != nil {
+		t.Fatalf("submit runtime hash visibility check: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "false" {
+		t.Fatalf("runtime hash visibility check = %+v, want %q", res.CompletionValue, "false")
+	}
+}
+
+func TestSession_TransitionToState_StaleIndexedValuesDoNotExposeMarkerProperty(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &staleIndexedValueDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `__pkgFn`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState: %v", err)
+	}
+
+	res, err := sess.Submit(ctx, `Object.prototype.hasOwnProperty.call($val(1), "__replStaleIndexedValue")`)
+	if err != nil {
+		t.Fatalf("submit stale marker visibility check: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "false" {
+		t.Fatalf("stale marker visibility check = %+v, want %q", res.CompletionValue, "false")
+	}
+}
+
+func TestSession_TransitionToState_StaleIndexedValuesDoNotExposeMessageProperty(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &staleIndexedValueDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `__pkgFn`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState: %v", err)
+	}
+
+	res, err := sess.Submit(ctx, `Object.prototype.hasOwnProperty.call($val(1), "__replStaleIndexedMessage")`)
+	if err != nil {
+		t.Fatalf("submit stale message visibility check: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "false" {
+		t.Fatalf("stale message visibility check = %+v, want %q", res.CompletionValue, "false")
+	}
+}
+
+func TestSession_TransitionToState_PreservesNonCallableIndexedValuesFromPreviousRuntime(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &staleIndexedValueDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `"alpha"`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState: %v", err)
+	}
+
+	res, err := sess.Submit(ctx, `$val(1) === "alpha" && $last === "alpha"`)
+	if err != nil {
+		t.Fatalf("submit preserved non-callable indexed values: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "true" {
+		t.Fatalf("preserved non-callable indexed values = %+v, want %q", res.CompletionValue, "true")
+	}
+}
+
+func TestSession_TransitionToState_ReplacesStaleIndexedFunctionsAfterNextCommittedCell(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &staleIndexedValueDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `__pkgFn`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState: %v", err)
+	}
+	if _, err := sess.Submit(ctx, `1`); err != nil {
+		t.Fatalf("submit after transition: %v", err)
+	}
+
+	staleType, err := sess.Submit(ctx, `typeof $val(1)`)
+	if err != nil {
+		t.Fatalf("submit typeof stale $val(1): %v", err)
+	}
+	if staleType.CompletionValue == nil || staleType.CompletionValue.Preview != `function` {
+		t.Fatalf("typeof stale $val(1) = %+v, want %q", staleType.CompletionValue, `function`)
+	}
+
+	if _, err := sess.Submit(ctx, `$val(1)()`); err == nil || !strings.Contains(err.Error(), "indexed value from a previous runtime is no longer callable") {
+		t.Fatalf("submit stale $val(1)() error = %v, want stale indexed callable error", err)
+	}
+
+	res, err := sess.Submit(ctx, `$val(2)`)
+	if err != nil {
+		t.Fatalf("submit preserved $val(2): %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "1" {
+		t.Fatalf("$val(2) preview = %+v, want %q", res.CompletionValue, "1")
+	}
+}
+
+func TestSession_TransitionToState_ReplacesStaleIndexedFunctionsImmediately(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &staleIndexedValueDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `__pkgFn`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState: %v", err)
+	}
+
+	if _, err := sess.Submit(ctx, `$val(1)()`); err == nil || !strings.Contains(err.Error(), "indexed value from a previous runtime is no longer callable") {
+		t.Fatalf("submit stale $val(1)() immediately after transition error = %v, want stale indexed callable error", err)
+	}
+}
+
+func TestSession_OpenSession_ReplacesStaleIndexedFunctionsAcrossRuntimeTransition(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+	fix.deps.VMDelegate = &staleIndexedValueDelegate{}
+	fix.deps.RuntimeConfig = json.RawMessage(`{"label":"alpha"}`)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Submit(ctx, `__pkgFn`); err != nil {
+		t.Fatalf("seed submit: %v", err)
+	}
+	if err := sess.TransitionToState(ctx, json.RawMessage(`{"label":"beta"}`)); err != nil {
+		t.Fatalf("TransitionToState: %v", err)
+	}
+	if _, err := sess.Submit(ctx, `1`); err != nil {
+		t.Fatalf("submit after transition: %v", err)
+	}
+
+	reopened, err := e.OpenSession(ctx, sess.ID(), fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := reopened.Submit(ctx, `$val(2)`)
+	if err != nil {
+		t.Fatalf("submit preserved $val(2) after reopen: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "1" {
+		t.Fatalf("$val(2) after reopen preview = %+v, want %q", res.CompletionValue, "1")
+	}
+
+	if _, err := reopened.Submit(ctx, `$val(1)()`); err == nil || !strings.Contains(err.Error(), "indexed value from a previous runtime is no longer callable") {
+		t.Fatalf("submit stale $val(1)() after reopen error = %v, want stale indexed callable error", err)
+	}
+}
+
+func TestSession_Restore_LoadStaticEnvFailureLeavesDurableAndLiveStateUnchanged(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	st := newLoadStaticEnvFailingStore()
+
+	sess, err := e.StartSession(ctx, defaultConfig(), engine.SessionDeps{Store: st})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	first, err := sess.Submit(ctx, `const x = 1`)
+	if err != nil {
+		t.Fatalf("Submit first cell: %v", err)
+	}
+	second, err := sess.Submit(ctx, `const y = 2`)
+	if err != nil {
+		t.Fatalf("Submit second cell: %v", err)
+	}
+
+	before, err := st.LoadSessionState(ctx, sess.ID())
+	if err != nil {
+		t.Fatalf("LoadSessionState before restore: %v", err)
+	}
+	if before.Head != second.Cell {
+		t.Fatalf("session head before restore = %q, want %q", before.Head, second.Cell)
+	}
+
+	st.FailNextLoadStaticEnv()
+	if err := sess.Restore(ctx, first.Cell); err == nil || !strings.Contains(err.Error(), errForcedFailure.Error()) {
+		t.Fatalf("Restore error = %v, want load static env failure", err)
+	}
+
+	after, err := st.LoadSessionState(ctx, sess.ID())
+	if err != nil {
+		t.Fatalf("LoadSessionState after restore failure: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("session state after failed restore = %+v, want unchanged %+v", after, before)
+	}
+
+	reopened, err := e.OpenSession(ctx, sess.ID(), engine.SessionDeps{Store: st})
+	if err != nil {
+		t.Fatalf("OpenSession after failed restore: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := reopened.Submit(ctx, `typeof y`)
+	if err != nil {
+		t.Fatalf("submit after failed restore reopen: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "number" {
+		t.Fatalf("submit after failed restore reopen preview = %+v, want %q", res.CompletionValue, "number")
+	}
+}
+
+func TestSession_Fork_LoadStaticEnvFailureLeavesDurableAndLiveStateUnchanged(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	st := newLoadStaticEnvFailingStore()
+
+	sess, err := e.StartSession(ctx, defaultConfig(), engine.SessionDeps{Store: st})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	first, err := sess.Submit(ctx, `const x = 1`)
+	if err != nil {
+		t.Fatalf("Submit first cell: %v", err)
+	}
+	second, err := sess.Submit(ctx, `const y = 2`)
+	if err != nil {
+		t.Fatalf("Submit second cell: %v", err)
+	}
+
+	before, err := st.LoadSessionState(ctx, sess.ID())
+	if err != nil {
+		t.Fatalf("LoadSessionState before fork: %v", err)
+	}
+	if before.Head != second.Cell {
+		t.Fatalf("session head before fork = %q, want %q", before.Head, second.Cell)
+	}
+
+	st.FailNextLoadStaticEnv()
+	if err := sess.Fork(ctx, first.Cell); err == nil || !strings.Contains(err.Error(), errForcedFailure.Error()) {
+		t.Fatalf("Fork error = %v, want load static env failure", err)
+	}
+
+	after, err := st.LoadSessionState(ctx, sess.ID())
+	if err != nil {
+		t.Fatalf("LoadSessionState after fork failure: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("session state after failed fork = %+v, want unchanged %+v", after, before)
+	}
+
+	reopened, err := e.OpenSession(ctx, sess.ID(), engine.SessionDeps{Store: st})
+	if err != nil {
+		t.Fatalf("OpenSession after failed fork: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := reopened.Submit(ctx, `typeof y`)
+	if err != nil {
+		t.Fatalf("submit after failed fork reopen: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "number" {
+		t.Fatalf("submit after failed fork reopen preview = %+v, want %q", res.CompletionValue, "number")
 	}
 }
 
@@ -2436,7 +3124,7 @@ func TestSession_Submit_ConsoleLogReturnedOnSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
-	if got, want := res.Log, []string{`"start" {ok: true}`}; !reflect.DeepEqual(got, want) {
+	if got, want := res.Log, []string{`start [object Object]`}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("res.Log = %#v, want %#v", got, want)
 	}
 }
@@ -2461,8 +3149,52 @@ func TestSession_Submit_ConsoleLogReturnedOnFailure(t *testing.T) {
 	if !errors.As(err, &submitErr) {
 		t.Fatalf("expected SubmitFailure, got %T", err)
 	}
-	if got, want := submitErr.Log, []string{`"before" {ok: true}`}; !reflect.DeepEqual(got, want) {
+	if got, want := submitErr.Log, []string{`before [object Object]`}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("submitErr.Log = %#v, want %#v", got, want)
+	}
+}
+
+func TestSession_Submit_ConsoleLogIsObservational(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	res, err := sess.Submit(ctx, `let side = 0; const value = { toString() { side = 1; return "x"; } }; console.log(value); side`)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "0" {
+		t.Fatalf("completion = %+v, want preview 0", res.CompletionValue)
+	}
+	if got, want := res.Log, []string{`[object Object]`}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("res.Log = %#v, want %#v", got, want)
+	}
+}
+
+func TestSession_Submit_ConsoleLogUsesPreviewForLongStrings(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	long := strings.Repeat("x", 256)
+	res, err := sess.Submit(ctx, fmt.Sprintf(`console.log(%q); 1`, long))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if got, want := res.Log, []string{long}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("res.Log = %#v, want %#v", got, want)
 	}
 }
 
@@ -2521,7 +3253,7 @@ func TestSession_Logs_ReplaysCommittedCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Logs(first.Cell): %v", err)
 	}
-	if want := []string{`"first" {x: 1}`}; !reflect.DeepEqual(got, want) {
+	if want := []string{`first [object Object]`}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Logs(first.Cell) = %#v, want %#v", got, want)
 	}
 
@@ -3212,8 +3944,8 @@ func TestSession_Submit_ReturnsSubmitFailureWithLinkedEffectSummaries(t *testing
 	if submitErr.Phase != "eval" {
 		t.Fatalf("expected phase eval, got %q", submitErr.Phase)
 	}
-	if submitErr.ErrorMessage != "promise rejected: Error: boom" {
-		t.Fatalf("expected submit error message %q, got %q", "promise rejected: Error: boom", submitErr.ErrorMessage)
+	if !strings.Contains(submitErr.ErrorMessage, "promise rejected: Error: boom") {
+		t.Fatalf("expected submit error message to contain %q, got %q", "promise rejected: Error: boom", submitErr.ErrorMessage)
 	}
 	if len(submitErr.LinkedEffects) != 1 {
 		t.Fatalf("expected one linked effect summary, got %v", submitErr.LinkedEffects)
@@ -3247,6 +3979,62 @@ func TestSession_Submit_ReturnsSubmitFailureWithLinkedEffectSummaries(t *testing
 	}
 	if failures[0].Failure != submitErr.Failure {
 		t.Fatalf("submit failure id %q does not match durable failure id %q", submitErr.Failure, failures[0].Failure)
+	}
+}
+
+func TestSession_Submit_MapsGojaSyntaxErrorBackToUserLine(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newRecordingFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	_, err = sess.Submit(ctx, `const =`)
+	if err == nil {
+		t.Fatal("expected syntax failure")
+	}
+
+	var submitErr *engine.SubmitFailure
+	if !errors.As(err, &submitErr) {
+		t.Fatalf("expected SubmitFailure, got %T (%v)", err, err)
+	}
+	if !strings.Contains(submitErr.ErrorMessage, "Line 1:") {
+		t.Fatalf("syntax error = %q, want user line 1", submitErr.ErrorMessage)
+	}
+	if strings.Contains(submitErr.ErrorMessage, "Line 2:") {
+		t.Fatalf("syntax error = %q, should not leak wrapped line 2", submitErr.ErrorMessage)
+	}
+}
+
+func TestSession_Submit_MapsGojaExceptionStackBackToUserLine(t *testing.T) {
+	ctx := context.Background()
+	e := session.New()
+	fix := newRecordingFixture(t)
+
+	sess, err := e.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	_, err = sess.Submit(ctx, `throw new Error("boom")`)
+	if err == nil {
+		t.Fatal("expected runtime failure")
+	}
+
+	var submitErr *engine.SubmitFailure
+	if !errors.As(err, &submitErr) {
+		t.Fatalf("expected SubmitFailure, got %T (%v)", err, err)
+	}
+	if !strings.Contains(submitErr.ErrorMessage, "cell.js:1:") {
+		t.Fatalf("runtime error = %q, want user line 1 stack frame", submitErr.ErrorMessage)
+	}
+	if strings.Contains(submitErr.ErrorMessage, "cell.js:2:") {
+		t.Fatalf("runtime error = %q, should not leak wrapped line 2", submitErr.ErrorMessage)
 	}
 }
 
@@ -5509,6 +6297,112 @@ func TestSession_OpenSession_ReplaysTypeOnlyTypeScriptCellWithoutTypeScript(t *t
 	}
 	if plan.Steps[0].Cell != typeOnly.Cell || plan.Steps[0].Language != model.CellLanguageTypeScript || plan.Steps[0].EmittedJS != "" {
 		t.Fatalf("type-only replay step = %+v, want TS step with empty emit", plan.Steps[0])
+	}
+}
+
+func TestSession_OpenSession_DoesNotRecheckHistoricalTypeScriptAgainstChangedEnv(t *testing.T) {
+	ctx := context.Background()
+	fix := newFixture(t)
+
+	currentEnv := typescript.Env{
+		Hash:    "epoch-a",
+		EpochTS: "declare const alpha: number;",
+	}
+	fix.deps.TypeScriptFactory = typescript.NewFactory()
+	fix.deps.TypeScriptEnvProvider = func(context.Context, engine.TypeScriptEnvContext) (typescript.Env, error) {
+		return currentEnv, nil
+	}
+
+	eng := session.New()
+	withTS, err := eng.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession with TS: %v", err)
+	}
+
+	if _, err := submitTS(ctx, withTS, `type Answer = typeof alpha`); err != nil {
+		t.Fatalf("Submit historical type-only TS cell: %v", err)
+	}
+	if err := withTS.Close(); err != nil {
+		t.Fatalf("Close TS session: %v", err)
+	}
+
+	currentEnv = typescript.Env{
+		Hash: "epoch-b",
+	}
+
+	reopened, err := eng.OpenSession(ctx, withTS.ID(), fix.deps)
+	if err != nil {
+		t.Fatalf("OpenSession with changed TS env: %v", err)
+	}
+	defer reopened.Close()
+
+	res, err := submitTS(ctx, reopened, `const ok: number = 1; ok`)
+	if err != nil {
+		t.Fatalf("Submit after reopen with changed TS env: %v", err)
+	}
+	if len(res.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want exactly one env reset warning", res.Warnings)
+	}
+	if res.Warnings[0].Code != "typescript_env_reset" {
+		t.Fatalf("warning code = %q, want typescript_env_reset", res.Warnings[0].Code)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "1" {
+		t.Fatalf("completion after reopen = %+v, want preview 1", res.CompletionValue)
+	}
+}
+
+func TestSession_Submit_TypeScriptEnvChangeBeforeJavaScriptCommitResetsEpoch(t *testing.T) {
+	ctx := context.Background()
+	fix := newRecordingFixture(t)
+
+	currentEnv := typescript.Env{Hash: "epoch-a"}
+	fix.deps.TypeScriptFactory = typescript.NewFactory()
+	fix.deps.TypeScriptEnvProvider = func(context.Context, engine.TypeScriptEnvContext) (typescript.Env, error) {
+		return currentEnv, nil
+	}
+
+	eng := session.New()
+	sess, err := eng.StartSession(ctx, defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession with TS: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := submitTS(ctx, sess, `const start: number = 1; start`); err != nil {
+		t.Fatalf("Submit TS cell before env change: %v", err)
+	}
+
+	currentEnv = typescript.Env{Hash: "epoch-b"}
+
+	jsCell, err := sess.Submit(ctx, `const mid = 2; mid`)
+	if err != nil {
+		t.Fatalf("Submit JS cell after env change: %v", err)
+	}
+	if jsCell.CompletionValue == nil || jsCell.CompletionValue.Preview != "2" {
+		t.Fatalf("JS completion = %+v, want preview 2", jsCell.CompletionValue)
+	}
+
+	state, err := fix.st.LoadSessionState(ctx, sess.ID())
+	if err != nil {
+		t.Fatalf("LoadSessionState: %v", err)
+	}
+	snapshot, err := fix.st.LoadStaticEnv(ctx, sess.ID(), state.Branch, jsCell.Cell)
+	if err != nil {
+		t.Fatalf("LoadStaticEnv: %v", err)
+	}
+	if snapshot.TypeScriptEnvHash != "epoch-b" {
+		t.Fatalf("TypeScriptEnvHash after JS cell = %q, want %q", snapshot.TypeScriptEnvHash, "epoch-b")
+	}
+	if got, want := snapshot.CommittedSources, []string{`const mid = 2; mid`}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("CommittedSources after JS cell = %#v, want %#v", got, want)
+	}
+
+	res, err := submitTS(ctx, sess, `const total: number = mid + 1; total`)
+	if err != nil {
+		t.Fatalf("Submit TS cell after JS cell in new epoch: %v", err)
+	}
+	if res.CompletionValue == nil || res.CompletionValue.Preview != "3" {
+		t.Fatalf("completion after JS cell in new epoch = %+v, want preview 3", res.CompletionValue)
 	}
 }
 

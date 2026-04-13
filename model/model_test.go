@@ -7,7 +7,7 @@ import (
 	// Verify mus-go is wired into the module (smoke-test import).
 	_ "github.com/mus-format/mus-go"
 
-	. "github.com/solidarity-ai/repl/model"
+	. "github.com/mackross/repljs/model"
 )
 
 // TestIDTypes verifies that all opaque ID types are defined and can be

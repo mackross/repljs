@@ -8,9 +8,9 @@ import (
 	"net/http"
 
 	"github.com/dop251/goja"
-	"github.com/solidarity-ai/repl/engine"
-	"github.com/solidarity-ai/repl/jswire"
-	"github.com/solidarity-ai/repl/model"
+	"github.com/mackross/repljs/engine"
+	"github.com/mackross/repljs/jswire"
+	"github.com/mackross/repljs/model"
 )
 
 type fetchDelegate struct{}

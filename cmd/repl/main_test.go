@@ -8,11 +8,11 @@ import (
 	"testing"
 
 	"github.com/dop251/goja"
-	"github.com/solidarity-ai/repl/engine"
-	"github.com/solidarity-ai/repl/jswire"
-	"github.com/solidarity-ai/repl/model"
-	"github.com/solidarity-ai/repl/session"
-	storemem "github.com/solidarity-ai/repl/store/mem"
+	"github.com/mackross/repljs/engine"
+	"github.com/mackross/repljs/jswire"
+	"github.com/mackross/repljs/model"
+	"github.com/mackross/repljs/session"
+	storemem "github.com/mackross/repljs/store/mem"
 )
 
 func TestPrintSubmitError_IncludesLinkedEffects(t *testing.T) {
@@ -117,22 +117,6 @@ func TestRun_PrintsCompletionSummary(t *testing.T) {
 	}
 }
 
-func TestRun_TopLevelObjectLiteralIsTreatedAsExpression(t *testing.T) {
-	var out, errOut bytes.Buffer
-	in := strings.NewReader("{ a: \"hello\" }\n:quit\n")
-	if err := run(in, &out, &errOut, nil); err != nil {
-		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
-	}
-
-	got := out.String()
-	if !strings.Contains(got, `completion.preview="[object Object]"`) {
-		t.Fatalf("run output should show raw object preview:\n%s", got)
-	}
-	if !strings.Contains(got, `completion.summary="{a: \"hello\"}"`) {
-		t.Fatalf("run output should summarize object literal, got:\n%s", got)
-	}
-}
-
 func TestRun_MultilineBlankSubmitDoesNotCreateCell(t *testing.T) {
 	var out, errOut bytes.Buffer
 	in := strings.NewReader(":submit\n.end\n1\n:quit\n")
@@ -203,6 +187,38 @@ func TestRun_TypeScriptModeBuiltInsAreAny(t *testing.T) {
 	}
 	if !strings.Contains(got, `completion.summary="\"hi2\""`) {
 		t.Fatalf("expected direct any-style access to work:\n%s", got)
+	}
+}
+
+func TestRun_TypeScriptModeAllowsImplicitAnyInExploratoryCells(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":ts\nconst pick = (m) => m.subject\nconst msgs = [{ subject: 'a' }]\nmsgs.map(pick).join(',')\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if strings.Contains(got, "TS Err:") {
+		t.Fatalf("exploratory cells should allow implicit any parameters:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.preview="a"`) {
+		t.Fatalf("expected mapped preview to work:\n%s", got)
+	}
+}
+
+func TestRun_TypeScriptModeLastArrayCastRemainsCallable(t *testing.T) {
+	var out, errOut bytes.Buffer
+	in := strings.NewReader(":ts\n({ messages: [{ subject: 'a' }, { subject: 'b' }] })\n($last.messages as any[]).map(m => m.subject).join(',')\n:quit\n")
+	if err := run(in, &out, &errOut, nil); err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	got := out.String()
+	if strings.Contains(got, "TS Err:") {
+		t.Fatalf("$last any[] cast should preserve array methods:\n%s", got)
+	}
+	if !strings.Contains(got, `completion.preview="a,b"`) {
+		t.Fatalf("expected mapped preview to work:\n%s", got)
 	}
 }
 
@@ -323,10 +339,10 @@ func TestRun_PrintsConsoleLogOnSuccessAndFailure(t *testing.T) {
 	}
 
 	got := out.String()
-	if !strings.Contains(got, `log[0]="ok" {a: 1}`) {
+	if !strings.Contains(got, `log[0]=ok [object Object]`) {
 		t.Fatalf("success log missing from output:\n%s", got)
 	}
-	if !strings.Contains(got, `log[0]="bad" {a: 2}`) {
+	if !strings.Contains(got, `log[0]=bad [object Object]`) {
 		t.Fatalf("failure log missing from output:\n%s", got)
 	}
 }
@@ -352,7 +368,7 @@ func TestCmdLogs_ReplaysCellLogs(t *testing.T) {
 		t.Fatalf("cmdLogs: %v", err)
 	}
 	got := out.String()
-	if !strings.Contains(got, `log[0]="hello" {a: 1}`) {
+	if !strings.Contains(got, `log[0]=hello [object Object]`) {
 		t.Fatalf(":logs output missing replayed log line:\n%s", got)
 	}
 }

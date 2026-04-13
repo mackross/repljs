@@ -10,13 +10,13 @@ import (
 
 	"github.com/evanw/esbuild/pkg/api"
 	tstoolbox "github.com/microsoft/typescript-go/toolbox"
-	"github.com/solidarity-ai/repl/model"
+	"github.com/mackross/repljs/model"
 )
 
 const (
-	declarationsFile = "__repl_env.d.ts"
-	entryFile        = "__repl_cell.ts"
-	moduleMarker     = "export {};\n"
+	entryFile    = "__repl_cell.ts"
+	tsconfigFile = "tsconfig.json"
+	moduleMarker = "export {};\n"
 )
 
 const builtinDeclarations = `
@@ -28,11 +28,21 @@ declare const console: {
 };
 `
 
+const replTSConfig = `{
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitAny": false,
+    "module": "esnext",
+    "target": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true
+  }
+}`
+
 type Env struct {
-	Hash            string
-	DeclarationsDTS string
-	PreludeTS       string
-	CurrentDir      string
+	Hash       string
+	EpochTS    string
+	CurrentDir string
 }
 
 type Result struct {
@@ -90,7 +100,7 @@ func (s *session) CheckEmitCell(ctx context.Context, env Env, src string) (Resul
 	if env.CurrentDir == "" {
 		env.CurrentDir = "/"
 	}
-	prefix, currentOffset := buildTypecheckEntry(env.PreludeTS, s.history, src)
+	prefix, currentOffset := buildTypecheckEntry(env.EpochTS, s.history, src)
 	input := tstoolbox.CheckInput{
 		Files:            filesForEnv(env, prefix),
 		Entry:            entryFile,
@@ -126,7 +136,7 @@ func (s *session) CheckEmitCell(ctx context.Context, env Env, src string) (Resul
 	}
 
 	converted := convertDiagnostics(checkResult.Diagnostics, entryFile, prefix, currentOffset)
-	emitted, err := emitCell(env.PreludeTS, src)
+	emitted, err := emitCell(env.EpochTS, src)
 	if err != nil {
 		return Result{}, err
 	}
@@ -138,11 +148,11 @@ func (s *session) CheckEmitCell(ctx context.Context, env Env, src string) (Resul
 }
 
 func normalizeEnv(env Env) Env {
-	decls := builtinDeclarations
-	if strings.TrimSpace(env.DeclarationsDTS) != "" {
-		decls += "\n" + env.DeclarationsDTS
+	epoch := builtinDeclarations
+	if strings.TrimSpace(env.EpochTS) != "" {
+		epoch += "\n" + env.EpochTS
 	}
-	env.DeclarationsDTS = decls
+	env.EpochTS = epoch
 	if env.Hash == "" {
 		env.Hash = "builtin-v1"
 	} else {
@@ -161,28 +171,36 @@ func buildTypecheckEntry(prelude string, history []string, current string) (stri
 		}
 	}
 	for _, src := range history {
-		b.WriteString(src)
-		if !strings.HasSuffix(src, "\n") {
-			b.WriteString("\n")
-		}
+		appendCommittedCell(&b, src)
 	}
 	offset := b.Len()
 	b.WriteString(current)
 	return b.String(), offset
 }
 
+func appendCommittedCell(b *strings.Builder, src string) {
+	b.WriteString(src)
+	if !strings.HasSuffix(src, "\n") {
+		b.WriteString("\n")
+	}
+	// Cells are independent statements. Force a hard statement boundary so an
+	// expression cell followed by a new cell starting with `(`, `[`, or a
+	// template literal cannot merge into one larger call/member expression.
+	b.WriteString(";\n")
+}
+
 func filesForEnv(env Env, entry string) fs.FS {
 	return fstest.MapFS{
-		declarationsFile: &fstest.MapFile{Data: []byte(env.DeclarationsDTS)},
-		entryFile:        &fstest.MapFile{Data: []byte(entry)},
+		entryFile:    &fstest.MapFile{Data: []byte(entry)},
+		tsconfigFile: &fstest.MapFile{Data: []byte(replTSConfig)},
 	}
 }
 
-func emitCell(prelude string, src string) (string, error) {
+func emitCell(epoch string, src string) (string, error) {
 	var input strings.Builder
-	if prelude != "" {
-		input.WriteString(prelude)
-		if !strings.HasSuffix(prelude, "\n") {
+	if epoch != "" {
+		input.WriteString(epoch)
+		if !strings.HasSuffix(epoch, "\n") {
 			input.WriteString("\n")
 		}
 	}

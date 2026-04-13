@@ -12,21 +12,22 @@ type Fact interface {
 // --- Fact type constants ---
 
 const (
-	FactTypeSessionStarted   = "SessionStarted"
-	FactTypeManifestAttached = "ManifestAttached"
-	FactTypeRuntimeAttached  = "RuntimeAttached"
-	FactTypeCellChecked      = "CellChecked"
-	FactTypeCellEvaluated    = "CellEvaluated"
-	FactTypeCellCommitted    = "CellCommitted"
-	FactTypeCellFailed       = "CellFailed"
-	FactTypeEffectStarted    = "EffectStarted"
-	FactTypeEffectCompleted  = "EffectCompleted"
-	FactTypeEffectFailed     = "EffectFailed"
-	FactTypePromiseSettled   = "PromiseSettled"
-	FactTypeHeadMoved        = "HeadMoved"
-	FactTypeBranchCreated    = "BranchCreated"
-	FactTypeRestoreCompleted = "RestoreCompleted"
-	FactTypeCheckpointSaved  = "CheckpointSaved"
+	FactTypeSessionStarted      = "SessionStarted"
+	FactTypeManifestAttached    = "ManifestAttached"
+	FactTypeRuntimeAttached     = "RuntimeAttached"
+	FactTypeRuntimeTransitioned = "RuntimeTransitioned"
+	FactTypeCellChecked         = "CellChecked"
+	FactTypeCellEvaluated       = "CellEvaluated"
+	FactTypeCellCommitted       = "CellCommitted"
+	FactTypeCellFailed          = "CellFailed"
+	FactTypeEffectStarted       = "EffectStarted"
+	FactTypeEffectCompleted     = "EffectCompleted"
+	FactTypeEffectFailed        = "EffectFailed"
+	FactTypePromiseSettled      = "PromiseSettled"
+	FactTypeHeadMoved           = "HeadMoved"
+	FactTypeBranchCreated       = "BranchCreated"
+	FactTypeRestoreCompleted    = "RestoreCompleted"
+	FactTypeCheckpointSaved     = "CheckpointSaved"
 )
 
 // --- Session lifecycle facts ---
@@ -67,6 +68,18 @@ type RuntimeAttached struct {
 
 func (RuntimeAttached) FactType() string { return FactTypeRuntimeAttached }
 
+// RuntimeTransitioned is appended when the active runtime descriptor changes at
+// a branch/head boundary after session startup.
+type RuntimeTransitioned struct {
+	Session     SessionID `json:"session"`
+	Branch      BranchID  `json:"branch"`
+	AfterCell   CellID    `json:"after_cell,omitempty"`
+	RuntimeHash string    `json:"runtime_hash"`
+	At          time.Time `json:"at"`
+}
+
+func (RuntimeTransitioned) FactType() string { return FactTypeRuntimeTransitioned }
+
 // --- Cell facts ---
 
 // Diagnostic carries a single TypeScript diagnostic for a cell.
@@ -87,8 +100,16 @@ type CellChecked struct {
 	Source      string       `json:"source"`
 	Diagnostics []Diagnostic `json:"diagnostics"`
 	EmittedJS   string       `json:"emitted_js,omitempty"`
-	HasErrors   bool         `json:"has_errors"`
-	At          time.Time    `json:"at"`
+	// TypeScriptEnvHash identifies the static epoch used when this cell was
+	// checked. Empty for cells checked without a TypeScript env or for
+	// historical facts written before env epochs were recorded.
+	TypeScriptEnvHash string `json:"typescript_env_hash,omitempty"`
+	// TypeScriptEpochTS is the checker epoch source associated with
+	// TypeScriptEnvHash. It is recorded so restore/fork can reconstruct the
+	// exact static epoch even when the embedder's current env has since changed.
+	TypeScriptEpochTS string    `json:"typescript_epoch_ts,omitempty"`
+	HasErrors         bool      `json:"has_errors"`
+	At                time.Time `json:"at"`
 }
 
 func (CellChecked) FactType() string { return FactTypeCellChecked }

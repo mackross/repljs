@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/solidarity-ai/repl/model"
-	memstore "github.com/solidarity-ai/repl/store/mem"
+	"github.com/mackross/repljs/model"
+	memstore "github.com/mackross/repljs/store/mem"
 )
 
 // newTestStore creates a fresh in-memory store for test isolation.
@@ -281,6 +281,71 @@ func TestMemStore_LoadHead(t *testing.T) {
 			t.Errorf("Head: got %q, want empty", head.Head)
 		}
 	})
+}
+
+func TestMemStore_LoadReplayPlan_ExcludesParentRuntimeTransitionsAddedAfterFork(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	const (
+		session = model.SessionID("sess-runtime-fork")
+		root    = model.BranchID("root")
+		fork    = model.BranchID("fork")
+		cell1   = model.CellID("c1")
+		cell2   = model.CellID("c2")
+		cell3   = model.CellID("c3")
+		rootRT  = "runtime-root"
+		nextRT  = "runtime-next"
+	)
+
+	if err := s.PutRuntimeConfig(ctx, rootRT, json.RawMessage(`{"label":"root"}`)); err != nil {
+		t.Fatalf("PutRuntimeConfig root: %v", err)
+	}
+	if err := s.PutRuntimeConfig(ctx, nextRT, json.RawMessage(`{"label":"next"}`)); err != nil {
+		t.Fatalf("PutRuntimeConfig next: %v", err)
+	}
+
+	for _, fact := range []model.Fact{
+		model.SessionStarted{Session: session, RootBranch: root, At: time.Now().UTC()},
+		model.RuntimeAttached{Session: session, RuntimeHash: rootRT, At: time.Now().UTC()},
+		model.CellChecked{Session: session, Branch: root, Cell: cell1, Source: "root-1", EmittedJS: "root-1", At: time.Now().UTC()},
+		model.CellEvaluated{Session: session, Branch: root, Cell: cell1, At: time.Now().UTC()},
+		model.CellCommitted{Session: session, Branch: root, Cell: cell1, At: time.Now().UTC()},
+		model.HeadMoved{Session: session, Branch: root, Next: cell1, At: time.Now().UTC()},
+		model.BranchCreated{Session: session, Branch: fork, ParentCell: cell1, At: time.Now().UTC()},
+		model.RuntimeTransitioned{Session: session, Branch: root, AfterCell: cell1, RuntimeHash: nextRT, At: time.Now().UTC()},
+		model.CellChecked{Session: session, Branch: root, Cell: cell2, Source: "root-2", EmittedJS: "root-2", At: time.Now().UTC()},
+		model.CellEvaluated{Session: session, Branch: root, Cell: cell2, At: time.Now().UTC()},
+		model.CellCommitted{Session: session, Branch: root, Cell: cell2, At: time.Now().UTC()},
+		model.HeadMoved{Session: session, Branch: root, Previous: cell1, Next: cell2, At: time.Now().UTC()},
+		model.CellChecked{Session: session, Branch: fork, Cell: cell3, Source: "fork-3", EmittedJS: "fork-3", At: time.Now().UTC()},
+		model.CellEvaluated{Session: session, Branch: fork, Cell: cell3, At: time.Now().UTC()},
+		model.CellCommitted{Session: session, Branch: fork, Cell: cell3, At: time.Now().UTC()},
+		model.HeadMoved{Session: session, Branch: fork, Next: cell3, At: time.Now().UTC()},
+	} {
+		if err := s.AppendFact(ctx, fact); err != nil {
+			t.Fatalf("AppendFact(%q): %v", fact.FactType(), err)
+		}
+	}
+
+	forkPlan, err := s.LoadReplayPlan(ctx, session, cell3)
+	if err != nil {
+		t.Fatalf("LoadReplayPlan fork: %v", err)
+	}
+	if got := len(forkPlan.RuntimeTransitions); got != 0 {
+		t.Fatalf("fork RuntimeTransitions len = %d, want 0", got)
+	}
+
+	rootPlan, err := s.LoadReplayPlan(ctx, session, cell2)
+	if err != nil {
+		t.Fatalf("LoadReplayPlan root: %v", err)
+	}
+	if got := len(rootPlan.RuntimeTransitions); got != 1 {
+		t.Fatalf("root RuntimeTransitions len = %d, want 1", got)
+	}
+	if got := rootPlan.RuntimeTransitions[0].RuntimeHash; got != nextRT {
+		t.Fatalf("root RuntimeTransitions[0].RuntimeHash = %q, want %q", got, nextRT)
+	}
 }
 
 // ---------------------------------------------------------------------------

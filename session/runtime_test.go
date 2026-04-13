@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/dop251/goja"
-	"github.com/solidarity-ai/repl/engine"
-	"github.com/solidarity-ai/repl/jswire"
+	"github.com/mackross/repljs/engine"
+	"github.com/mackross/repljs/jswire"
 )
 
 func mustNewBranchRuntime(t *testing.T) *branchRuntime {

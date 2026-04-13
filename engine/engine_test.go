@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/solidarity-ai/repl/model"
+	"github.com/mackross/repljs/model"
 )
 
 func TestSubmitCheckFailure_ErrorIncludesDiagnostics(t *testing.T) {

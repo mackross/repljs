@@ -6,10 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/solidarity-ai/repl/engine"
-	"github.com/solidarity-ai/repl/model"
-	"github.com/solidarity-ai/repl/session"
-	memstore "github.com/solidarity-ai/repl/store/mem"
+	"github.com/mackross/repljs/engine"
+	"github.com/mackross/repljs/model"
+	"github.com/mackross/repljs/session"
+	memstore "github.com/mackross/repljs/store/mem"
 )
 
 type Harness struct {

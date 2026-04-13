@@ -10,16 +10,15 @@ import (
 	"os"
 	"strings"
 
-	"github.com/dop251/goja"
 	"github.com/google/uuid"
-	"github.com/solidarity-ai/repl/engine"
-	"github.com/solidarity-ai/repl/jswire"
-	"github.com/solidarity-ai/repl/model"
-	"github.com/solidarity-ai/repl/session"
-	"github.com/solidarity-ai/repl/store"
-	storemem "github.com/solidarity-ai/repl/store/mem"
-	storesqlite "github.com/solidarity-ai/repl/store/sqlite"
-	"github.com/solidarity-ai/repl/typescript"
+	"github.com/mackross/repljs/engine"
+	"github.com/mackross/repljs/jswire"
+	"github.com/mackross/repljs/model"
+	"github.com/mackross/repljs/session"
+	"github.com/mackross/repljs/store"
+	storemem "github.com/mackross/repljs/store/mem"
+	storesqlite "github.com/mackross/repljs/store/sqlite"
+	"github.com/mackross/repljs/typescript"
 )
 
 func main() {
@@ -205,26 +204,11 @@ func defaultManifest() model.Manifest {
 	return model.Manifest{ID: "cli-manifest", Functions: nil}
 }
 
-func rewriteTopLevelObjectLiteral(trimmed string) (string, bool) {
-	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
-		return "", false
-	}
-	wrapped := "(" + trimmed + ")"
-	if _, err := goja.Parse("cell.js", wrapped); err != nil {
-		return "", false
-	}
-	return wrapped, true
-}
-
 func cmdSubmit(ctx context.Context, out io.Writer, sess engine.Session, src string, language model.CellLanguage) error {
 	if strings.TrimSpace(src) == "" {
 		return nil
 	}
-	submission := src
-	if rewritten, ok := rewriteTopLevelObjectLiteral(strings.TrimSpace(src)); ok {
-		submission = rewritten
-	}
-	res, err := sess.SubmitCell(ctx, engine.SubmitInput{Source: submission, Language: language})
+	res, err := sess.SubmitCell(ctx, engine.SubmitInput{Source: src, Language: language})
 	if err != nil {
 		return err
 	}

@@ -14,12 +14,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	_ "modernc.org/sqlite" // register "sqlite" driver with database/sql
 
-	"github.com/solidarity-ai/repl/model"
-	"github.com/solidarity-ai/repl/store"
+	"github.com/mackross/repljs/model"
+	"github.com/mackross/repljs/store"
 )
 
 const (
@@ -266,19 +267,19 @@ func (s *Store) LoadStaticEnv(ctx context.Context, session model.SessionID, bran
 	}
 	manifest := attached.Manifest
 
-	// Collect committed cell sources in insertion order up to and including
-	// the head cell.
-	sources, err := s.loadCommittedSources(ctx, session, branch, head)
+	envHash, epochTS, sources, err := s.loadStaticEnvState(ctx, session, branch, head)
 	if err != nil {
 		return store.StaticEnvSnapshot{}, err
 	}
 
 	return store.StaticEnvSnapshot{
-		Session:          session,
-		Branch:           branch,
-		Head:             head,
-		Manifest:         manifest,
-		CommittedSources: sources,
+		Session:           session,
+		Branch:            branch,
+		Head:              head,
+		Manifest:          manifest,
+		TypeScriptEnvHash: envHash,
+		TypeScriptEpochTS: epochTS,
+		CommittedSources:  sources,
 	}, nil
 }
 
@@ -311,15 +312,20 @@ func (s *Store) LoadReplayPlan(ctx context.Context, session model.SessionID, tar
 	if err != nil {
 		return store.ReplayPlan{}, err
 	}
+	transitions, err := s.buildRuntimeTransitions(ctx, session, branch, targetCell)
+	if err != nil {
+		return store.ReplayPlan{}, err
+	}
 
 	return store.ReplayPlan{
-		Session:       session,
-		Branch:        branch,
-		TargetCell:    targetCell,
-		RuntimeHash:   runtime.RuntimeHash,
-		RuntimeConfig: config,
-		Steps:         steps,
-		Decisions:     decisions,
+		Session:            session,
+		Branch:             branch,
+		TargetCell:         targetCell,
+		RuntimeHash:        runtime.RuntimeHash,
+		RuntimeConfig:      config,
+		RuntimeTransitions: transitions,
+		Steps:              steps,
+		Decisions:          decisions,
 	}, nil
 }
 
@@ -364,20 +370,9 @@ func (s *Store) LoadSessionState(ctx context.Context, session model.SessionID) (
 	if err != nil {
 		return store.SessionState{}, err
 	}
-	runtime, err := s.loadRuntimeAttached(ctx, session)
-	if err != nil {
-		return store.SessionState{}, err
-	}
-	config, err := s.LoadRuntimeConfig(ctx, runtime.RuntimeHash)
-	if err != nil {
-		return store.SessionState{}, err
-	}
-
 	state := store.SessionState{
-		Session:       session,
-		Branch:        started.RootBranch,
-		RuntimeHash:   runtime.RuntimeHash,
-		RuntimeConfig: config,
+		Session: session,
+		Branch:  started.RootBranch,
 	}
 
 	const q = `
@@ -434,6 +429,12 @@ ORDER BY id ASC`
 	if rowsErr != nil {
 		return store.SessionState{}, fmt.Errorf("sqlite: LoadSessionState rows: %w", rowsErr)
 	}
+	runtimeHash, config, err := s.loadActiveRuntime(ctx, session, state.Branch, state.Head)
+	if err != nil {
+		return store.SessionState{}, err
+	}
+	state.RuntimeHash = runtimeHash
+	state.RuntimeConfig = config
 
 	return state, nil
 }
@@ -451,6 +452,8 @@ func extractIndexColumns(fact model.Fact) (session model.SessionID, branch model
 		return f.Session, "", ""
 	case model.RuntimeAttached:
 		return f.Session, "", ""
+	case model.RuntimeTransitioned:
+		return f.Session, f.Branch, f.AfterCell
 	case model.CellChecked:
 		return f.Session, f.Branch, f.Cell
 	case model.CellEvaluated:
@@ -572,6 +575,187 @@ LIMIT 1`
 	return f, nil
 }
 
+type runtimeTransitionRecord struct {
+	id   int64
+	fact model.RuntimeTransitioned
+}
+
+type runtimeBranchScope struct {
+	cells              map[model.CellID]struct{}
+	maxFactID          int64
+	allowEmptyBoundary bool
+}
+
+type runtimeVisibility struct {
+	scopes map[model.BranchID]runtimeBranchScope
+}
+
+func (v runtimeVisibility) visible(record runtimeTransitionRecord) bool {
+	scope, ok := v.scopes[record.fact.Branch]
+	if !ok || record.id > scope.maxFactID {
+		return false
+	}
+	if record.fact.AfterCell == "" {
+		return scope.allowEmptyBoundary
+	}
+	_, ok = scope.cells[record.fact.AfterCell]
+	return ok
+}
+
+func (s *Store) loadRuntimeTransitionRecords(ctx context.Context, session model.SessionID) ([]runtimeTransitionRecord, error) {
+	const q = `
+SELECT id, payload FROM facts
+WHERE session = ? AND fact_type = ?
+ORDER BY id ASC`
+
+	rows, err := s.db.QueryContext(ctx, q, string(session), model.FactTypeRuntimeTransitioned)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: loadRuntimeTransitionFacts query: %w", err)
+	}
+
+	var transitions []runtimeTransitionRecord
+	for rows.Next() {
+		var id int64
+		var payload string
+		if err := rows.Scan(&id, &payload); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("sqlite: loadRuntimeTransitionFacts scan: %w", err)
+		}
+		var f model.RuntimeTransitioned
+		if err := json.Unmarshal([]byte(payload), &f); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("sqlite: loadRuntimeTransitionFacts decode: %w", err)
+		}
+		transitions = append(transitions, runtimeTransitionRecord{id: id, fact: f})
+	}
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	if rowsErr != nil {
+		return nil, fmt.Errorf("sqlite: loadRuntimeTransitionFacts rows: %w", rowsErr)
+	}
+	return transitions, nil
+}
+
+func (s *Store) loadActiveRuntime(ctx context.Context, session model.SessionID, branch model.BranchID, head model.CellID) (string, json.RawMessage, error) {
+	runtime, err := s.loadRuntimeAttached(ctx, session)
+	if err != nil {
+		return "", nil, err
+	}
+	currentHash := runtime.RuntimeHash
+	if head == "" {
+		transitions, err := s.loadRuntimeTransitionRecords(ctx, session)
+		if err != nil {
+			return "", nil, err
+		}
+		for _, transition := range transitions {
+			if transition.fact.Branch == branch && transition.fact.AfterCell == "" {
+				currentHash = transition.fact.RuntimeHash
+			}
+		}
+	} else {
+		visibility, err := s.buildRuntimeVisibility(ctx, session, branch, head)
+		if err != nil {
+			return "", nil, err
+		}
+		records, err := s.loadRuntimeTransitionRecords(ctx, session)
+		if err != nil {
+			return "", nil, err
+		}
+		for _, record := range records {
+			if visibility.visible(record) {
+				currentHash = record.fact.RuntimeHash
+			}
+		}
+	}
+	config, err := s.LoadRuntimeConfig(ctx, currentHash)
+	if err != nil {
+		return "", nil, err
+	}
+	return currentHash, config, nil
+}
+
+func (s *Store) buildRuntimeTransitions(ctx context.Context, session model.SessionID, branch model.BranchID, stopCell model.CellID) ([]store.RuntimeTransition, error) {
+	visibility, err := s.buildRuntimeVisibility(ctx, session, branch, stopCell)
+	if err != nil {
+		return nil, err
+	}
+	records, err := s.loadRuntimeTransitionRecords(ctx, session)
+	if err != nil {
+		return nil, err
+	}
+	transitions := make([]store.RuntimeTransition, 0, len(records))
+	for _, record := range records {
+		if !visibility.visible(record) {
+			continue
+		}
+		config, err := s.LoadRuntimeConfig(ctx, record.fact.RuntimeHash)
+		if err != nil {
+			return nil, err
+		}
+		transitions = append(transitions, store.RuntimeTransition{
+			AfterCell:     record.fact.AfterCell,
+			RuntimeHash:   record.fact.RuntimeHash,
+			RuntimeConfig: config,
+		})
+	}
+	return transitions, nil
+}
+
+func (s *Store) buildRuntimeVisibility(ctx context.Context, session model.SessionID, branch model.BranchID, stopCell model.CellID) (runtimeVisibility, error) {
+	chainCells, chainBranches, err := s.collectAncestorChain(ctx, session, branch, stopCell)
+	if err != nil {
+		return runtimeVisibility{}, err
+	}
+	scopes := make(map[model.BranchID]runtimeBranchScope)
+	for i, cellID := range chainCells {
+		branchID := chainBranches[i]
+		scope := scopes[branchID]
+		if scope.cells == nil {
+			scope.cells = make(map[model.CellID]struct{})
+			scope.maxFactID = math.MaxInt64
+		}
+		scope.cells[cellID] = struct{}{}
+		scopes[branchID] = scope
+	}
+	rootBranch := branch
+	if len(chainBranches) > 0 {
+		rootBranch = chainBranches[0]
+	} else {
+		started, err := s.loadSessionStarted(ctx, session)
+		if err != nil {
+			return runtimeVisibility{}, err
+		}
+		rootBranch = started.RootBranch
+	}
+	rootScope := scopes[rootBranch]
+	if rootScope.maxFactID == 0 {
+		rootScope.maxFactID = math.MaxInt64
+	}
+	rootScope.allowEmptyBoundary = true
+	scopes[rootBranch] = rootScope
+
+	currentBranch := branch
+	currentCutoff := int64(math.MaxInt64)
+	for {
+		scope := scopes[currentBranch]
+		if scope.maxFactID == 0 || scope.maxFactID > currentCutoff {
+			scope.maxFactID = currentCutoff
+		}
+		scopes[currentBranch] = scope
+
+		parent, _, branchCreatedID, found, err := s.branchParentRecord(ctx, session, currentBranch)
+		if err != nil {
+			return runtimeVisibility{}, err
+		}
+		if !found {
+			break
+		}
+		currentBranch = parent
+		currentCutoff = branchCreatedID
+	}
+	return runtimeVisibility{scopes: scopes}, nil
+}
+
 // loadManifest returns the manifest from the first ManifestAttached fact for
 // the given session.
 func (s *Store) loadManifest(ctx context.Context, session model.SessionID) (model.Manifest, error) {
@@ -610,6 +794,44 @@ func (s *Store) loadCommittedSources(ctx context.Context, session model.SessionI
 		sources = append(sources, src)
 	}
 	return sources, nil
+}
+
+func (s *Store) loadStaticEnvState(ctx context.Context, session model.SessionID, branch model.BranchID, stopCell model.CellID) (envHash string, epochTS string, sources []string, err error) {
+	if stopCell == "" {
+		return "", "", nil, nil
+	}
+
+	chainCells, chainBranches, err := s.collectAncestorChain(ctx, session, branch, stopCell)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	segmentStart := 0
+	sources = make([]string, 0, len(chainCells))
+	for i, cellID := range chainCells {
+		src, cellEnvHash, cellEpochTS, err := s.loadCellStaticDetails(ctx, session, chainBranches[i], cellID)
+		if err != nil {
+			return "", "", nil, err
+		}
+		sources = append(sources, src)
+		if cellEnvHash == "" {
+			continue
+		}
+		if envHash == "" {
+			envHash = cellEnvHash
+			epochTS = cellEpochTS
+			continue
+		}
+		if cellEnvHash != envHash {
+			envHash = cellEnvHash
+			epochTS = cellEpochTS
+			segmentStart = i
+		}
+	}
+	if segmentStart > 0 {
+		sources = append([]string(nil), sources[segmentStart:]...)
+	}
+	return envHash, epochTS, sources, nil
 }
 
 // collectAncestorChain resolves the full ordered list of committed cell IDs
@@ -670,31 +892,37 @@ func (s *Store) collectAncestorChain(ctx context.Context, session model.SessionI
 // non-root branch by reading its BranchCreated fact. For the root branch
 // (no BranchCreated fact) it returns found=false.
 func (s *Store) branchParent(ctx context.Context, session model.SessionID, branch model.BranchID) (parent model.BranchID, forkCell model.CellID, found bool, err error) {
+	parent, forkCell, _, found, err = s.branchParentRecord(ctx, session, branch)
+	return parent, forkCell, found, err
+}
+
+func (s *Store) branchParentRecord(ctx context.Context, session model.SessionID, branch model.BranchID) (parent model.BranchID, forkCell model.CellID, createdFactID int64, found bool, err error) {
 	const q = `
-SELECT payload FROM facts
+SELECT id, payload FROM facts
 WHERE session = ? AND branch = ? AND fact_type = ?
 ORDER BY id ASC
 LIMIT 1`
 
 	row := s.db.QueryRowContext(ctx, q, string(session), string(branch), model.FactTypeBranchCreated)
+	var id int64
 	var payload string
-	if err := row.Scan(&payload); err != nil {
+	if err := row.Scan(&id, &payload); err != nil {
 		if err == sql.ErrNoRows {
-			return "", "", false, nil
+			return "", "", 0, false, nil
 		}
-		return "", "", false, fmt.Errorf("sqlite: branchParent scan: %w", err)
+		return "", "", 0, false, fmt.Errorf("sqlite: branchParent scan: %w", err)
 	}
 	var f model.BranchCreated
 	if err := json.Unmarshal([]byte(payload), &f); err != nil {
-		return "", "", false, fmt.Errorf("sqlite: branchParent decode: %w", err)
+		return "", "", 0, false, fmt.Errorf("sqlite: branchParent decode: %w", err)
 	}
 	// BranchCreated.Branch is the NEW branch; we need the parent branch.
 	// The parent is the branch that owned ParentCell.
 	parentBranch, err := s.branchForCell(ctx, session, f.ParentCell)
 	if err != nil {
-		return "", "", false, err
+		return "", "", 0, false, err
 	}
-	return parentBranch, f.ParentCell, true, nil
+	return parentBranch, f.ParentCell, id, true, nil
 }
 
 // committedCellsUpTo returns CellCommitted cell IDs on the given branch, in
@@ -752,6 +980,28 @@ LIMIT 1`
 		return "", fmt.Errorf("sqlite: loadCellSource decode: %w", err)
 	}
 	return f.Source, nil
+}
+
+func (s *Store) loadCellStaticDetails(ctx context.Context, session model.SessionID, branch model.BranchID, cell model.CellID) (src, envHash, epochTS string, err error) {
+	const q = `
+SELECT payload FROM facts
+WHERE session = ? AND branch = ? AND cell = ? AND fact_type = ?
+ORDER BY id DESC
+LIMIT 1`
+
+	row := s.db.QueryRowContext(ctx, q, string(session), string(branch), string(cell), model.FactTypeCellChecked)
+	var payload string
+	if err := row.Scan(&payload); err != nil {
+		if err == sql.ErrNoRows {
+			return "", "", "", fmt.Errorf("sqlite: loadCellStaticDetails: no CellChecked for cell %q", cell)
+		}
+		return "", "", "", fmt.Errorf("sqlite: loadCellStaticDetails scan: %w", err)
+	}
+	var f model.CellChecked
+	if err := json.Unmarshal([]byte(payload), &f); err != nil {
+		return "", "", "", fmt.Errorf("sqlite: loadCellStaticDetails decode: %w", err)
+	}
+	return f.Source, f.TypeScriptEnvHash, f.TypeScriptEpochTS, nil
 }
 
 // branchForCell returns the branch ID for the CellCommitted fact matching the

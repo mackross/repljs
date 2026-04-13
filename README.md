@@ -7,6 +7,24 @@
 - replay-aware host effects
 - structured value transport with `jswire`
 
+## Go Package Surface
+
+Most embedders should import the top-level package:
+
+```go
+import repl "github.com/mackross/repljs"
+```
+
+It re-exports the embedder-facing contracts and enums, and provides:
+
+- `repl.New()` for the default engine implementation
+- `repl.NewTypeScriptFactory()` for the default incremental TS checker
+
+Concrete store backends still live in subpackages such as:
+
+- `github.com/mackross/repljs/store/sqlite`
+- `github.com/mackross/repljs/store/mem`
+
 ## REPL Details And Quirks
 
 This section is the "non-obvious behavior" list: semantics that are easy to
@@ -54,7 +72,6 @@ project.
 
 ### Top-level REPL input
 
-- One-line REPL input treats a top-level object literal like an expression. For example, entering `{ a: "hello" }` is rewritten so it evaluates as an object literal instead of a block statement with a labeled expression.
 - All cells run through the same internal async wrapper model. That is how top-level `await` works, and it also keeps completion behavior consistent across cells with and without `await`.
 - `cmd/repl` starts in `js` mode and supports `:ts` / `:js` to switch the default language for later submits.
 - Because every cell uses the wrapper model, some behavior now follows wrapped-function semantics rather than raw script semantics. See tests around top-level await and wrapped-cell behavior for the current edge cases.
