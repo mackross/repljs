@@ -10,6 +10,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/mackross/repljs/model"
 )
@@ -159,6 +160,28 @@ type StaticEnvSnapshot struct {
 	CommittedSources []string
 }
 
+type EffectRecordStatus string
+
+const (
+	EffectRecordPending   EffectRecordStatus = "pending"
+	EffectRecordCompleted EffectRecordStatus = "completed"
+	EffectRecordFailed    EffectRecordStatus = "failed"
+)
+
+// EffectRecord is the structured read model for one effect invocation.
+type EffectRecord struct {
+	Effect       model.EffectID
+	Cell         model.CellID
+	FunctionName string
+	Params       []byte
+	ReplayPolicy model.ReplayPolicy
+	Status       EffectRecordStatus
+	Result       []byte
+	ErrorMessage string
+	StartedAt    time.Time
+	UpdatedAt    time.Time
+}
+
 // Store is the persistence boundary for the repl engine.
 //
 // Implementations must be safe for concurrent use by multiple goroutines.
@@ -200,4 +223,8 @@ type Store interface {
 	// LoadSessionState returns the active branch/head cursor for the given
 	// session together with its attached runtime descriptor.
 	LoadSessionState(ctx context.Context, session model.SessionID) (SessionState, error)
+
+	// LoadCellEffects returns the effect records started by the given cell in
+	// append order.
+	LoadCellEffects(ctx context.Context, session model.SessionID, cell model.CellID) ([]EffectRecord, error)
 }

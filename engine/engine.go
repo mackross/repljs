@@ -300,6 +300,10 @@ type TypeScriptEnvProvider func(ctx context.Context, tsCtx TypeScriptEnvContext)
 // bytes must use the same bridge encoding.
 type HostFuncInvoke func(ctx context.Context, params []byte) ([]byte, error)
 
+// HostFuncInvokeWithEffectID is the Go implementation behind one journaled host
+// call when the embedder also needs the effect ID selected by the runtime.
+type HostFuncInvokeWithEffectID func(ctx context.Context, effectID model.EffectID, params []byte) ([]byte, error)
+
 // HostFuncBuilder wraps Go implementations with the runtime's effect-journaling
 // and replay machinery. The delegate chooses where the returned callables are
 // installed in the goja object graph.
@@ -311,6 +315,14 @@ type HostFuncBuilder interface {
 	// WrapAsync returns a callable goja binding that resolves via a JS Promise
 	// while still passing through effect journaling and replay control.
 	WrapAsync(name string, replay model.ReplayPolicy, invoke HostFuncInvoke) func(goja.FunctionCall) goja.Value
+
+	// WrapSyncWithEffectID mirrors WrapSync but also returns the effect ID that
+	// the runtime selected for this invocation.
+	WrapSyncWithEffectID(name string, replay model.ReplayPolicy, invoke HostFuncInvokeWithEffectID) func(goja.FunctionCall) (goja.Value, model.EffectID)
+
+	// WrapAsyncWithEffectID mirrors WrapAsync but also returns the effect ID that
+	// the runtime selected for this invocation.
+	WrapAsyncWithEffectID(name string, replay model.ReplayPolicy, invoke HostFuncInvokeWithEffectID) func(goja.FunctionCall) (goja.Value, model.EffectID)
 }
 
 type VMDelegate interface {

@@ -60,6 +60,14 @@ type ReplayPlan = store.ReplayPlan
 type HeadRecord = store.HeadRecord
 type SessionState = store.SessionState
 type StaticEnvSnapshot = store.StaticEnvSnapshot
+type EffectRecordStatus = store.EffectRecordStatus
+type EffectRecord = store.EffectRecord
+
+const (
+	EffectRecordPending   = store.EffectRecordPending
+	EffectRecordCompleted = store.EffectRecordCompleted
+	EffectRecordFailed    = store.EffectRecordFailed
+)
 
 type SessionID = model.SessionID
 type BranchID = model.BranchID

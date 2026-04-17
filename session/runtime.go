@@ -522,20 +522,40 @@ func rejectJSError(vm *goja.Runtime, reject func(interface{}) error, kind string
 }
 
 func (b hostFuncBuilder) WrapSync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke) func(goja.FunctionCall) goja.Value {
+	withEffectID := b.WrapSyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params []byte) ([]byte, error) {
+		return invoke(ctx, params)
+	})
 	return func(call goja.FunctionCall) goja.Value {
-		if b.router == nil || b.router.vm == nil {
-			panic("internal runtime: missing host function router")
-		}
-		return b.router.invokeSync(name, replay, invoke, call)
+		value, _ := withEffectID(call)
+		return value
 	}
 }
 
 func (b hostFuncBuilder) WrapAsync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke) func(goja.FunctionCall) goja.Value {
+	withEffectID := b.WrapAsyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params []byte) ([]byte, error) {
+		return invoke(ctx, params)
+	})
 	return func(call goja.FunctionCall) goja.Value {
+		value, _ := withEffectID(call)
+		return value
+	}
+}
+
+func (b hostFuncBuilder) WrapSyncWithEffectID(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvokeWithEffectID) func(goja.FunctionCall) (goja.Value, model.EffectID) {
+	return func(call goja.FunctionCall) (goja.Value, model.EffectID) {
 		if b.router == nil || b.router.vm == nil {
-			return goja.Undefined()
+			panic("internal runtime: missing host function router")
 		}
-		return b.router.invokeAsync(name, replay, invoke, call)
+		return b.router.invokeSyncWithEffectID(name, replay, invoke, call)
+	}
+}
+
+func (b hostFuncBuilder) WrapAsyncWithEffectID(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvokeWithEffectID) func(goja.FunctionCall) (goja.Value, model.EffectID) {
+	return func(call goja.FunctionCall) (goja.Value, model.EffectID) {
+		if b.router == nil || b.router.vm == nil {
+			return goja.Undefined(), ""
+		}
+		return b.router.invokeAsyncWithEffectID(name, replay, invoke, call)
 	}
 }
 
@@ -992,6 +1012,13 @@ func (r *branchRuntime) close() {
 }
 
 func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
+	value, _ := r.invokeSyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params []byte) ([]byte, error) {
+		return invoke(ctx, params)
+	}, call)
+	return value
+}
+
+func (r *hostFunctionRouter) invokeSyncWithEffectID(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvokeWithEffectID, call goja.FunctionCall) (goja.Value, model.EffectID) {
 	vm := r.vm
 	params, err := marshalFirstArgument(call)
 	if err != nil {
@@ -1008,7 +1035,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 		if len(inv.decision.RecordedResult) == 0 {
 			panicJSError(vm, "Error", "host function %q replay: missing recorded result for effect %q", name, inv.effectID)
 		}
-		return bridgeResultToValue(vm, inv.decision.RecordedResult)
+		return bridgeResultToValue(vm, inv.decision.RecordedResult), inv.effectID
 	}
 
 	live, err := r.currentLiveState()
@@ -1029,7 +1056,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 	}
 	live.acc.recordStarted(effectID, name, params, replay)
 
-	result, err := invoke(live.ctx, params)
+	result, err := invoke(live.ctx, effectID, params)
 	if err != nil {
 		live.acc.recordFailed(effectID, err.Error())
 		_ = r.store.AppendFact(context.Background(), model.EffectFailed{
@@ -1057,7 +1084,7 @@ func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, 
 		panicJSError(vm, "Error", "%s", msg)
 	}
 	live.acc.recordCompleted(effectID, result)
-	return bridgeResultToValue(vm, result)
+	return bridgeResultToValue(vm, result), effectID
 }
 
 func (r *hostFunctionRouter) trackPromiseRejection(p *goja.Promise, operation goja.PromiseRejectionOperation) {
@@ -1141,28 +1168,35 @@ func renderSummaryValue(v goja.Value) string {
 }
 
 func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
+	value, _ := r.invokeAsyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params []byte) ([]byte, error) {
+		return invoke(ctx, params)
+	}, call)
+	return value
+}
+
+func (r *hostFunctionRouter) invokeAsyncWithEffectID(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvokeWithEffectID, call goja.FunctionCall) (goja.Value, model.EffectID) {
 	vm := r.vm
 	promise, resolve, reject := vm.NewPromise()
 
 	params, err := marshalFirstArgument(call)
 	if err != nil {
 		rejectJSError(vm, reject, "TypeError", "%v", err)
-		return vm.ToValue(promise)
+		return vm.ToValue(promise), ""
 	}
 
 	if r.currentMode() == hostFunctionModeReplay {
 		inv, replayErr := r.nextReplayInvocation()
 		if replayErr != nil {
 			rejectJSError(vm, reject, "Error", "host function %q replay: %v", name, replayErr)
-			return vm.ToValue(promise)
+			return vm.ToValue(promise), ""
 		}
 		if inv.decision.Policy == model.ReplayNonReplayable {
 			rejectJSError(vm, reject, "Error", "non-replayable effect: function %q effectID %q cannot be replayed", name, inv.effectID)
-			return vm.ToValue(promise)
+			return vm.ToValue(promise), inv.effectID
 		}
 		if len(inv.decision.RecordedResult) == 0 {
 			rejectJSError(vm, reject, "Error", "host function %q replay: missing recorded result for effect %q", name, inv.effectID)
-			return vm.ToValue(promise)
+			return vm.ToValue(promise), inv.effectID
 		}
 		order := inv.decision.CompletionOrder
 		if order <= 0 {
@@ -1171,13 +1205,13 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 		r.queueReplayAsync(order, func(vm *goja.Runtime) {
 			_ = resolve(bridgeResultToValue(vm, inv.decision.RecordedResult))
 		})
-		return vm.ToValue(promise)
+		return vm.ToValue(promise), inv.effectID
 	}
 
 	live, stateErr := r.currentLiveState()
 	if stateErr != nil {
 		rejectJSError(vm, reject, "Error", "host function %q: %v", name, stateErr)
-		return vm.ToValue(promise)
+		return vm.ToValue(promise), ""
 	}
 	effectID := model.EffectID(uuid.NewString())
 	if err := r.store.AppendFact(context.Background(), model.EffectStarted{
@@ -1190,12 +1224,12 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 		At:           time.Now().UTC(),
 	}); err != nil {
 		rejectJSError(vm, reject, "Error", "host function %q: journal EffectStarted: %v", name, err)
-		return vm.ToValue(promise)
+		return vm.ToValue(promise), ""
 	}
 	live.acc.addAsync(effectID, name, params, replay)
 
 	go func(callCtx context.Context) {
-		result, invokeErr := invoke(callCtx, params)
+		result, invokeErr := invoke(callCtx, effectID, params)
 		engine.RunOnRuntimeLoop(vm, func(vm *goja.Runtime) {
 			now := time.Now().UTC()
 			if invokeErr != nil {
@@ -1231,7 +1265,7 @@ func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy,
 		})
 	}(live.ctx)
 
-	return vm.ToValue(promise)
+	return vm.ToValue(promise), effectID
 }
 
 func marshalFirstArgument(call goja.FunctionCall) ([]byte, error) {

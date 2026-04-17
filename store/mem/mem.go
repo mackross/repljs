@@ -263,6 +263,55 @@ func (s *Store) LoadSessionState(_ context.Context, session model.SessionID) (st
 	return state, nil
 }
 
+func (s *Store) LoadCellEffects(_ context.Context, session model.SessionID, cell model.CellID) ([]store.EffectRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []store.EffectRecord
+	indexByEffect := map[model.EffectID]int{}
+	for _, entry := range s.facts {
+		if entry.session != session {
+			continue
+		}
+		switch fact := entry.fact.(type) {
+		case model.EffectStarted:
+			if fact.Cell != cell {
+				continue
+			}
+			indexByEffect[fact.Effect] = len(out)
+			out = append(out, store.EffectRecord{
+				Effect:       fact.Effect,
+				Cell:         fact.Cell,
+				FunctionName: fact.FunctionName,
+				Params:       append([]byte(nil), fact.Params...),
+				ReplayPolicy: fact.ReplayPolicy,
+				Status:       store.EffectRecordPending,
+				StartedAt:    fact.At,
+				UpdatedAt:    fact.At,
+			})
+		case model.EffectCompleted:
+			idx, ok := indexByEffect[fact.Effect]
+			if !ok {
+				continue
+			}
+			out[idx].Status = store.EffectRecordCompleted
+			out[idx].Result = append([]byte(nil), fact.Result...)
+			out[idx].ErrorMessage = ""
+			out[idx].UpdatedAt = fact.At
+		case model.EffectFailed:
+			idx, ok := indexByEffect[fact.Effect]
+			if !ok {
+				continue
+			}
+			out[idx].Status = store.EffectRecordFailed
+			out[idx].Result = nil
+			out[idx].ErrorMessage = fact.ErrorMessage
+			out[idx].UpdatedAt = fact.At
+		}
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers (called with s.mu read-lock already held)
 // ---------------------------------------------------------------------------

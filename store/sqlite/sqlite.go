@@ -60,6 +60,15 @@ type Store struct {
 	db *sql.DB
 }
 
+// DB exposes the underlying database handle for embedder-owned extension
+// tables. Callers must not mutate repljs-managed rows outside the public API.
+func (s *Store) DB() *sql.DB {
+	if s == nil {
+		return nil
+	}
+	return s.db
+}
+
 // LatestSessionID returns the most recently started session in the database.
 func (s *Store) LatestSessionID(ctx context.Context) (model.SessionID, error) {
 	const q = `
@@ -437,6 +446,86 @@ ORDER BY id ASC`
 	state.RuntimeConfig = config
 
 	return state, nil
+}
+
+func (s *Store) LoadCellEffects(ctx context.Context, session model.SessionID, cell model.CellID) ([]store.EffectRecord, error) {
+	const q = `
+SELECT fact_type, payload
+FROM facts
+WHERE session = ? AND fact_type IN (?, ?, ?)
+ORDER BY id ASC`
+
+	rows, err := s.db.QueryContext(ctx, q,
+		string(session),
+		model.FactTypeEffectStarted,
+		model.FactTypeEffectCompleted,
+		model.FactTypeEffectFailed,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: LoadCellEffects query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.EffectRecord
+	indexByEffect := map[model.EffectID]int{}
+	for rows.Next() {
+		var factType string
+		var payload string
+		if err := rows.Scan(&factType, &payload); err != nil {
+			return nil, fmt.Errorf("sqlite: LoadCellEffects scan: %w", err)
+		}
+		switch factType {
+		case model.FactTypeEffectStarted:
+			var fact model.EffectStarted
+			if err := json.Unmarshal([]byte(payload), &fact); err != nil {
+				return nil, fmt.Errorf("sqlite: LoadCellEffects decode started: %w", err)
+			}
+			if fact.Cell != cell {
+				continue
+			}
+			indexByEffect[fact.Effect] = len(out)
+			out = append(out, store.EffectRecord{
+				Effect:       fact.Effect,
+				Cell:         fact.Cell,
+				FunctionName: fact.FunctionName,
+				Params:       append([]byte(nil), fact.Params...),
+				ReplayPolicy: fact.ReplayPolicy,
+				Status:       store.EffectRecordPending,
+				StartedAt:    fact.At,
+				UpdatedAt:    fact.At,
+			})
+		case model.FactTypeEffectCompleted:
+			var fact model.EffectCompleted
+			if err := json.Unmarshal([]byte(payload), &fact); err != nil {
+				return nil, fmt.Errorf("sqlite: LoadCellEffects decode completed: %w", err)
+			}
+			idx, ok := indexByEffect[fact.Effect]
+			if !ok {
+				continue
+			}
+			out[idx].Status = store.EffectRecordCompleted
+			out[idx].Result = append([]byte(nil), fact.Result...)
+			out[idx].ErrorMessage = ""
+			out[idx].UpdatedAt = fact.At
+		case model.FactTypeEffectFailed:
+			var fact model.EffectFailed
+			if err := json.Unmarshal([]byte(payload), &fact); err != nil {
+				return nil, fmt.Errorf("sqlite: LoadCellEffects decode failed: %w", err)
+			}
+			idx, ok := indexByEffect[fact.Effect]
+			if !ok {
+				continue
+			}
+			out[idx].Status = store.EffectRecordFailed
+			out[idx].Result = nil
+			out[idx].ErrorMessage = fact.ErrorMessage
+			out[idx].UpdatedAt = fact.At
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: LoadCellEffects rows: %w", err)
+	}
+	return out, nil
 }
 
 // --- internal helpers ---
