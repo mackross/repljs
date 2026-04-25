@@ -981,15 +981,26 @@ func (r *branchRuntime) flushLoop(ctx context.Context) error {
 	}
 }
 
+func (r *branchRuntime) flushLoopBestEffort() {
+	if r == nil || r.loop == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), directRunTimeout)
+	defer cancel()
+	_ = r.flushLoop(ctx)
+}
+
 func (r *branchRuntime) awaitCellSettled(ctx context.Context, acc *effectAccumulator) error {
 	if acc == nil {
 		return r.flushLoop(ctx)
 	}
 	for {
 		if err := acc.waitPendingAsync(ctx); err != nil {
+			r.flushLoopBestEffort()
 			return err
 		}
 		if err := r.flushLoop(ctx); err != nil {
+			r.flushLoopBestEffort()
 			return err
 		}
 		if acc.pendingAsyncCount() == 0 {

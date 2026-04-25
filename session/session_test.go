@@ -94,6 +94,10 @@ func (s *recordingStore) LoadSessionState(ctx context.Context, sess model.Sessio
 	return s.wrapped.LoadSessionState(ctx, sess)
 }
 
+func (s *recordingStore) LoadCellEffects(ctx context.Context, sess model.SessionID, cell model.CellID) ([]store.EffectRecord, error) {
+	return s.wrapped.LoadCellEffects(ctx, sess, cell)
+}
+
 func (s *recordingStore) Facts() []model.Fact {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2086,6 +2090,10 @@ func (f *failingStore) LoadSessionState(ctx context.Context, sess model.SessionI
 	return f.wrapped.LoadSessionState(ctx, sess)
 }
 
+func (f *failingStore) LoadCellEffects(ctx context.Context, sess model.SessionID, cell model.CellID) ([]store.EffectRecord, error) {
+	return f.wrapped.LoadCellEffects(ctx, sess, cell)
+}
+
 type selectiveFailingStore struct {
 	wrapped *memstore.Store
 	fail    func(model.Fact) error
@@ -2130,6 +2138,10 @@ func (s *selectiveFailingStore) LoadFailures(ctx context.Context, sess model.Ses
 
 func (s *selectiveFailingStore) LoadSessionState(ctx context.Context, sess model.SessionID) (store.SessionState, error) {
 	return s.wrapped.LoadSessionState(ctx, sess)
+}
+
+func (s *selectiveFailingStore) LoadCellEffects(ctx context.Context, sess model.SessionID, cell model.CellID) ([]store.EffectRecord, error) {
+	return s.wrapped.LoadCellEffects(ctx, sess, cell)
 }
 
 type loadStaticEnvFailingStore struct {
@@ -2186,6 +2198,10 @@ func (s *loadStaticEnvFailingStore) LoadFailures(ctx context.Context, sess model
 
 func (s *loadStaticEnvFailingStore) LoadSessionState(ctx context.Context, sess model.SessionID) (store.SessionState, error) {
 	return s.wrapped.LoadSessionState(ctx, sess)
+}
+
+func (s *loadStaticEnvFailingStore) LoadCellEffects(ctx context.Context, sess model.SessionID, cell model.CellID) ([]store.EffectRecord, error) {
+	return s.wrapped.LoadCellEffects(ctx, sess, cell)
 }
 
 // TestSession_Submit_AppendErrorDoesNotAdvanceHead verifies that a store
@@ -4211,6 +4227,86 @@ func TestSession_Submit_ConcurrentEffectsRecordBothCompletions(t *testing.T) {
 	if delegate.CallCount("left") != 1 || delegate.CallCount("right") != 1 {
 		t.Fatalf("expected one call per host function, got left=%d right=%d", delegate.CallCount("left"), delegate.CallCount("right"))
 	}
+}
+
+func TestSession_Submit_TimeoutIncludesCompletedAndPendingLinkedEffects(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	e := session.New()
+	fix := newRecordingFixture(t)
+	delegate := newEffectHostDelegate()
+	slowStarted := make(chan struct{}, 1)
+	slowRelease := make(chan struct{})
+	var slowReleaseOnce sync.Once
+	t.Cleanup(func() {
+		slowReleaseOnce.Do(func() {
+			close(slowRelease)
+		})
+	})
+	delegate.SetAsync("fastOne", func(_ context.Context, _ []byte) ([]byte, error) {
+		return mustEncodeBridgeValue("fast-one"), nil
+	})
+	delegate.SetAsync("fastTwo", func(_ context.Context, _ []byte) ([]byte, error) {
+		return mustEncodeBridgeValue("fast-two"), nil
+	})
+	delegate.SetAsync("slow", func(_ context.Context, _ []byte) ([]byte, error) {
+		select {
+		case slowStarted <- struct{}{}:
+		default:
+		}
+		<-slowRelease
+		return mustEncodeBridgeValue("slow"), nil
+	})
+	fix.deps.VMDelegate = delegate
+
+	sess, err := e.StartSession(context.Background(), defaultConfig(), fix.deps)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer sess.Close()
+
+	_, err = sess.Submit(ctx, `(async () => {
+  const one = await fastOne(null);
+  const two = await fastTwo(null);
+  const three = slow(null);
+  await new Promise(() => {});
+  return [one, two, three];
+})()`)
+	if err == nil {
+		t.Fatal("expected timeout waiting on pending host promise")
+	}
+	var submitErr *engine.SubmitFailure
+	if !errors.As(err, &submitErr) {
+		t.Fatalf("expected SubmitFailure, got %T (%v)", err, err)
+	}
+
+	select {
+	case <-slowStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for slow effect to start")
+	}
+
+	if len(submitErr.LinkedEffects) != 3 {
+		t.Fatalf("expected 3 linked effects, got %+v", submitErr.LinkedEffects)
+	}
+
+	statuses := map[string]engine.EffectStatus{}
+	for _, effect := range submitErr.LinkedEffects {
+		statuses[effect.FunctionName] = effect.Status
+	}
+	if statuses["fastOne"] != engine.EffectStatusCompleted {
+		t.Fatalf("fastOne status = %q, want completed", statuses["fastOne"])
+	}
+	if statuses["fastTwo"] != engine.EffectStatusCompleted {
+		t.Fatalf("fastTwo status = %q, want completed", statuses["fastTwo"])
+	}
+	if statuses["slow"] != engine.EffectStatusPending {
+		t.Fatalf("slow status = %q, want pending", statuses["slow"])
+	}
+	slowReleaseOnce.Do(func() {
+		close(slowRelease)
+	})
 }
 
 func TestSession_Submit_EffectFailureDoesNotCommitCell(t *testing.T) {
