@@ -6,6 +6,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/fastschema/qjs"
@@ -656,6 +657,26 @@ func TestEncodeGoja_FulfilledPromiseSkipsEnumerableMethodProps(t *testing.T) {
 	got := snapshotGojaValue(t, vm, promise.Result())
 	want := snapshotGojaValue(t, vm, evalGoja(t, vm, `({ ok: true, status: 200 })`))
 	assertDeepEqual(t, "fulfilled promise result without methods", want, got)
+}
+
+func TestEncodeGoja_LargeDenseArrayDoesNotHang(t *testing.T) {
+	vm := mustNewGoja(t)
+	value := evalGoja(t, vm, `Object.keys("x".repeat(13000))`)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := EncodeGoja(value)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("EncodeGoja() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EncodeGoja() did not return within 2s for a large dense array")
+	}
 }
 
 func TestWireGraphTypedArrayRoundTrip(t *testing.T) {

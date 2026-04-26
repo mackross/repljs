@@ -423,9 +423,13 @@ func (e *gojaEncoder) encodeValue(v goja.Value) (wireValue, error) {
 		node.Kind = nodeArray
 		length := int(obj.Get("length").ToInteger())
 		node.Slots = make([]wireSlot, length)
+		ownProps := make(map[string]struct{}, length)
+		for _, name := range obj.GetOwnPropertyNames() {
+			ownProps[name] = struct{}{}
+		}
 		for i := 0; i < length; i++ {
 			prop := strconv.Itoa(i)
-			if !containsString(obj.GetOwnPropertyNames(), prop) {
+			if _, ok := ownProps[prop]; !ok {
 				continue
 			}
 			val, err := e.encodeValue(obj.Get(prop))
