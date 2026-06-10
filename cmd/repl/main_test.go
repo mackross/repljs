@@ -27,7 +27,7 @@ func TestPrintSubmitError_IncludesLinkedEffects(t *testing.T) {
 			{
 				Effect:       model.EffectID("effect-1"),
 				FunctionName: "tools.fetch",
-				Params: func() []byte {
+				Params: func() jswire.Value {
 					b, err := jswire.EncodeGoja(goja.New().ToValue(map[string]any{"url": "https://example.com"}))
 					if err != nil {
 						t.Fatalf("EncodeGoja params: %v", err)

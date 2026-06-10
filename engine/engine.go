@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/mackross/repljs/jswire"
 	"github.com/mackross/repljs/model"
 	"github.com/mackross/repljs/store"
 	"github.com/mackross/repljs/typescript"
@@ -147,7 +148,7 @@ type ValueView struct {
 
 	// Structured carries the versioned bridge encoding of the value when
 	// available. Nil for values that can only be previewed as a string.
-	Structured []byte
+	Structured jswire.Value
 }
 
 // FailureView describes one durable failed submit attempt. Unlike SubmitResult,
@@ -178,8 +179,8 @@ const (
 type EffectSummary struct {
 	Effect       model.EffectID
 	FunctionName string
-	Params       []byte
-	Result       []byte
+	Params       jswire.Value
+	Result       jswire.Value
 	ErrorMessage string
 	ReplayPolicy model.ReplayPolicy
 	Status       EffectStatus
@@ -297,12 +298,12 @@ type TypeScriptEnvProvider func(ctx context.Context, tsCtx TypeScriptEnvContext)
 
 // HostFuncInvoke is the Go implementation behind one journaled host call.
 // params is the bridge-encoded first argument passed from JS. The returned
-// bytes must use the same bridge encoding.
-type HostFuncInvoke func(ctx context.Context, params []byte) ([]byte, error)
+// value must use the same bridge encoding.
+type HostFuncInvoke func(ctx context.Context, params jswire.Value) (jswire.Value, error)
 
 // HostFuncInvokeWithEffectID is the Go implementation behind one journaled host
 // call when the embedder also needs the effect ID selected by the runtime.
-type HostFuncInvokeWithEffectID func(ctx context.Context, effectID model.EffectID, params []byte) ([]byte, error)
+type HostFuncInvokeWithEffectID func(ctx context.Context, effectID model.EffectID, params jswire.Value) (jswire.Value, error)
 
 // HostFuncBuilder wraps Go implementations with the runtime's effect-journaling
 // and replay machinery. The delegate chooses where the returned callables are

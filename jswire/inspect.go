@@ -16,6 +16,44 @@ type Inspection struct {
 	Full    string
 }
 
+// Bytes returns v as a byte slice. The returned slice aliases v.
+func (v Value) Bytes() []byte {
+	return []byte(v)
+}
+
+// Clone returns an owned copy of v.
+func (v Value) Clone() Value {
+	if v == nil {
+		return nil
+	}
+	return append(Value(nil), v...)
+}
+
+// Describe renders a compact summary and a fuller bounded representation of v.
+func (v Value) Describe() (Inspection, error) {
+	return Describe(v)
+}
+
+// DisplaySummary renders v for concise display. Invalid payloads are rendered
+// as a stable error marker instead of returning an error.
+func (v Value) DisplaySummary() string {
+	inspection, err := v.Describe()
+	if err != nil {
+		return fmt.Sprintf("<jswire-describe-error:%v>", err)
+	}
+	return inspection.Summary
+}
+
+// DisplayFull renders v for fuller display. Invalid payloads are rendered as a
+// stable error marker instead of returning an error.
+func (v Value) DisplayFull() string {
+	inspection, err := v.Describe()
+	if err != nil {
+		return fmt.Sprintf("<jswire-describe-error:%v>", err)
+	}
+	return inspection.Full
+}
+
 type inspectOptions struct {
 	maxDepth         int
 	maxProps         int
@@ -62,7 +100,7 @@ var (
 
 // Describe renders a compact summary and a fuller bounded representation of a
 // versioned jswire payload without decoding it into a live JS runtime.
-func Describe(raw []byte) (Inspection, error) {
+func Describe(raw Value) (Inspection, error) {
 	if len(raw) == 0 {
 		return Inspection{}, nil
 	}

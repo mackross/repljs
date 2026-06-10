@@ -366,7 +366,7 @@ func (d *blockingHostDelegate) CallCount(sessionID model.SessionID) int {
 }
 
 func (d *blockingHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
-	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params []byte) ([]byte, error) {
+	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params jswire.Value) (jswire.Value, error) {
 		value, err := decodeJSONStringParam(params)
 		if err != nil {
 			return nil, fmt.Errorf("hostAsync: value required")
@@ -401,7 +401,7 @@ func (d *blockingHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext
 }
 
 type scriptedAsyncCall struct {
-	result    []byte
+	result    jswire.Value
 	err       error
 	started   chan struct{}
 	release   chan struct{}
@@ -432,7 +432,7 @@ func (d *scriptedAsyncHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeCont
 	}
 	d.mu.Unlock()
 
-	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(ctx context.Context, params []byte) ([]byte, error) {
+	if err := rt.Set("hostAsync", host.WrapAsync("hostAsync", model.ReplayReadonly, func(ctx context.Context, params jswire.Value) (jswire.Value, error) {
 		value, err := decodeJSONStringParam(params)
 		if err != nil {
 			return nil, err
@@ -461,7 +461,7 @@ func (d *scriptedAsyncHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeCont
 		if call.err != nil {
 			return nil, call.err
 		}
-		return cloneJSON(call.result), nil
+		return cloneJSWireValue(call.result), nil
 	})); err != nil {
 		return nil, err
 	}
@@ -548,7 +548,7 @@ func (d *asyncHostDelegate) CallCount(sessionID model.SessionID) int {
 }
 
 func (d *asyncHostDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
-	baseHostAsync := host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params []byte) ([]byte, error) {
+	baseHostAsync := host.WrapAsync("hostAsync", model.ReplayReadonly, func(_ context.Context, params jswire.Value) (jswire.Value, error) {
 		decoded, err := jswire.DecodeGoja(goja.New(), params)
 		if err != nil {
 			return nil, fmt.Errorf("hostAsync: decode payload: %w", err)
@@ -699,7 +699,7 @@ func (d *syncRandomDelegate) CallCount(sessionID model.SessionID) int {
 
 func (d *syncRandomDelegate) ConfigureRuntime(ctx engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
 	mathObj := rt.Get("Math").ToObject(rt)
-	if err := mathObj.Set("random", host.WrapSync("Math.random", model.ReplayReadonly, func(_ context.Context, _ []byte) ([]byte, error) {
+	if err := mathObj.Set("random", host.WrapSync("Math.random", model.ReplayReadonly, func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return mustEncodeBridgeValue(d.next(ctx.SessionID)), nil
 	})); err != nil {
 		return nil, err
@@ -746,7 +746,7 @@ func (d *effectHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt
 	for name, invoke := range invokes {
 		name := name
 		invoke := invoke
-		if err := rt.Set(name, host.WrapAsync(name, model.ReplayReadonly, func(ctx context.Context, params []byte) ([]byte, error) {
+		if err := rt.Set(name, host.WrapAsync(name, model.ReplayReadonly, func(ctx context.Context, params jswire.Value) (jswire.Value, error) {
 			d.mu.Lock()
 			if d.calls == nil {
 				d.calls = make(map[string]int)
@@ -764,7 +764,7 @@ func (d *effectHostDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt
 	return json.RawMessage(`{"kind":"effect-host-test","version":1}`), nil
 }
 
-func decodeJSONStringParam(params []byte) (string, error) {
+func decodeJSONStringParam(params jswire.Value) (string, error) {
 	if len(params) == 0 {
 		return "", nil
 	}
@@ -776,14 +776,14 @@ func decodeJSONStringParam(params []byte) (string, error) {
 	return value, nil
 }
 
-func cloneJSON(raw []byte) []byte {
+func cloneJSWireValue(raw jswire.Value) jswire.Value {
 	if len(raw) == 0 {
 		return nil
 	}
-	return append([]byte(nil), raw...)
+	return raw.Clone()
 }
 
-func mustEncodeBridgeValue(value any) []byte {
+func mustEncodeBridgeValue(value any) jswire.Value {
 	b, err := jswire.EncodeGoja(goja.New().ToValue(value))
 	if err != nil {
 		panic(err)
@@ -791,7 +791,7 @@ func mustEncodeBridgeValue(value any) []byte {
 	return b
 }
 
-func decodeBridgeStructured(t *testing.T, raw []byte) any {
+func decodeBridgeStructured(t *testing.T, raw jswire.Value) any {
 	t.Helper()
 	decoded, err := jswire.DecodeGoja(goja.New(), raw)
 	if err != nil {
@@ -800,7 +800,7 @@ func decodeBridgeStructured(t *testing.T, raw []byte) any {
 	return decoded.Export()
 }
 
-func decodeBridgeStructuredFulfilledPromiseResult(t *testing.T, raw []byte) any {
+func decodeBridgeStructuredFulfilledPromiseResult(t *testing.T, raw jswire.Value) any {
 	t.Helper()
 	decoded, err := jswire.DecodeGoja(goja.New(), raw)
 	if err != nil {
@@ -816,7 +816,7 @@ func decodeBridgeStructuredFulfilledPromiseResult(t *testing.T, raw []byte) any 
 	return promise.Result().Export()
 }
 
-func mustEncodeBridgeExpr(t *testing.T, expr string) []byte {
+func mustEncodeBridgeExpr(t *testing.T, expr string) jswire.Value {
 	t.Helper()
 	vm := goja.New()
 	value, err := vm.RunString(expr)
@@ -830,7 +830,7 @@ func mustEncodeBridgeExpr(t *testing.T, expr string) []byte {
 	return b
 }
 
-func requireBridgeExprResult(t *testing.T, raw []byte, expr string, want any) {
+func requireBridgeExprResult(t *testing.T, raw jswire.Value, expr string, want any) {
 	t.Helper()
 	vm := goja.New()
 	value, err := jswire.DecodeGoja(vm, raw)
@@ -2821,7 +2821,7 @@ func TestSession_Submit_AsyncEffectCompletedJournalFailureFailsSubmit(t *testing
 		return nil
 	})
 	delegate := newEffectHostDelegate()
-	delegate.SetAsync("ok", func(_ context.Context, _ []byte) ([]byte, error) {
+	delegate.SetAsync("ok", func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return mustEncodeBridgeValue("done"), nil
 	})
 
@@ -3291,7 +3291,7 @@ func TestSession_Submit_HostEffectsRoundTripBridgeTypes(t *testing.T) {
 	fix := newRecordingFixture(t)
 	delegate := newEffectHostDelegate()
 
-	delegate.SetAsync("hostDate", func(_ context.Context, params []byte) ([]byte, error) {
+	delegate.SetAsync("hostDate", func(_ context.Context, params jswire.Value) (jswire.Value, error) {
 		requireBridgeExprResult(t, params, `__value instanceof Date`, true)
 		requireBridgeExprResult(t, params, `__value.toISOString()`, "2021-02-03T04:05:06.789Z")
 		return mustEncodeBridgeExpr(t, `new Date("2022-05-06T07:08:09.123Z")`), nil
@@ -3887,7 +3887,7 @@ func TestSession_Submit_FailuresIncludeLinkedEffects(t *testing.T) {
 	e := session.New()
 	fix := newRecordingFixture(t)
 	delegate := newEffectHostDelegate()
-	delegate.SetAsync("boom", func(_ context.Context, _ []byte) ([]byte, error) {
+	delegate.SetAsync("boom", func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return nil, errors.New("boom")
 	})
 	fix.deps.VMDelegate = delegate
@@ -3931,7 +3931,7 @@ func TestSession_Submit_ReturnsSubmitFailureWithLinkedEffectSummaries(t *testing
 	e := session.New()
 	fix := newRecordingFixture(t)
 	delegate := newEffectHostDelegate()
-	delegate.SetAsync("boom", func(_ context.Context, _ []byte) ([]byte, error) {
+	delegate.SetAsync("boom", func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return nil, errors.New("boom")
 	})
 	fix.deps.VMDelegate = delegate
@@ -4061,7 +4061,7 @@ func TestSession_Submit_SingleEffectRecordsLinkedEffects(t *testing.T) {
 	e := session.New()
 	fix := newRecordingFixture(t)
 	delegate := newEffectHostDelegate()
-	delegate.SetAsync("hostOne", func(_ context.Context, params []byte) ([]byte, error) {
+	delegate.SetAsync("hostOne", func(_ context.Context, params jswire.Value) (jswire.Value, error) {
 		value, err := decodeJSONStringParam(params)
 		if err != nil {
 			return nil, err
@@ -4133,7 +4133,7 @@ func TestSession_Submit_ConcurrentEffectsRecordBothCompletions(t *testing.T) {
 	var max int32
 
 	mkInvoke := func(name string) engine.HostFuncInvoke {
-		return func(_ context.Context, _ []byte) ([]byte, error) {
+		return func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 			cur := atomic.AddInt32(&current, 1)
 			for {
 				observed := atomic.LoadInt32(&max)
@@ -4244,13 +4244,13 @@ func TestSession_Submit_TimeoutIncludesCompletedAndPendingLinkedEffects(t *testi
 			close(slowRelease)
 		})
 	})
-	delegate.SetAsync("fastOne", func(_ context.Context, _ []byte) ([]byte, error) {
+	delegate.SetAsync("fastOne", func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return mustEncodeBridgeValue("fast-one"), nil
 	})
-	delegate.SetAsync("fastTwo", func(_ context.Context, _ []byte) ([]byte, error) {
+	delegate.SetAsync("fastTwo", func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return mustEncodeBridgeValue("fast-two"), nil
 	})
-	delegate.SetAsync("slow", func(_ context.Context, _ []byte) ([]byte, error) {
+	delegate.SetAsync("slow", func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		select {
 		case slowStarted <- struct{}{}:
 		default:
@@ -4316,7 +4316,7 @@ func TestSession_Submit_EffectFailureDoesNotCommitCell(t *testing.T) {
 	e := session.New()
 	fix := newRecordingFixture(t)
 	delegate := newEffectHostDelegate()
-	delegate.SetAsync("boom", func(_ context.Context, _ []byte) ([]byte, error) {
+	delegate.SetAsync("boom", func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return nil, errors.New("boom")
 	})
 	fix.deps.VMDelegate = delegate
@@ -4390,7 +4390,7 @@ func TestSession_Submit_ContextCancelMidEffectDoesNotCommitCell(t *testing.T) {
 	delegate := newEffectHostDelegate()
 	started := make(chan struct{}, 1)
 	returned := make(chan error, 1)
-	delegate.SetAsync("slow", func(callCtx context.Context, _ []byte) ([]byte, error) {
+	delegate.SetAsync("slow", func(callCtx context.Context, _ jswire.Value) (jswire.Value, error) {
 		select {
 		case started <- struct{}{}:
 		default:
@@ -5459,7 +5459,7 @@ func TestSession_FailedSubmit_DoesNotLeakRuntimeStateAcrossModes(t *testing.T) {
 
 	t.Run("host failure after mutation", func(t *testing.T) {
 		delegate := newEffectHostDelegate()
-		delegate.SetAsync("boom", func(_ context.Context, _ []byte) ([]byte, error) {
+		delegate.SetAsync("boom", func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 			return nil, errors.New("boom")
 		})
 
@@ -5985,7 +5985,7 @@ func TestSession_TopLevelAwait_TableDrivenParity(t *testing.T) {
 // configurable replay policy and tracks how many times the live invoke fires.
 type policyTestDelegate struct {
 	policy model.ReplayPolicy
-	result []byte
+	result jswire.Value
 
 	mu    sync.Mutex
 	calls int
@@ -5998,7 +5998,7 @@ func (d *policyTestDelegate) CallCount() int {
 }
 
 func (d *policyTestDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.Runtime, host engine.HostFuncBuilder, state json.RawMessage) (json.RawMessage, error) {
-	if err := rt.Set("hostFn", host.WrapSync("hostFn", d.policy, func(_ context.Context, _ []byte) ([]byte, error) {
+	if err := rt.Set("hostFn", host.WrapSync("hostFn", d.policy, func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		d.mu.Lock()
 		d.calls++
 		d.mu.Unlock()

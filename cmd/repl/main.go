@@ -306,7 +306,7 @@ func printDiagnostics(out io.Writer, diagnostics []model.Diagnostic) {
 	}
 }
 
-func formatStructuredInline(raw []byte) string {
+func formatStructuredInline(raw jswire.Value) string {
 	if len(raw) == 0 {
 		return "<nil>"
 	}

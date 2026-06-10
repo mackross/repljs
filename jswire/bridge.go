@@ -25,6 +25,12 @@ var (
 	gojaKeepAliveSymbol   = goja.NewSymbol("jswire.keepalive")
 )
 
+// Value is an encoded JavaScript value in jswire's versioned wire format.
+//
+// It is a raw payload, similar in spirit to json.RawMessage, but the bytes are
+// jswire data rather than JSON.
+type Value []byte
+
 type valueKind byte
 type nodeKind byte
 type numberKind byte
@@ -107,7 +113,7 @@ type wireEntry struct {
 	Value wireValue
 }
 
-func EncodeQuickJS(v *qjs.Value) ([]byte, error) {
+func EncodeQuickJS(v *qjs.Value) (Value, error) {
 	if v == nil {
 		return marshalGraph(wireGraph{Root: wireValue{Kind: valueUndefined}}), nil
 	}
@@ -122,7 +128,7 @@ func EncodeQuickJS(v *qjs.Value) ([]byte, error) {
 	return marshalGraph(wireGraph{Root: root, Nodes: enc.nodes}), nil
 }
 
-func DecodeQuickJS(ctx *qjs.Context, bs []byte) (*qjs.Value, error) {
+func DecodeQuickJS(ctx *qjs.Context, bs Value) (*qjs.Value, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: nil quickjs context", ErrInvalidWire)
 	}
@@ -145,7 +151,7 @@ func DecodeQuickJS(ctx *qjs.Context, bs []byte) (*qjs.Value, error) {
 	return dec.decodeRoot(graph.Root)
 }
 
-func EncodeGoja(v goja.Value) ([]byte, error) {
+func EncodeGoja(v goja.Value) (Value, error) {
 	enc := gojaEncoder{
 		seen:   make(map[uintptr]uint32),
 		nextID: 1,
@@ -157,7 +163,7 @@ func EncodeGoja(v goja.Value) ([]byte, error) {
 	return marshalGraph(wireGraph{Root: root, Nodes: enc.nodes}), nil
 }
 
-func DecodeGoja(vm *goja.Runtime, bs []byte) (goja.Value, error) {
+func DecodeGoja(vm *goja.Runtime, bs Value) (goja.Value, error) {
 	if vm == nil {
 		return nil, fmt.Errorf("%w: nil goja runtime", ErrInvalidWire)
 	}

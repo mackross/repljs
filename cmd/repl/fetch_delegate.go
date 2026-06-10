@@ -44,7 +44,7 @@ func (fetchDelegate) ConfigureRuntime(_ engine.SessionRuntimeContext, rt *goja.R
 		return nil, fmt.Errorf("install FetchResult: %w", err)
 	}
 
-	rawFetch := host.WrapAsync("fetch", model.ReplayReadonly, func(_ context.Context, params []byte) ([]byte, error) {
+	rawFetch := host.WrapAsync("fetch", model.ReplayReadonly, func(_ context.Context, params jswire.Value) (jswire.Value, error) {
 		decoded, err := jswire.DecodeGoja(goja.New(), params)
 		if err != nil {
 			return nil, fmt.Errorf("fetch: decode url: %w", err)

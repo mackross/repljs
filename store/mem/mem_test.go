@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mackross/repljs/jswire"
 	"github.com/mackross/repljs/model"
 	memstore "github.com/mackross/repljs/store/mem"
 )
@@ -54,8 +55,8 @@ func TestMemStore_AppendFactRoundTrip(t *testing.T) {
 		model.ManifestAttached{Session: sessionID, ManifestID: manifest.ID, Manifest: manifest, At: time.Now().UTC()},
 		model.CellChecked{Session: sessionID, Branch: branchID, Cell: cellID1, Source: "const x = 1;", EmittedJS: "const x = 1;", At: time.Now().UTC()},
 		model.CellEvaluated{Session: sessionID, Branch: branchID, Cell: cellID1, LinkedEffects: []model.EffectID{effectID}, At: time.Now().UTC()},
-		model.EffectStarted{Session: sessionID, Effect: effectID, Cell: cellID1, FunctionName: "tools.fs.read", Params: json.RawMessage(`{"path":"/etc/hosts"}`), ReplayPolicy: model.ReplayReadonly, At: time.Now().UTC()},
-		model.EffectCompleted{Session: sessionID, Effect: effectID, Result: json.RawMessage(`"127.0.0.1 localhost"`), At: time.Now().UTC()},
+		model.EffectStarted{Session: sessionID, Effect: effectID, Cell: cellID1, FunctionName: "tools.fs.read", Params: jswire.Value(`{"path":"/etc/hosts"}`), ReplayPolicy: model.ReplayReadonly, At: time.Now().UTC()},
+		model.EffectCompleted{Session: sessionID, Effect: effectID, Result: jswire.Value(`"127.0.0.1 localhost"`), At: time.Now().UTC()},
 		model.CellCommitted{Session: sessionID, Branch: branchID, Cell: cellID1, At: time.Now().UTC()},
 		model.HeadMoved{Session: sessionID, Branch: branchID, Next: cellID1, At: time.Now().UTC()},
 		// Second cell with no effects.
@@ -554,7 +555,7 @@ func TestMemStore_LoadReplayPlan(t *testing.T) {
 			model.CellChecked{Session: session, Branch: root, Cell: cell1, Source: "src1", EmittedJS: "js1", At: time.Now().UTC()},
 			model.CellEvaluated{Session: session, Branch: root, Cell: cell1, LinkedEffects: []model.EffectID{fx1}, At: time.Now().UTC()},
 			model.EffectStarted{Session: session, Effect: fx1, Cell: cell1, FunctionName: "fn.read", ReplayPolicy: model.ReplayReadonly, At: time.Now().UTC()},
-			model.EffectCompleted{Session: session, Effect: fx1, Result: json.RawMessage(`"result1"`), At: time.Now().UTC()},
+			model.EffectCompleted{Session: session, Effect: fx1, Result: jswire.Value(`"result1"`), At: time.Now().UTC()},
 			model.CellCommitted{Session: session, Branch: root, Cell: cell1, At: time.Now().UTC()},
 			model.HeadMoved{Session: session, Branch: root, Next: cell1, At: time.Now().UTC()},
 			// -- root: cell2 --
@@ -569,7 +570,7 @@ func TestMemStore_LoadReplayPlan(t *testing.T) {
 			model.CellChecked{Session: session, Branch: fork, Cell: cell3, Source: "src3", EmittedJS: "js3", At: time.Now().UTC()},
 			model.CellEvaluated{Session: session, Branch: fork, Cell: cell3, LinkedEffects: []model.EffectID{fx3}, At: time.Now().UTC()},
 			model.EffectStarted{Session: session, Effect: fx3, Cell: cell3, FunctionName: "fn.idempotent", ReplayPolicy: model.ReplayIdempotent, At: time.Now().UTC()},
-			model.EffectCompleted{Session: session, Effect: fx3, Result: json.RawMessage(`"result3"`), At: time.Now().UTC()},
+			model.EffectCompleted{Session: session, Effect: fx3, Result: jswire.Value(`"result3"`), At: time.Now().UTC()},
 			model.CellCommitted{Session: session, Branch: fork, Cell: cell3, At: time.Now().UTC()},
 			model.HeadMoved{Session: session, Branch: fork, Next: cell3, At: time.Now().UTC()},
 		} {

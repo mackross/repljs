@@ -1,6 +1,10 @@
 package model
 
-import "time"
+import (
+	"time"
+
+	"github.com/mackross/repljs/jswire"
+)
 
 // Fact is implemented by every append-only fact struct.
 // The store uses FactType() to route and index facts without falling back to
@@ -165,12 +169,12 @@ func (CellFailed) FactType() string { return FactTypeCellFailed }
 // populate ReplayDecision.Policy directly from facts without re-querying the
 // manifest.
 type EffectStarted struct {
-	Session        SessionID `json:"session"`
-	Effect         EffectID  `json:"effect"`
-	Cell           CellID    `json:"cell"`
-	FunctionName   string    `json:"function_name"`
-	Params         []byte    `json:"params,omitempty"`
-	IdempotencyKey string    `json:"idempotency_key,omitempty"`
+	Session        SessionID    `json:"session"`
+	Effect         EffectID     `json:"effect"`
+	Cell           CellID       `json:"cell"`
+	FunctionName   string       `json:"function_name"`
+	Params         jswire.Value `json:"params,omitempty"`
+	IdempotencyKey string       `json:"idempotency_key,omitempty"`
 	// ReplayPolicy is the policy in effect for this function at the time the
 	// effect was started, copied from HostFunctionSpec.Replay. Recording it
 	// here means the replay layer does not need to re-derive it from the
@@ -183,10 +187,10 @@ func (EffectStarted) FactType() string { return FactTypeEffectStarted }
 
 // EffectCompleted is appended when a host function invocation succeeds.
 type EffectCompleted struct {
-	Session SessionID `json:"session"`
-	Effect  EffectID  `json:"effect"`
-	Result  []byte    `json:"result,omitempty"`
-	At      time.Time `json:"at"`
+	Session SessionID    `json:"session"`
+	Effect  EffectID     `json:"effect"`
+	Result  jswire.Value `json:"result,omitempty"`
+	At      time.Time    `json:"at"`
 }
 
 func (EffectCompleted) FactType() string { return FactTypeEffectCompleted }
@@ -209,7 +213,7 @@ type PromiseSettled struct {
 	Promise PromiseID    `json:"promise"`
 	Effect  EffectID     `json:"effect,omitempty"`
 	State   PromiseState `json:"state"`
-	Value   []byte       `json:"value,omitempty"`
+	Value   jswire.Value `json:"value,omitempty"`
 	Error   string       `json:"error,omitempty"`
 	At      time.Time    `json:"at"`
 }

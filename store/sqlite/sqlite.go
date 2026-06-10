@@ -19,6 +19,7 @@ import (
 
 	_ "modernc.org/sqlite" // register "sqlite" driver with database/sql
 
+	"github.com/mackross/repljs/jswire"
 	"github.com/mackross/repljs/model"
 	"github.com/mackross/repljs/store"
 )
@@ -488,7 +489,7 @@ ORDER BY id ASC`
 				Effect:       fact.Effect,
 				Cell:         fact.Cell,
 				FunctionName: fact.FunctionName,
-				Params:       append([]byte(nil), fact.Params...),
+				Params:       fact.Params.Clone(),
 				ReplayPolicy: fact.ReplayPolicy,
 				Status:       store.EffectRecordPending,
 				StartedAt:    fact.At,
@@ -504,7 +505,7 @@ ORDER BY id ASC`
 				continue
 			}
 			out[idx].Status = store.EffectRecordCompleted
-			out[idx].Result = append([]byte(nil), fact.Result...)
+			out[idx].Result = fact.Result.Clone()
 			out[idx].ErrorMessage = ""
 			out[idx].UpdatedAt = fact.At
 		case model.FactTypeEffectFailed:
@@ -1261,7 +1262,7 @@ ORDER BY id ASC`
 		return store.ReplayDecision{}, fmt.Errorf("sqlite: loadReplayDecision completed query: %w", err)
 	}
 
-	var recordedResult []byte
+	var recordedResult jswire.Value
 	completionOrder := 0
 	rowIndex := 0
 	for rows2.Next() {

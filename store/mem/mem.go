@@ -15,6 +15,7 @@ import (
 	"math"
 	"sync"
 
+	"github.com/mackross/repljs/jswire"
 	"github.com/mackross/repljs/model"
 	"github.com/mackross/repljs/store"
 )
@@ -283,7 +284,7 @@ func (s *Store) LoadCellEffects(_ context.Context, session model.SessionID, cell
 				Effect:       fact.Effect,
 				Cell:         fact.Cell,
 				FunctionName: fact.FunctionName,
-				Params:       append([]byte(nil), fact.Params...),
+				Params:       fact.Params.Clone(),
 				ReplayPolicy: fact.ReplayPolicy,
 				Status:       store.EffectRecordPending,
 				StartedAt:    fact.At,
@@ -295,7 +296,7 @@ func (s *Store) LoadCellEffects(_ context.Context, session model.SessionID, cell
 				continue
 			}
 			out[idx].Status = store.EffectRecordCompleted
-			out[idx].Result = append([]byte(nil), fact.Result...)
+			out[idx].Result = fact.Result.Clone()
 			out[idx].ErrorMessage = ""
 			out[idx].UpdatedAt = fact.At
 		case model.EffectFailed:
@@ -907,7 +908,7 @@ func (s *Store) loadReplayDecision(session model.SessionID, effectID model.Effec
 		return store.ReplayDecision{}, fmt.Errorf("mem: loadReplayDecision: EffectStarted not found for effect %q", effectID)
 	}
 
-	var recordedResult []byte
+	var recordedResult jswire.Value
 	completionOrder := 0
 	for i, e := range s.facts {
 		if e.session != session || e.factType != model.FactTypeEffectCompleted {

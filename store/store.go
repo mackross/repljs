@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/mackross/repljs/jswire"
 	"github.com/mackross/repljs/model"
 )
 
@@ -48,7 +49,7 @@ type ReplayDecision struct {
 
 	// RecordedResult holds the serialised completed result, if any. A nil
 	// value means the effect did not complete before the prior process ended.
-	RecordedResult []byte
+	RecordedResult jswire.Value
 
 	// CompletionOrder is the append-order index of the terminal success row for
 	// this effect. Replay uses it to preserve settlement order for concurrent
@@ -173,10 +174,10 @@ type EffectRecord struct {
 	Effect       model.EffectID
 	Cell         model.CellID
 	FunctionName string
-	Params       []byte
+	Params       jswire.Value
 	ReplayPolicy model.ReplayPolicy
 	Status       EffectRecordStatus
-	Result       []byte
+	Result       jswire.Value
 	ErrorMessage string
 	StartedAt    time.Time
 	UpdatedAt    time.Time

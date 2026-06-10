@@ -38,14 +38,14 @@ type effectAccumulator struct {
 	logs               []string
 }
 
-func cloneBytes(raw []byte) []byte {
+func cloneJSWireValue(raw jswire.Value) jswire.Value {
 	if len(raw) == 0 {
 		return nil
 	}
-	return append([]byte(nil), raw...)
+	return raw.Clone()
 }
 
-func (a *effectAccumulator) recordStarted(effectID model.EffectID, name string, params []byte, replay model.ReplayPolicy) {
+func (a *effectAccumulator) recordStarted(effectID model.EffectID, name string, params jswire.Value, replay model.ReplayPolicy) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.effects == nil {
@@ -57,13 +57,13 @@ func (a *effectAccumulator) recordStarted(effectID model.EffectID, name string, 
 	a.effects[effectID] = engine.EffectSummary{
 		Effect:       effectID,
 		FunctionName: name,
-		Params:       cloneBytes(params),
+		Params:       cloneJSWireValue(params),
 		ReplayPolicy: replay,
 		Status:       engine.EffectStatusPending,
 	}
 }
 
-func (a *effectAccumulator) addAsync(effectID model.EffectID, name string, params []byte, replay model.ReplayPolicy) {
+func (a *effectAccumulator) addAsync(effectID model.EffectID, name string, params jswire.Value, replay model.ReplayPolicy) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.effects == nil {
@@ -75,7 +75,7 @@ func (a *effectAccumulator) addAsync(effectID model.EffectID, name string, param
 	a.effects[effectID] = engine.EffectSummary{
 		Effect:       effectID,
 		FunctionName: name,
-		Params:       cloneBytes(params),
+		Params:       cloneJSWireValue(params),
 		ReplayPolicy: replay,
 		Status:       engine.EffectStatusPending,
 	}
@@ -86,7 +86,7 @@ func (a *effectAccumulator) addAsync(effectID model.EffectID, name string, param
 	a.pendingAsync++
 }
 
-func (a *effectAccumulator) recordCompleted(effectID model.EffectID, result []byte) {
+func (a *effectAccumulator) recordCompleted(effectID model.EffectID, result jswire.Value) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	summary, ok := a.effects[effectID]
@@ -94,7 +94,7 @@ func (a *effectAccumulator) recordCompleted(effectID model.EffectID, result []by
 		return
 	}
 	summary.Status = engine.EffectStatusCompleted
-	summary.Result = cloneBytes(result)
+	summary.Result = cloneJSWireValue(result)
 	summary.ErrorMessage = ""
 	a.effects[effectID] = summary
 	a.markAsyncSettledLocked(effectID)
@@ -205,8 +205,8 @@ func (a *effectAccumulator) drain() []engine.EffectSummary {
 	effects := make([]engine.EffectSummary, 0, len(a.order))
 	for _, effectID := range a.order {
 		summary := a.effects[effectID]
-		summary.Params = cloneBytes(summary.Params)
-		summary.Result = cloneBytes(summary.Result)
+		summary.Params = cloneJSWireValue(summary.Params)
+		summary.Result = cloneJSWireValue(summary.Result)
 		effects = append(effects, summary)
 	}
 	a.order = nil
@@ -522,7 +522,7 @@ func rejectJSError(vm *goja.Runtime, reject func(interface{}) error, kind string
 }
 
 func (b hostFuncBuilder) WrapSync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke) func(goja.FunctionCall) goja.Value {
-	withEffectID := b.WrapSyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params []byte) ([]byte, error) {
+	withEffectID := b.WrapSyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params jswire.Value) (jswire.Value, error) {
 		return invoke(ctx, params)
 	})
 	return func(call goja.FunctionCall) goja.Value {
@@ -532,7 +532,7 @@ func (b hostFuncBuilder) WrapSync(name string, replay model.ReplayPolicy, invoke
 }
 
 func (b hostFuncBuilder) WrapAsync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke) func(goja.FunctionCall) goja.Value {
-	withEffectID := b.WrapAsyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params []byte) ([]byte, error) {
+	withEffectID := b.WrapAsyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params jswire.Value) (jswire.Value, error) {
 		return invoke(ctx, params)
 	})
 	return func(call goja.FunctionCall) goja.Value {
@@ -564,10 +564,10 @@ func installReplayAwareGojaNondeterminism(vm *goja.Runtime, host hostFuncBuilder
 		return nil
 	}
 
-	randomSource := host.WrapSync("Math.random", model.ReplayReadonly, func(_ context.Context, _ []byte) ([]byte, error) {
+	randomSource := host.WrapSync("Math.random", model.ReplayReadonly, func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return encodeBridgeLiteral(mrand.Float64())
 	})
-	timeSource := host.WrapSync("Date.now", model.ReplayReadonly, func(_ context.Context, _ []byte) ([]byte, error) {
+	timeSource := host.WrapSync("Date.now", model.ReplayReadonly, func(_ context.Context, _ jswire.Value) (jswire.Value, error) {
 		return encodeBridgeLiteral(time.Now().UTC().UnixMilli())
 	})
 
@@ -624,7 +624,7 @@ func installConsoleAndInspect(vm *goja.Runtime, router *hostFunctionRouter) erro
 	return nil
 }
 
-func encodeBridgeLiteral(value any) ([]byte, error) {
+func encodeBridgeLiteral(value any) (jswire.Value, error) {
 	return jswire.EncodeGoja(goja.New().ToValue(value))
 }
 
@@ -1023,7 +1023,7 @@ func (r *branchRuntime) close() {
 }
 
 func (r *hostFunctionRouter) invokeSync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
-	value, _ := r.invokeSyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params []byte) ([]byte, error) {
+	value, _ := r.invokeSyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params jswire.Value) (jswire.Value, error) {
 		return invoke(ctx, params)
 	}, call)
 	return value
@@ -1179,7 +1179,7 @@ func renderSummaryValue(v goja.Value) string {
 }
 
 func (r *hostFunctionRouter) invokeAsync(name string, replay model.ReplayPolicy, invoke engine.HostFuncInvoke, call goja.FunctionCall) goja.Value {
-	value, _ := r.invokeAsyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params []byte) ([]byte, error) {
+	value, _ := r.invokeAsyncWithEffectID(name, replay, func(ctx context.Context, _ model.EffectID, params jswire.Value) (jswire.Value, error) {
 		return invoke(ctx, params)
 	}, call)
 	return value
@@ -1279,7 +1279,7 @@ func (r *hostFunctionRouter) invokeAsyncWithEffectID(name string, replay model.R
 	return vm.ToValue(promise), effectID
 }
 
-func marshalFirstArgument(call goja.FunctionCall) ([]byte, error) {
+func marshalFirstArgument(call goja.FunctionCall) (jswire.Value, error) {
 	if len(call.Arguments) == 0 {
 		return jswire.EncodeGoja(goja.Undefined())
 	}
@@ -1290,7 +1290,7 @@ func marshalFirstArgument(call goja.FunctionCall) ([]byte, error) {
 	return b, nil
 }
 
-func bridgeResultToValue(vm *goja.Runtime, raw []byte) goja.Value {
+func bridgeResultToValue(vm *goja.Runtime, raw jswire.Value) goja.Value {
 	if len(raw) == 0 {
 		return vm.ToValue(nil)
 	}
@@ -1311,7 +1311,7 @@ type evalResult struct {
 	// structured carries the versioned bridge encoding of the completion value.
 	// It is nil when the value cannot be bridge-encoded or when completionValue
 	// is nil.
-	structured []byte
+	structured jswire.Value
 
 	// indexedValue is the actual JS value that should be rebound into REPL
 	// conveniences like `$last` and `$val(n)`.
@@ -1567,7 +1567,7 @@ func valueToEvalResult(displayVal goja.Value, indexedVal goja.Value) (evalResult
 		hasIndexedValue: true,
 	}
 	var ref *model.ValueRef
-	var structured []byte
+	var structured jswire.Value
 	if displayVal != nil && !goja.IsUndefined(displayVal) && !goja.IsNull(displayVal) {
 		typeHint := gojaTypeHint(displayVal)
 		preview := gojaValuePreview(displayVal)

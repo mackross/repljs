@@ -386,8 +386,8 @@ func cloneEffectSummaries(in []engine.EffectSummary) []engine.EffectSummary {
 	}
 	out := make([]engine.EffectSummary, 0, len(in))
 	for _, summary := range in {
-		summary.Params = cloneBytes(summary.Params)
-		summary.Result = cloneBytes(summary.Result)
+		summary.Params = summary.Params.Clone()
+		summary.Result = summary.Result.Clone()
 		out = append(out, summary)
 	}
 	return out
@@ -916,7 +916,7 @@ func (s *session) Logs(ctx context.Context, targetCell model.CellID) ([]string, 
 	return logs, nil
 }
 
-func describeValue(preview string, structured []byte) (summary, full string) {
+func describeValue(preview string, structured jswire.Value) (summary, full string) {
 	summary = preview
 	full = preview
 	if len(structured) == 0 {
