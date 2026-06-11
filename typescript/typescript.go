@@ -35,7 +35,8 @@ const replTSConfig = `{
     "module": "esnext",
     "target": "esnext",
     "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "noErrorTruncation": true
   }
 }`
 

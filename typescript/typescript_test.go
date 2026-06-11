@@ -2,6 +2,7 @@ package typescript_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -213,5 +214,32 @@ func TestSession_CheckEmitCell_AllowsAmbientDeclareNamespace(t *testing.T) {
 	}
 	if !strings.Contains(result.EmittedJS, "const value = 2;") {
 		t.Fatalf("EmittedJS = %q, want ordinary runtime code to remain", result.EmittedJS)
+	}
+}
+
+func TestSession_CheckEmitCell_DoesNotTruncateLongTypesInDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	factory := typescript.NewFactory()
+	sess, err := factory.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	api := strings.Repeat("declare namespace pkg { function get(id: number): Promise<Item>; } ", 8)
+	env := typescript.Env{
+		Hash:    "long-type-v1",
+		EpochTS: "declare const $pkgMetadata: { readonly api: " + strconv.Quote(api) + " };",
+	}
+	result, err := sess.CheckEmitCell(ctx, env, "$pkgMetadata.tools")
+	if err != nil {
+		t.Fatalf("CheckEmitCell: %v", err)
+	}
+	if !result.HasErrors {
+		t.Fatal("expected a type error for the missing property")
+	}
+	message := result.Diagnostics[0].Message
+	if !strings.Contains(message, api) {
+		t.Fatalf("diagnostic message = %q, want the full type without compiler elision", message)
 	}
 }
